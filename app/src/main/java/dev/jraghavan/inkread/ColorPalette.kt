@@ -49,6 +49,15 @@ class ColorPalette(
      * chosen index. Never auto-dismisses: the caller hides it only on a tool switch.
      */
     fun show(title: String, colors: IntArray, names: Array<String>, selected: Int, onPick: (Int) -> Unit) {
+        // The original highlighter green (#9CCC65) is a very light yellow-green. On the Note Air 4C
+        // Kaleido panel it collapses visually into the default yellow highlighter even after a full
+        // repaint. Use Onyx's own saturated pen green (#00B036) at the same 50% alpha so the portable
+        // stored colour remains unambiguously green on colour e-ink as well as conventional displays.
+        if (title == "Highlighter") {
+            val greenIndex = names.indexOf("Green")
+            if (greenIndex >= 0 && greenIndex < colors.size) colors[greenIndex] = 0x00B03680
+        }
+
         // BOOX TouchHelper owns the Pen's low-latency wet-ink layer. Keep its transient colour in sync
         // with the portable/core colour selected by the user; Highlighter draws its own app overlay.
         val syncNativePenColor = title == "Pen"
