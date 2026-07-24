@@ -33,7 +33,7 @@
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
-        tools:replace="android:label">
+        tools:replace="android:allowBackup,android:label">
 
         <!-- Home screen + launcher: brand and entry points (Open / Library / Continue). -->
         <activity
