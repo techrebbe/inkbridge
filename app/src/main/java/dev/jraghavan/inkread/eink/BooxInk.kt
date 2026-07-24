@@ -54,6 +54,9 @@ class BooxInk(
             batchedPenPoints = null
             penFromTouch = fromTouch
             if (fromTouch) return
+            // The portable core stores the selected true colour separately. Keep TouchHelper's
+            // transient wet-ink preview on the same colour so it doesn't appear black until repaint.
+            runCatching { touchHelper?.setStrokeColor(FirmwareInkStyle.currentPenColorArgb()) }
             touchPoint?.let { pendingPenPoints += TouchPoint(it) }
             listener.onBooxInkStatus("BOOX pen down")
         }
@@ -186,6 +189,7 @@ class BooxInk(
             helper.setRawDrawingEnabled(false)
             helper.closeRawDrawing()
             helper.setStrokeWidth(STROKE_WIDTH_PX)
+            helper.setStrokeColor(FirmwareInkStyle.currentPenColorArgb())
             helper.setLimitRect(mutableListOf(limit))
                 .setExcludeRect(emptyList())
                 .openRawDrawing()
@@ -235,7 +239,7 @@ class BooxInk(
             pendingEraserPoints.clear()
             batchedEraserPoints = null
             // Re-bind immediately so ReaderActivity's existing page/tool lifecycle can keep using one
-            // firmware-ink object. setup() reapplies the current [writable] state.
+            // firmware-ink object. setup() reapplies the current [writable] state and selected colour.
             setup()
         }
     }
