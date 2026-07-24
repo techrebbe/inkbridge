@@ -41,39 +41,49 @@ class BooxInk(
 
     private val pendingPenPoints = ArrayList<TouchPoint>(2048)
     private var batchedPenPoints: List<TouchPoint>? = null
+    private var penFromTouch = false
 
     private val pendingEraserPoints = ArrayList<TouchPoint>(2048)
     private var batchedEraserPoints: List<TouchPoint>? = null
+    private var eraserFromTouch = false
 
     private val callback = object : RawInputCallback() {
         override fun onBeginRawDrawing(fromTouch: Boolean, touchPoint: TouchPoint?) {
             pendingPenPoints.clear()
             batchedPenPoints = null
+            penFromTouch = fromTouch
+            if (fromTouch) return
             touchPoint?.let { pendingPenPoints += TouchPoint(it) }
             listener.onBooxInkStatus("BOOX pen down")
         }
 
         override fun onRawDrawingTouchPointMoveReceived(touchPoint: TouchPoint?) {
+            if (penFromTouch) return
             // Some BOOX firmware versions intermittently omit the final cumulative-list callback.
             // Keep per-move samples as a fallback, but prefer the SDK list when present.
             touchPoint?.let { pendingPenPoints += TouchPoint(it) }
         }
 
         override fun onRawDrawingTouchPointListReceived(touchPointList: TouchPointList?) {
+            if (penFromTouch) return
             val raw = touchPointList?.points.orEmpty()
             if (raw.isNotEmpty()) batchedPenPoints = raw.map { TouchPoint(it) }
         }
 
         override fun onEndRawDrawing(fromTouch: Boolean, touchPoint: TouchPoint?) {
-            val raw = batchedPenPoints ?: buildList {
-                addAll(pendingPenPoints)
-                touchPoint?.let { add(TouchPoint(it)) }
+            val ignore = penFromTouch || fromTouch
+            penFromTouch = false
+            if (ignore) {
+                pendingPenPoints.clear()
+                batchedPenPoints = null
+                return
             }
+
+            val snapshot = mergedSequence(pendingPenPoints, batchedPenPoints, touchPoint)
             pendingPenPoints.clear()
             batchedPenPoints = null
-            if (raw.isEmpty()) return
+            if (snapshot.isEmpty()) return
 
-            val snapshot = raw.map { TouchPoint(it) }
             surfaceView.post {
                 listener.onBooxPenStroke(snapshot.map(::toSample))
             }
@@ -82,35 +92,76 @@ class BooxInk(
         override fun onBeginRawErasing(fromTouch: Boolean, touchPoint: TouchPoint?) {
             pendingEraserPoints.clear()
             batchedEraserPoints = null
+            eraserFromTouch = fromTouch
+            if (fromTouch) return
             touchPoint?.let { pendingEraserPoints += TouchPoint(it) }
             listener.onBooxInkStatus("BOOX eraser down")
         }
 
         override fun onRawErasingTouchPointMoveReceived(touchPoint: TouchPoint?) {
+            if (eraserFromTouch) return
             touchPoint?.let { pendingEraserPoints += TouchPoint(it) }
         }
 
         override fun onRawErasingTouchPointListReceived(touchPointList: TouchPointList?) {
+            if (eraserFromTouch) return
             val raw = touchPointList?.points.orEmpty()
             if (raw.isNotEmpty()) batchedEraserPoints = raw.map { TouchPoint(it) }
         }
 
         override fun onEndRawErasing(fromTouch: Boolean, touchPoint: TouchPoint?) {
-            val raw = batchedEraserPoints ?: buildList {
-                addAll(pendingEraserPoints)
-                touchPoint?.let { add(TouchPoint(it)) }
+            val ignore = eraserFromTouch || fromTouch
+            eraserFromTouch = false
+            if (ignore) {
+                pendingEraserPoints.clear()
+                batchedEraserPoints = null
+                return
             }
+
+            val snapshot = mergedSequence(pendingEraserPoints, batchedEraserPoints, touchPoint)
             pendingEraserPoints.clear()
             batchedEraserPoints = null
-            if (raw.isEmpty()) return
+            if (snapshot.isEmpty()) return
 
-            val snapshot = raw.map { TouchPoint(it) }
             surfaceView.post {
                 listener.onBooxEraserGesture(snapshot.map(::toSample))
             }
         }
 
         override fun onPenActive(touchPoint: TouchPoint?) = Unit
+    }
+
+    /**
+     * Build one portable sequence without losing SDK begin/end samples.
+     *
+     * BOOX can deliver a cumulative list for the middle of the stroke, while begin/end arrive in
+     * separate callbacks. When the list is present we use it as the authoritative middle, but still
+     * prepend the begin sample and append the pen-up sample when they are not already present.
+     */
+    private fun mergedSequence(
+        pending: List<TouchPoint>,
+        batch: List<TouchPoint>?,
+        end: TouchPoint?,
+    ): List<TouchPoint> {
+        val middle = batch.orEmpty()
+        val out = ArrayList<TouchPoint>((if (middle.isNotEmpty()) middle.size else pending.size) + 2)
+
+        if (middle.isNotEmpty()) {
+            pending.firstOrNull()?.let { appendDistinct(out, it) }
+            middle.forEach { appendDistinct(out, it) }
+        } else {
+            pending.forEach { appendDistinct(out, it) }
+        }
+        end?.let { appendDistinct(out, it) }
+        return out
+    }
+
+    private fun appendDistinct(out: MutableList<TouchPoint>, point: TouchPoint) {
+        val copy = TouchPoint(point)
+        val last = out.lastOrNull()
+        if (last == null || last.x != copy.x || last.y != copy.y || last.pressure != copy.pressure) {
+            out += copy
+        }
     }
 
     /** Start BOOX raw drawing over the visible reader surface. Safe to call more than once. */
