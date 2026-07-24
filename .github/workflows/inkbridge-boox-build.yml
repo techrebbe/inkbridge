@@ -39,9 +39,20 @@ jobs:
           echo "Using NDK: $ndk"
 
       - name: Build debug APK
+        shell: bash
         run: |
           chmod +x ./buildApk.sh
-          ./buildApk.sh --debug
+          set +e
+          ./buildApk.sh --debug > inkbridge-build.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "===== COMPACT BUILD FAILURE ====="
+            grep -E '(^FAILURE:|^\* What went wrong:|^e: |^error:|Could not resolve|Could not find|Unresolved reference|Execution failed for task|Manifest merger failed|Compilation error|BUILD FAILED|Duplicate relative path|duplicate files|A failure occurred while executing)' inkbridge-build.log | tail -n 80 || true
+            echo "===== FINAL 40 LINES ====="
+            tail -n 40 inkbridge-build.log
+            exit $rc
+          fi
+          echo "Build succeeded"
 
       - name: Verify APK and native libraries
         run: |
