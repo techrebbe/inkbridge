@@ -1,0 +1,11 @@
+{
+  "name": "InkBridge Test",
+  "pluginKey": "InkBridgePoc",
+  "pluginID": "ibpoc20260724001",
+  "iconPath": "assets/icon.png",
+  "desc": "InkBridge native-stroke interoperability proof",
+  "versionCode": "1",
+  "versionName": "0.0.1",
+  "jsMainPath": "index",
+  "author": "InkBridge"
+}
