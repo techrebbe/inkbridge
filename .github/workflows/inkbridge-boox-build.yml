@@ -54,7 +54,17 @@ jobs:
           fi
           echo "Build succeeded"
 
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkbridge-boox-build-log
+          path: inkbridge-build.log
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Verify APK and native libraries
+        if: success()
         run: |
           set -euo pipefail
           apk="$(find app/build/outputs/apk/debug -type f -name '*.apk' -print -quit)"
@@ -64,3 +74,12 @@ jobs:
             [[ "$listing" == *"$lib"* ]] || { echo "::error::$lib missing from $apk"; exit 1; }
           done
           echo "APK OK: $apk"
+
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkbridge-boox-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
