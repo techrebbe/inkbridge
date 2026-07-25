@@ -31,11 +31,33 @@ At runtime the plugin:
 4. Creates a native pressure-pen stroke (`penType=16`).
 5. Inserts it with `PluginFileAPI.insertElements` and reloads the document.
 
-The acceptance test is that this BOOX-originated stroke appears in native Supernote NOTE/DOC and can immediately be lassoed, moved, and erased.
+Hardware validation on a Nomad confirmed that the real BOOX-originated stroke is lassoable, movable, and erasable as ordinary native Supernote ink.
+
+## Supernote → BOOX export proof
+
+The **Export Supernote Test** toolbar action reads the first native handwritten stroke on the current page and writes a portable JSON sidecar named:
+
+```text
+InkBridge_Supernote_Stroke.json
+```
+
+The sidecar is written into the same directory as the currently-open document. It contains:
+
+- Supernote element UUID
+- normalized page coordinates
+- pressure samples (`0..4096`)
+- page size
+- layer/thickness
+- pen color/type
+- optional `userData`
+
+The build includes `react-native-fs`, matching the file-I/O module used by Ratta's official sticker-plugin example.
+
+The next half of this proof is off-device: convert this real Supernote stroke sidecar into a standard PDF `/Ink` annotation and verify that BOOX NeoReader adopts it as editable ink.
 
 ## Build
 
-The build script scaffolds Ratta's official React Native 0.79.2 plugin template, overlays the InkBridge proof code, and runs the official `buildPlugin.sh` packager:
+The build script scaffolds Ratta's official React Native 0.79.2 plugin template, overlays the InkBridge proof code, installs `react-native-fs`, and runs the official `buildPlugin.sh` packager:
 
 ```bash
 cd supernote-poc
@@ -57,7 +79,7 @@ GitHub Actions also uploads the `.snplg` as the `inkbridge-supernote-poc` artifa
 3. Choose **Add Plugin** / update the existing InkBridge Test plugin.
 4. Open a disposable PDF/DOC in the native reader.
 
-Both proof buttons are registered with `showType: 0`, so they run headlessly and leave you in the document.
+All proof buttons are registered with `showType: 0`, so they run headlessly and leave you in the document.
 
 ### Test native duplication
 
@@ -72,4 +94,12 @@ Both proof buttons are registered with `showType: 0`, so they run headlessly and
 3. A BOOX-originated stroke should appear toward the lower-left area of the page.
 4. Lasso it, move it, and erase it with the native Supernote tools.
 
-Do not use an important document for these proofs. The plugin intentionally inserts native elements into the current file.
+### Export a real Supernote stroke for the reverse proof
+
+1. Open a disposable PDF/DOC page.
+2. Draw one distinctive native Supernote stroke.
+3. Tap **Export Supernote Test**.
+4. In the same folder as the open document, retrieve `InkBridge_Supernote_Stroke.json`.
+5. Use that sidecar to construct a standard PDF `/Ink` annotation for the BOOX test.
+
+Do not use an important document for these proofs. The plugin intentionally reads/inserts native elements and writes a test sidecar next to the current document.
