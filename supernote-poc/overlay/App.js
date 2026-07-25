@@ -1,6 +1,5 @@
 import React from 'react';
 import {StyleSheet, Text, View} from 'react-native';
-import RNFS from 'react-native-fs';
 import {
   PluginCommAPI,
   PluginFileAPI,
@@ -10,7 +9,7 @@ import {BOOX_NATIVE_STROKE_FIXTURE} from './booxFixture';
 
 const OFFSET_X_PX = 80;
 const OFFSET_Y_PX = 50;
-const SUPERNOTE_EXPORT_NAME = 'InkBridge_Supernote_Stroke.json';
+const LOG_CHUNK_SIZE = 1800;
 
 async function requireResult(promise, label) {
   const response = await promise;
@@ -147,8 +146,6 @@ export async function importBooxNativeStroke() {
     return PointUtils.androidPoint2Emr(pixel, pageSize);
   });
 
-  // BOOX reports pressure against maxPressure=4095; Supernote documents 0..4096.
-  // Preserve the measured pressure samples directly for this interoperability proof.
   const pressures = BOOX_NATIVE_STROKE_FIXTURE.samples.map(([, , pressure]) =>
     Math.max(0, Math.min(4096, Math.round(pressure))),
   );
@@ -215,13 +212,7 @@ export async function exportFirstSupernoteStroke() {
   });
 
   const slash = filePath.lastIndexOf('/');
-  if (slash < 0) {
-    throw new Error(`Could not determine document directory from path: ${filePath}`);
-  }
-  const documentDir = filePath.slice(0, slash);
-  const sourceFileName = filePath.slice(slash + 1);
-  const exportPath = `${documentDir}/${SUPERNOTE_EXPORT_NAME}`;
-
+  const sourceFileName = slash >= 0 ? filePath.slice(slash + 1) : filePath;
   const payload = {
     schemaVersion: 1,
     source: 'Supernote native stroke',
@@ -240,18 +231,21 @@ export async function exportFirstSupernoteStroke() {
     samples,
   };
 
-  await RNFS.writeFile(exportPath, JSON.stringify(payload, null, 2), 'utf8');
+  const compactJson = JSON.stringify(payload);
+  const chunkCount = Math.ceil(compactJson.length / LOG_CHUNK_SIZE);
+  for (let i = 0; i < chunkCount; i += 1) {
+    const chunk = compactJson.slice(i * LOG_CHUNK_SIZE, (i + 1) * LOG_CHUNK_SIZE);
+    console.log(`INKBRIDGE_EXPORT ${i + 1}/${chunkCount} ${chunk}`);
+  }
 
   return {
-    exportPath,
     page,
     sourceUuid: source.uuid ?? '(none)',
     sampleCount: samples.length,
+    chunkCount,
   };
 }
 
-// This component is retained as a harmless fallback. Proof buttons are
-// registered with showType: 0 so normal use never leaves NOTE/DOC.
 export default function App() {
   return (
     <View style={styles.root}>
