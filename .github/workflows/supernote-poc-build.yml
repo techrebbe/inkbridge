@@ -1,0 +1,47 @@
+name: Supernote POC build
+
+on:
+  pull_request:
+    paths:
+      - 'supernote-poc/**'
+      - '.github/workflows/supernote-poc-build.yml'
+  push:
+    branches:
+      - inkbridge-supernote-native-bridge-poc
+    paths:
+      - 'supernote-poc/**'
+      - '.github/workflows/supernote-poc-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build official Supernote plugin proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build .snplg
+        run: |
+          chmod +x supernote-poc/build.sh
+          supernote-poc/build.sh
+
+      - name: Verify package
+        run: |
+          test -n "$(find supernote-poc/out -maxdepth 1 -name '*.snplg' -print -quit)"
+          ls -lh supernote-poc/out/*.snplg
+
+      - name: Upload Supernote proof plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkbridge-supernote-poc
+          path: supernote-poc/out/*.snplg
+          if-no-files-found: error
+          retention-days: 7
