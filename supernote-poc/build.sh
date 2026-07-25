@@ -15,6 +15,7 @@ PROJECT="$WORK_ROOT/InkBridgePoc"
 cp "$ROOT/overlay/App.js" "$PROJECT/App.js"
 cp "$ROOT/overlay/index.js" "$PROJECT/index.js"
 cp "$ROOT/overlay/app.json" "$PROJECT/app.json"
+cp "$ROOT/overlay/booxFixture.js" "$PROJECT/booxFixture.js"
 cp "$ROOT/PluginConfig.json" "$PROJECT/PluginConfig.json"
 
 mkdir -p "$PROJECT/assets"
