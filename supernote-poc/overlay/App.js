@@ -34,7 +34,17 @@ async function currentDocumentContext() {
   return {filePath, page, pageSize};
 }
 
-async function createNativeStroke({filePath, page, points, pressures, thickness = 2}) {
+async function createNativeStroke({
+  filePath,
+  page,
+  points,
+  pressures,
+  thickness = 2,
+  layerNum = 0,
+  penColor = 0x00,
+  penType = 16,
+  userData,
+}) {
   if (!points.length || points.length !== pressures.length) {
     throw new Error('Stroke point/pressure arrays must be non-empty and the same length.');
   }
@@ -47,10 +57,11 @@ async function createNativeStroke({filePath, page, points, pressures, thickness 
     throw new Error('createElement returned a stroke without stroke accessors.');
   }
 
-  target.layerNum = 0;
+  target.layerNum = layerNum;
   target.thickness = thickness;
-  target.stroke.penColor = 0x00;
-  target.stroke.penType = 16;
+  target.stroke.penColor = penColor;
+  target.stroke.penType = penType;
+  if (userData) target.userData = userData;
 
   const pointsOk = await target.stroke.points.setRange(
     0,
@@ -108,37 +119,16 @@ export async function duplicateFirstStroke() {
     ? sourcePressures
     : new Array(movedPoints.length).fill(sourcePressures[0] ?? 1024);
 
-  const target = await requireResult(
-    PluginCommAPI.createElement(0),
-    'createElement',
-  );
-  if (!target?.stroke) {
-    throw new Error('createElement returned a stroke without stroke accessors.');
-  }
-
-  target.layerNum = source.layerNum ?? 0;
-  target.thickness = source.thickness ?? 2;
-  target.stroke.penColor = source.stroke.penColor ?? 0;
-  target.stroke.penType = source.stroke.penType ?? 16;
-
-  const pointsOk = await target.stroke.points.setRange(
-    0,
-    movedPoints.length - 1,
-    movedPoints,
-  );
-  if (!pointsOk) throw new Error('Could not write duplicate stroke points.');
-
-  const pressureOk = await target.stroke.pressures.setRange(
-    0,
-    pressures.length - 1,
+  await createNativeStroke({
+    filePath,
+    page,
+    points: movedPoints,
     pressures,
-  );
-  if (!pressureOk) throw new Error('Could not write duplicate stroke pressure data.');
-
-  await requireResult(
-    PluginFileAPI.insertElements(filePath, page, [target]),
-    'insertElements',
-  );
+    thickness: source.thickness ?? 2,
+    layerNum: source.layerNum ?? 0,
+    penColor: source.stroke.penColor ?? 0,
+    penType: source.stroke.penType ?? 16,
+  });
   await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
 
   return {filePath, page, sourceUuid: source.uuid ?? '(none)'};
@@ -161,18 +151,20 @@ export async function importBooxNativeStroke() {
     Math.max(0, Math.min(4096, Math.round(pressure))),
   );
 
-  const target = await createNativeStroke({
+  await createNativeStroke({
     filePath,
     page,
     points,
     pressures,
     thickness: 2,
+    layerNum: 0,
+    penColor: 0x00,
+    penType: 16,
+    userData: JSON.stringify({
+      inkBridgeOrigin: 'boox-neoreader',
+      sourceUuid: BOOX_NATIVE_STROKE_FIXTURE.sourceUuid,
+    }),
   });
-  target.userData = JSON.stringify({
-    inkBridgeOrigin: 'boox-neoreader',
-    sourceUuid: BOOX_NATIVE_STROKE_FIXTURE.sourceUuid,
-  });
-
   await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
 
   return {
