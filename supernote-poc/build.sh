@@ -26,9 +26,6 @@ base64 --decode "$PROJECT/assets/icon.png.b64" > "$PROJECT/assets/icon.png"
 rm "$PROJECT/assets/icon.png.b64"
 
 pushd "$PROJECT" >/dev/null
-# Ratta's official sticker plugin uses react-native-fs for plugin file I/O.
-# Include the same module so this proof can export a portable stroke sidecar.
-npm install --save-exact react-native-fs@2.20.0
 chmod +x buildPlugin.sh
 ./buildPlugin.sh
 popd >/dev/null
