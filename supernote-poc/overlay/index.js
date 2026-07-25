@@ -1,7 +1,7 @@
 import {AppRegistry, Image} from 'react-native';
 import App, {
   duplicateFirstStroke,
-  exportFirstSupernoteStroke,
+  exportCurrentSupernotePage,
   importBooxNativeStroke,
 } from './App';
 import {name as appName} from './app.json';
@@ -31,7 +31,7 @@ PluginManager.registerButton(1, ['NOTE', 'DOC'], {
 
 PluginManager.registerButton(1, ['NOTE', 'DOC'], {
   id: EXPORT_SUPERNOTE_BUTTON_ID,
-  name: 'Export Supernote Test',
+  name: 'Export Page Test',
   icon,
   showType: 0,
 });
@@ -41,39 +41,27 @@ PluginManager.registerButtonListener({
     if (event?.id === DUPLICATE_BUTTON_ID) {
       duplicateFirstStroke()
         .then(result => {
-          console.log(
-            `InkBridge inserted native duplicate on page ${result.page + 1}; source=${result.sourceUuid}`,
-          );
+          console.log(`InkBridge duplicate page=${result.page + 1} source=${result.sourceUuid}`);
         })
-        .catch(error => {
-          console.error('InkBridge native-stroke proof failed', error);
-        });
+        .catch(error => console.error('InkBridge duplicate proof failed', error));
       return;
     }
 
     if (event?.id === IMPORT_BOOX_BUTTON_ID) {
       importBooxNativeStroke()
         .then(result => {
-          console.log(
-            `InkBridge imported BOOX stroke on page ${result.page + 1}; source=${result.sourceUuid}; samples=${result.sampleCount}`,
-          );
+          console.log(`InkBridge BOOX import page=${result.page + 1} source=${result.sourceUuid} samples=${result.sampleCount}`);
         })
-        .catch(error => {
-          console.error('InkBridge BOOX-to-Supernote proof failed', error);
-        });
+        .catch(error => console.error('InkBridge BOOX import proof failed', error));
       return;
     }
 
     if (event?.id === EXPORT_SUPERNOTE_BUTTON_ID) {
-      exportFirstSupernoteStroke()
+      exportCurrentSupernotePage()
         .then(result => {
-          console.log(
-            `INKBRIDGE_EXPORT_DONE page=${result.page + 1} source=${result.sourceUuid} samples=${result.sampleCount} chunks=${result.chunkCount}`,
-          );
+          console.log(`INKBRIDGE_EXPORT_DONE page=${result.page + 1} strokes=${result.strokeCount} samples=${result.sampleCount} chunks=${result.chunkCount}`);
         })
-        .catch(error => {
-          console.error('InkBridge Supernote-to-BOOX export proof failed', error);
-        });
+        .catch(error => console.error('InkBridge page export failed', error));
     }
   },
 });
