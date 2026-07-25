@@ -1,57 +1,36 @@
 # InkBridge Supernote native-stroke proofs
 
-This is a deliberately tiny official Supernote plugin proof-of-concept.
+This is a deliberately small official Supernote plugin proof-of-concept that now also supports the first real-document round-trip test.
 
-## Native Supernote duplication proof
+## Proven hardware paths
 
-The **InkBridge Test** toolbar action:
+### Native Supernote duplication
 
-1. Reads the currently-open file and current page via `PluginCommAPI`.
-2. Enumerates the page's native `Element` objects with `PluginFileAPI.getElements`.
-3. Finds the first handwritten stroke.
-4. Reads its native EMR points and pressure samples.
-5. Creates a new stroke element using `PluginCommAPI.createElement(0)`.
-6. Copies the stroke style/pressure while offsetting the geometry by ~80×50 screen pixels.
-7. Inserts the new stroke with `PluginFileAPI.insertElements`.
-8. Calls `PluginCommAPI.reloadFile`.
+**InkBridge Test** reads a native Supernote stroke, creates a second native element through the official plugin API, and reloads the document. Hardware validation on a Nomad confirmed the inserted copy is lassoable, movable, and erasable like ordinary native handwriting.
 
-Hardware validation on a Nomad confirmed that the inserted copy is lassoable, movable, and erasable like ordinary native Supernote handwriting.
+### BOOX → Supernote
 
-## BOOX → Supernote transfer proof
+**Import BOOX Test** inserts geometry and pressure extracted from a real BOOX Note Air 4C NeoReader `#ONYX-STROKE`. Hardware validation confirmed that the BOOX-originated stroke becomes ordinary editable native Supernote ink.
 
-The **Import BOOX Test** toolbar action inserts a stroke extracted from a real BOOX Note Air 4C NeoReader `#ONYX-STROKE` annotation.
+## Real-document Supernote → BOOX export
 
-The fixture stores normalized page coordinates plus pressure samples from BOOX `/onyxpoints`. BOOX reports `maxPressure=4095`, while Ratta documents Supernote stroke pressure as `0..4096`, so the proof preserves pressure values directly.
+**Export Page Test** exports every native handwritten stroke on the currently-open page. For each stroke it preserves:
 
-At runtime the plugin:
-
-1. Reads the current Supernote page size.
-2. Maps the normalized BOOX page coordinates into Supernote page pixels.
-3. Converts those pixels to Supernote EMR coordinates via `PointUtils.androidPoint2Emr`.
-4. Creates a native pressure-pen stroke (`penType=16`).
-5. Inserts it with `PluginFileAPI.insertElements` and reloads the document.
-
-Hardware validation on a Nomad confirmed that the real BOOX-originated stroke is lassoable, movable, and erasable as ordinary native Supernote ink.
-
-## Supernote → BOOX export proof
-
-The **Export Supernote Test** toolbar action reads the first native handwritten stroke on the current page and serializes a compact portable JSON payload containing:
-
-- Supernote element UUID
+- Supernote UUID (used as the cross-device identity when present)
 - normalized page coordinates
 - pressure samples (`0..4096`)
-- page size
-- layer/thickness
-- pen color/type
+- layer and thickness
+- pen color and pen type
 - optional `userData`
+- source element index as a fallback identity/debugging aid
 
-For the proof, the payload is emitted to Android logcat as numbered `INKBRIDGE_EXPORT` chunks (1800 characters each), followed by an `INKBRIDGE_EXPORT_DONE` summary. This intentionally avoids extra native filesystem dependencies inside the Supernote plugin host.
+The page payload also includes the source filename, page index and page pixel size.
 
-The next half of this proof is off-device: reassemble the logged JSON, convert that real Supernote stroke into a standard PDF `/Ink` annotation, and verify that BOOX NeoReader adopts it as editable ink.
+For this proof the JSON is emitted to Android logcat as numbered `INKBRIDGE_EXPORT` chunks, followed by an `INKBRIDGE_EXPORT_DONE` summary. This keeps the plugin entirely on the already-proven `sn-plugin-lib` runtime path and avoids the native filesystem dependency that caused plugin 0.0.4 not to load in the document toolbar.
+
+The exported Supernote UUID will be carried into the PDF annotation `/NM` identity. NeoReader previously preserved external `/NM` values while adopting and editing standard PDF `/Ink`, so the returned PDF can be matched back to the original Supernote elements for move/delete/update testing.
 
 ## Build
-
-The build script scaffolds Ratta's official React Native 0.79.2 plugin template, overlays the InkBridge proof code, and runs the official `buildPlugin.sh` packager:
 
 ```bash
 cd supernote-poc
@@ -66,34 +45,43 @@ supernote-poc/out/*.snplg
 
 GitHub Actions also uploads the `.snplg` as the `inkbridge-supernote-poc` artifact.
 
-## Install / update on Supernote
+## First real-document round-trip test
 
-1. Copy the generated `.snplg` to the device's `MyStyle` directory.
-2. Open **Settings → Apps → Plugins**.
-3. Choose **Add Plugin** / update the existing InkBridge Test plugin.
-4. Open a disposable PDF/DOC in the native reader.
+Use a **copy** of a real PDF rather than an important original.
 
-All proof buttons are registered with `showType: 0`, so they run headlessly and leave you in the document.
+### 1. Annotate one real page on Supernote
 
-### Test native duplication
+Open the PDF normally and annotate one page naturally. Use several strokes; moving or erasing something before export is fine.
 
-1. Write one ordinary pen stroke on the current page.
-2. Tap **InkBridge Test**.
-3. Use the native lasso/eraser tools on the offset copied stroke.
+### 2. Capture the page export
 
-### Test real BOOX → Supernote translation
+Connect the Nomad over ADB and clear old logs:
 
-1. Open a disposable PDF/DOC page.
-2. Tap **Import BOOX Test**.
-3. A BOOX-originated stroke should appear toward the lower-left area of the page.
-4. Lasso it, move it, and erase it with the native Supernote tools.
+```powershell
+.\adb logcat -c
+```
 
-### Export a real Supernote stroke for the reverse proof
+Then start a live capture before tapping the toolbar action:
 
-1. Open a disposable PDF/DOC page and draw one distinctive native Supernote stroke.
-2. From a connected computer, clear logcat: `adb logcat -c`.
-3. Tap **Export Supernote Test** on the Nomad.
-4. Save only the export lines: `adb logcat -d | grep INKBRIDGE_EXPORT > InkBridge_Supernote_Stroke.log` (PowerShell: `adb logcat -d | Select-String INKBRIDGE_EXPORT | Set-Content InkBridge_Supernote_Stroke.log`).
-5. Use the numbered chunks to reconstruct the JSON and construct a standard PDF `/Ink` annotation for the BOOX test.
+```powershell
+.\adb logcat -v raw | Select-String INKBRIDGE_EXPORT | Tee-Object InkBridge_Page.log
+```
 
-Do not use an important document for these proofs. The plugin intentionally reads/inserts native elements; the reverse export proof only logs stroke data and does not modify the document.
+On the Nomad tap **Export Page Test**. After an `INKBRIDGE_EXPORT_DONE` line appears, stop the command with Ctrl+C and keep `InkBridge_Page.log`.
+
+Live capture is preferred to `adb logcat -d` because a heavily annotated real page may generate enough data to roll older chunks out of the log buffer.
+
+### 3. BOOX half of the round trip
+
+Reassemble the numbered chunks into the page JSON and convert each Supernote stroke to a standard PDF `/Ink` annotation using its stable identity. Open that PDF in NeoReader and verify the page looks correct and remains editable.
+
+Then on BOOX:
+
+1. add new handwriting;
+2. move at least one Supernote-originated stroke;
+3. delete at least one Supernote-originated stroke;
+4. use **Embed Data to PDF**.
+
+The returned PDF can then be parsed by stable annotation identity and translated into Supernote insert/modify/delete operations for the final return trip.
+
+The first real-document milestone is deliberately page-at-a-time and manually transferred. Automatic Syncthing/cloud transport and whole-document background synchronization come after this round-trip behavior is proven.
