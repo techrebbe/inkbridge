@@ -40,28 +40,49 @@ Relevant official documentation:
 - `PluginFileAPI.modifyElements`
 - `PluginCommAPI.reloadFile`
 
-## Next proof
+## Supernote proof result (Nomad, 2026-07-25)
 
-Build the smallest possible official Supernote plugin that runs inside NOTE/DOC and proves that plugin-created stroke data becomes an ordinary native editable Supernote stroke.
+The `InkBridge Test` official Supernote plugin duplicated an existing handwritten stroke by:
 
-Acceptance test:
+1. Reading the currently open file/page.
+2. Reading an existing native stroke's EMR points and pressure samples.
+3. Creating a new stroke element through the official plugin API.
+4. Writing offset geometry/pressure data into the new element.
+5. Inserting it with `PluginFileAPI.insertElements`.
+6. Reloading the current document.
 
-1. Open a PDF/DOC containing at least one handwritten native Supernote stroke.
-2. Tap an `InkBridge Test` toolbar button.
-3. Plugin reads current file path/page and enumerates page elements.
-4. Plugin takes one existing stroke, duplicates its geometry with a small X/Y offset, assigns a new element identity as required by the API, and inserts it via `PluginFileAPI.insertElements`.
-5. Plugin calls `PluginCommAPI.reloadFile`.
-6. The duplicated stroke must be selectable with native lasso, movable, erasable, and otherwise behave like ordinary Supernote ink.
+Hardware validation on the Nomad confirmed that the plugin-created duplicate is handled as ordinary native Supernote ink:
 
-If this passes, both device-native environments have a viable editable-ink bridge.
+- Native lasso selects it.
+- Native move transforms it.
+- Native eraser deletes/edits it.
 
-## Architecture after both proofs
+Therefore the Supernote half of the native editable-ink bridge is proven.
 
-InkBridge should become a lightweight translation/synchronization layer:
+## Proven architecture
 
-- BOOX side: NeoReader remains the reader. A companion bridge watches/merges PDF annotations and understands standard `/Ink` plus BOOX `/onyxtag` + `/onyxpoints` strokes.
-- Supernote side: official plugin remains inside native NOTE/DOC and translates native `Element/Stroke` data.
+Both devices can now consume externally-created ink while retaining native editability:
+
+- **BOOX:** NeoReader adopts standard external PDF `/Ink` annotations as editable annotations.
+- **Supernote:** the official plugin API can insert strokes that behave as normal native Supernote handwriting.
+
+InkBridge should therefore become a lightweight translation/synchronization layer rather than a replacement reader:
+
+- BOOX side: NeoReader remains the reader. A bridge extracts/merges standard `/Ink` plus BOOX `/onyxtag` + `/onyxpoints` annotations.
+- Supernote side: the official plugin remains inside native NOTE/DOC and translates native `Element/Stroke` data.
 - Portable identity/journal: small InkBridge sidecar for stable cross-device IDs, tombstones, origin metadata, and conflict resolution.
 - PDF remains the document carrier/interoperability surface, but not the sole multiwriter conflict database.
 
-The existing Inkread-based BOOX reader work remains a useful fallback and SDK reference, but PR #2 should stay draft while the native-bridge proof is evaluated.
+## Next proof: real cross-device transfer
+
+The next milestone is not another synthetic native-stroke test. It is a one-way end-to-end transfer using an actual shared PDF:
+
+1. Create a handwritten stroke in NeoReader and embed it into the PDF.
+2. Transfer that PDF to the Nomad.
+3. InkBridge reads the BOOX annotation geometry/style and inserts an equivalent native Supernote stroke through the official plugin API.
+4. Verify that the transferred stroke is lassoable, movable, and erasable on Supernote.
+5. Repeat in the opposite direction: read a native Supernote stroke, convert it to a standard editable PDF `/Ink` annotation, and verify NeoReader adopts it as editable ink.
+
+After both one-way transfers work, add stable cross-device stroke IDs, deletion/tombstone handling, transforms, and incremental synchronization.
+
+The existing Inkread-based BOOX reader work remains a useful fallback and SDK reference. PR #2 should stay draft while the native-reader bridge becomes the primary architecture.
