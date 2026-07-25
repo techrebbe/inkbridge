@@ -1,13 +1,11 @@
-import React, {useEffect, useState} from 'react';
+import React from 'react';
 import {StyleSheet, Text, View} from 'react-native';
 import {
   PluginCommAPI,
   PluginFileAPI,
-  PluginManager,
   PointUtils,
 } from 'sn-plugin-lib';
 
-const BUTTON_ID = 100;
 const OFFSET_X_PX = 80;
 const OFFSET_Y_PX = 50;
 
@@ -19,7 +17,7 @@ async function requireResult(promise, label) {
   return response.result;
 }
 
-async function duplicateFirstStroke() {
+export async function duplicateFirstStroke() {
   const filePath = await requireResult(
     PluginCommAPI.getCurrentFilePath(),
     'getCurrentFilePath',
@@ -101,35 +99,14 @@ async function duplicateFirstStroke() {
   return {filePath, page, sourceUuid: source.uuid ?? '(none)'};
 }
 
+// This component is retained as a harmless fallback, but the toolbar button is
+// intentionally registered with showType: 0 so normal use never leaves NOTE/DOC.
 export default function App() {
-  const [status, setStatus] = useState('Open a DOC/PDF page, write one stroke, then tap InkBridge Test.');
-
-  useEffect(() => {
-    const subscription = PluginManager.registerButtonListener({
-      onButtonPress: event => {
-        if (event?.id !== BUTTON_ID) return;
-        setStatus('Duplicating the first handwritten stroke on this page…');
-        duplicateFirstStroke()
-          .then(result => {
-            setStatus(
-              `Inserted a native duplicate on page ${result.page + 1}. Close this panel and lasso/move/erase the copied stroke.`,
-            );
-          })
-          .catch(error => {
-            console.error('InkBridge native-stroke proof failed', error);
-            setStatus(`InkBridge test failed: ${error?.message ?? String(error)}`);
-          });
-      },
-    });
-    return () => subscription?.remove?.();
-  }, []);
-
   return (
     <View style={styles.root}>
       <Text style={styles.title}>InkBridge Test</Text>
-      <Text style={styles.body}>{status}</Text>
-      <Text style={styles.hint}>
-        Success means the duplicated stroke behaves exactly like ordinary Supernote handwriting.
+      <Text style={styles.body}>
+        This proof now runs directly from the NOTE/DOC toolbar without opening a plugin panel.
       </Text>
     </View>
   );
@@ -152,11 +129,5 @@ const styles = StyleSheet.create({
     color: '#000000',
     fontSize: 18,
     lineHeight: 28,
-  },
-  hint: {
-    color: '#444444',
-    fontSize: 14,
-    lineHeight: 22,
-    marginTop: 24,
   },
 });
