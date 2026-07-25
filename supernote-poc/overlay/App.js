@@ -1,5 +1,6 @@
 import React from 'react';
 import {StyleSheet, Text, View} from 'react-native';
+import RNFS from 'react-native-fs';
 import {
   PluginCommAPI,
   PluginFileAPI,
@@ -9,6 +10,7 @@ import {BOOX_NATIVE_STROKE_FIXTURE} from './booxFixture';
 
 const OFFSET_X_PX = 80;
 const OFFSET_Y_PX = 50;
+const SUPERNOTE_EXPORT_NAME = 'InkBridge_Supernote_Stroke.json';
 
 async function requireResult(promise, label) {
   const response = await promise;
@@ -175,7 +177,80 @@ export async function importBooxNativeStroke() {
   };
 }
 
-// This component is retained as a harmless fallback. Both proof buttons are
+export async function exportFirstSupernoteStroke() {
+  const {filePath, page, pageSize} = await currentDocumentContext();
+  const elements = await requireResult(
+    PluginFileAPI.getElements(page, filePath),
+    'getElements',
+  );
+
+  const source = (elements ?? []).find(element => element?.type === 0 && element?.stroke);
+  if (!source?.stroke) {
+    throw new Error('No handwritten stroke found on the current page. Write one first, then run Export Supernote Test.');
+  }
+
+  const pointCount = await source.stroke.points.size();
+  if (!pointCount) {
+    throw new Error('The selected Supernote stroke has no points.');
+  }
+
+  const emrPoints = await source.stroke.points.getRange(0, pointCount);
+  const pressureCount = await source.stroke.pressures.size();
+  const sourcePressures = pressureCount > 0
+    ? await source.stroke.pressures.getRange(0, pressureCount)
+    : new Array(pointCount).fill(1024);
+  const pressures = sourcePressures.length === pointCount
+    ? sourcePressures
+    : new Array(pointCount).fill(sourcePressures[0] ?? 1024);
+
+  const maxPixelX = Math.max(1, pageSize.width - 1);
+  const maxPixelY = Math.max(1, pageSize.height - 1);
+  const samples = emrPoints.map((point, index) => {
+    const pixel = PointUtils.emrPoint2Android(point, pageSize);
+    return [
+      Math.max(0, Math.min(1, pixel.x / maxPixelX)),
+      Math.max(0, Math.min(1, pixel.y / maxPixelY)),
+      Math.max(0, Math.min(4096, Math.round(pressures[index] ?? 1024))),
+    ];
+  });
+
+  const slash = filePath.lastIndexOf('/');
+  if (slash < 0) {
+    throw new Error(`Could not determine document directory from path: ${filePath}`);
+  }
+  const documentDir = filePath.slice(0, slash);
+  const sourceFileName = filePath.slice(slash + 1);
+  const exportPath = `${documentDir}/${SUPERNOTE_EXPORT_NAME}`;
+
+  const payload = {
+    schemaVersion: 1,
+    source: 'Supernote native stroke',
+    sourceDevice: 'Supernote Nomad',
+    exportedAt: new Date().toISOString(),
+    sourceFileName,
+    pageIndex: page,
+    pageSizePx: pageSize,
+    sourceUuid: source.uuid ?? null,
+    layerNum: source.layerNum ?? 0,
+    thickness: source.thickness ?? 2,
+    penColor: source.stroke.penColor ?? 0x00,
+    penType: source.stroke.penType ?? 16,
+    userData: source.userData ?? null,
+    pressureRange: [0, 4096],
+    samples,
+  };
+
+  await RNFS.writeFile(exportPath, JSON.stringify(payload, null, 2), 'utf8');
+
+  return {
+    exportPath,
+    page,
+    sourceUuid: source.uuid ?? '(none)',
+    sampleCount: samples.length,
+  };
+}
+
+// This component is retained as a harmless fallback. Proof buttons are
 // registered with showType: 0 so normal use never leaves NOTE/DOC.
 export default function App() {
   return (
