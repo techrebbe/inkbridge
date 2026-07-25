@@ -174,22 +174,9 @@ export async function importBooxNativeStroke() {
   };
 }
 
-export async function exportFirstSupernoteStroke() {
-  const {filePath, page, pageSize} = await currentDocumentContext();
-  const elements = await requireResult(
-    PluginFileAPI.getElements(page, filePath),
-    'getElements',
-  );
-
-  const source = (elements ?? []).find(element => element?.type === 0 && element?.stroke);
-  if (!source?.stroke) {
-    throw new Error('No handwritten stroke found on the current page. Write one first, then run Export Supernote Test.');
-  }
-
+async function serializeSupernoteStroke(source, elementIndex, pageSize, page) {
   const pointCount = await source.stroke.points.size();
-  if (!pointCount) {
-    throw new Error('The selected Supernote stroke has no points.');
-  }
+  if (!pointCount) return null;
 
   const emrPoints = await source.stroke.points.getRange(0, pointCount);
   const pressureCount = await source.stroke.pressures.size();
@@ -211,24 +198,59 @@ export async function exportFirstSupernoteStroke() {
     ];
   });
 
-  const slash = filePath.lastIndexOf('/');
-  const sourceFileName = slash >= 0 ? filePath.slice(slash + 1) : filePath;
-  const payload = {
-    schemaVersion: 1,
-    source: 'Supernote native stroke',
-    sourceDevice: 'Supernote Nomad',
-    exportedAt: new Date().toISOString(),
-    sourceFileName,
-    pageIndex: page,
-    pageSizePx: pageSize,
-    sourceUuid: source.uuid ?? null,
+  const sourceUuid = source.uuid ?? null;
+  return {
+    sourceUuid,
+    sourceKey: sourceUuid ?? `supernote-page-${page}-element-${elementIndex}`,
+    elementIndex,
     layerNum: source.layerNum ?? 0,
     thickness: source.thickness ?? 2,
     penColor: source.stroke.penColor ?? 0x00,
     penType: source.stroke.penType ?? 16,
     userData: source.userData ?? null,
-    pressureRange: [0, 4096],
     samples,
+  };
+}
+
+export async function exportCurrentSupernotePage() {
+  const {filePath, page, pageSize} = await currentDocumentContext();
+  const elements = await requireResult(
+    PluginFileAPI.getElements(page, filePath),
+    'getElements',
+  );
+
+  const nativeStrokes = (elements ?? [])
+    .map((element, elementIndex) => ({element, elementIndex}))
+    .filter(({element}) => element?.type === 0 && element?.stroke);
+  if (!nativeStrokes.length) {
+    throw new Error('No handwritten strokes found on the current page. Annotate the page first, then run Export Supernote Test.');
+  }
+
+  const strokes = [];
+  let totalSamples = 0;
+  for (const {element, elementIndex} of nativeStrokes) {
+    const serialized = await serializeSupernoteStroke(element, elementIndex, pageSize, page);
+    if (serialized) {
+      totalSamples += serialized.samples.length;
+      strokes.push(serialized);
+    }
+  }
+  if (!strokes.length) {
+    throw new Error('Handwriting elements were found, but none contained stroke points.');
+  }
+
+  const slash = filePath.lastIndexOf('/');
+  const sourceFileName = slash >= 0 ? filePath.slice(slash + 1) : filePath;
+  const payload = {
+    schemaVersion: 2,
+    source: 'Supernote native annotated page',
+    sourceDevice: 'Supernote Nomad',
+    exportedAt: new Date().toISOString(),
+    sourceFileName,
+    pageIndex: page,
+    pageSizePx: pageSize,
+    pressureRange: [0, 4096],
+    strokes,
   };
 
   const compactJson = JSON.stringify(payload);
@@ -240,8 +262,8 @@ export async function exportFirstSupernoteStroke() {
 
   return {
     page,
-    sourceUuid: source.uuid ?? '(none)',
-    sampleCount: samples.length,
+    strokeCount: strokes.length,
+    sampleCount: totalSamples,
     chunkCount,
   };
 }
