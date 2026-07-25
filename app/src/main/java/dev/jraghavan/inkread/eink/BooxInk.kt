@@ -38,6 +38,7 @@ class BooxInk(
 
     private var touchHelper: TouchHelper? = null
     private var started = false
+    private var writable = true
 
     private val pendingPenPoints = ArrayList<TouchPoint>(2048)
     private var batchedPenPoints: List<TouchPoint>? = null
@@ -53,6 +54,9 @@ class BooxInk(
             batchedPenPoints = null
             penFromTouch = fromTouch
             if (fromTouch) return
+            // The portable core stores the selected true colour separately. Keep TouchHelper's
+            // transient wet-ink preview on the same colour so it doesn't appear black until repaint.
+            runCatching { touchHelper?.setStrokeColor(FirmwareInkStyle.currentPenColorArgb()) }
             touchPoint?.let { pendingPenPoints += TouchPoint(it) }
             listener.onBooxInkStatus("BOOX pen down")
         }
@@ -185,6 +189,7 @@ class BooxInk(
             helper.setRawDrawingEnabled(false)
             helper.closeRawDrawing()
             helper.setStrokeWidth(STROKE_WIDTH_PX)
+            helper.setStrokeColor(FirmwareInkStyle.currentPenColorArgb())
             helper.setLimitRect(mutableListOf(limit))
                 .setExcludeRect(emptyList())
                 .openRawDrawing()
@@ -194,11 +199,11 @@ class BooxInk(
             helper.setStrokeStyle(TouchHelper.STROKE_STYLE_FOUNTAIN)
             helper.setRawDrawingRenderEnabled(true)
             runCatching { EpdController.enablePost(1) }
-            helper.setRawDrawingEnabled(true)
+            helper.setRawDrawingEnabled(writable)
 
             touchHelper = helper
             started = true
-            listener.onBooxInkStatus("BOOX TouchHelper active: native render + portable capture")
+            listener.onBooxInkStatus("BOOX TouchHelper active: native render + raw capture")
             true
         } catch (t: Throwable) {
             listener.onBooxInkStatus("BOOX TouchHelper failed: ${t.javaClass.simpleName}: ${t.message}")
@@ -208,8 +213,35 @@ class BooxInk(
 
     /** Enable/disable BOOX firmware drawing without destroying the adapter. */
     fun setWritable(enabled: Boolean) {
+        writable = enabled
         runCatching { touchHelper?.setRawDrawingEnabled(enabled) }
             .onFailure { listener.onBooxInkStatus("BOOX ink toggle failed: ${it.message}") }
+    }
+
+    /**
+     * Clear transient BOOX wet ink for a page/tool transition.
+     *
+     * TouchHelper does not expose the Supernote-style clear-buffer transaction. Closing and reopening
+     * raw drawing drops the transient native layer while leaving the Activity/Surface intact. Do the
+     * operation on the view thread because TouchHelper owns view-bound native state.
+     */
+    fun clearAll() {
+        if (!started) return
+        surfaceView.post {
+            val helper = touchHelper ?: return@post
+            runCatching { helper.setRawDrawingEnabled(false) }
+            runCatching { helper.closeRawDrawing() }
+                .onFailure { listener.onBooxInkStatus("BOOX ink clear/close failed: ${it.message}") }
+            touchHelper = null
+            started = false
+            pendingPenPoints.clear()
+            batchedPenPoints = null
+            pendingEraserPoints.clear()
+            batchedEraserPoints = null
+            // Re-bind immediately so ReaderActivity's existing page/tool lifecycle can keep using one
+            // firmware-ink object. setup() reapplies the current [writable] state and selected colour.
+            setup()
+        }
     }
 
     /** Release the firmware/native drawing path. */
@@ -220,6 +252,10 @@ class BooxInk(
             .onFailure { listener.onBooxInkStatus("BOOX ink close failed: ${it.message}") }
         touchHelper = null
         started = false
+        pendingPenPoints.clear()
+        batchedPenPoints = null
+        pendingEraserPoints.clear()
+        batchedEraserPoints = null
     }
 
     private fun toSample(point: TouchPoint): Sample {
