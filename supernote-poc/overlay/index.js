@@ -33,7 +33,6 @@ PluginManager.registerButton(1, ['NOTE', 'DOC'], {
   id: EXPORT_SUPERNOTE_BUTTON_ID,
   name: 'Export Supernote Test',
   icon,
-  // Headless action: export one native stroke while staying in the document.
   showType: 0,
 });
 
@@ -69,7 +68,7 @@ PluginManager.registerButtonListener({
       exportFirstSupernoteStroke()
         .then(result => {
           console.log(
-            `InkBridge exported Supernote stroke from page ${result.page + 1}; source=${result.sourceUuid}; samples=${result.sampleCount}; path=${result.exportPath}`,
+            `INKBRIDGE_EXPORT_DONE page=${result.page + 1} source=${result.sourceUuid} samples=${result.sampleCount} chunks=${result.chunkCount}`,
           );
         })
         .catch(error => {
