@@ -35,13 +35,7 @@ Hardware validation on a Nomad confirmed that the real BOOX-originated stroke is
 
 ## Supernote → BOOX export proof
 
-The **Export Supernote Test** toolbar action reads the first native handwritten stroke on the current page and writes a portable JSON sidecar named:
-
-```text
-InkBridge_Supernote_Stroke.json
-```
-
-The sidecar is written into the same directory as the currently-open document. It contains:
+The **Export Supernote Test** toolbar action reads the first native handwritten stroke on the current page and serializes a compact portable JSON payload containing:
 
 - Supernote element UUID
 - normalized page coordinates
@@ -51,13 +45,13 @@ The sidecar is written into the same directory as the currently-open document. I
 - pen color/type
 - optional `userData`
 
-The build includes `react-native-fs`, matching the file-I/O module used by Ratta's official sticker-plugin example.
+For the proof, the payload is emitted to Android logcat as numbered `INKBRIDGE_EXPORT` chunks (1800 characters each), followed by an `INKBRIDGE_EXPORT_DONE` summary. This intentionally avoids extra native filesystem dependencies inside the Supernote plugin host.
 
-The next half of this proof is off-device: convert this real Supernote stroke sidecar into a standard PDF `/Ink` annotation and verify that BOOX NeoReader adopts it as editable ink.
+The next half of this proof is off-device: reassemble the logged JSON, convert that real Supernote stroke into a standard PDF `/Ink` annotation, and verify that BOOX NeoReader adopts it as editable ink.
 
 ## Build
 
-The build script scaffolds Ratta's official React Native 0.79.2 plugin template, overlays the InkBridge proof code, installs `react-native-fs`, and runs the official `buildPlugin.sh` packager:
+The build script scaffolds Ratta's official React Native 0.79.2 plugin template, overlays the InkBridge proof code, and runs the official `buildPlugin.sh` packager:
 
 ```bash
 cd supernote-poc
@@ -96,10 +90,10 @@ All proof buttons are registered with `showType: 0`, so they run headlessly and 
 
 ### Export a real Supernote stroke for the reverse proof
 
-1. Open a disposable PDF/DOC page.
-2. Draw one distinctive native Supernote stroke.
-3. Tap **Export Supernote Test**.
-4. In the same folder as the open document, retrieve `InkBridge_Supernote_Stroke.json`.
-5. Use that sidecar to construct a standard PDF `/Ink` annotation for the BOOX test.
+1. Open a disposable PDF/DOC page and draw one distinctive native Supernote stroke.
+2. From a connected computer, clear logcat: `adb logcat -c`.
+3. Tap **Export Supernote Test** on the Nomad.
+4. Save only the export lines: `adb logcat -d | grep INKBRIDGE_EXPORT > InkBridge_Supernote_Stroke.log` (PowerShell: `adb logcat -d | Select-String INKBRIDGE_EXPORT | Set-Content InkBridge_Supernote_Stroke.log`).
+5. Use the numbered chunks to reconstruct the JSON and construct a standard PDF `/Ink` annotation for the BOOX test.
 
-Do not use an important document for these proofs. The plugin intentionally reads/inserts native elements and writes a test sidecar next to the current document.
+Do not use an important document for these proofs. The plugin intentionally reads/inserts native elements; the reverse export proof only logs stroke data and does not modify the document.
