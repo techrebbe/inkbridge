@@ -28,7 +28,27 @@ The page payload also includes the source filename, page index and page pixel si
 
 For this proof the JSON is emitted to Android logcat as numbered `INKBRIDGE_EXPORT` chunks, followed by an `INKBRIDGE_EXPORT_DONE` summary. This keeps the plugin entirely on the already-proven `sn-plugin-lib` runtime path and avoids the native filesystem dependency that caused plugin 0.0.4 not to load in the document toolbar.
 
-The exported Supernote UUID will be carried into the PDF annotation `/NM` identity. NeoReader previously preserved external `/NM` values while adopting and editing standard PDF `/Ink`, so the returned PDF can be matched back to the original Supernote elements for move/delete/update testing.
+The exported Supernote UUID is carried into the PDF annotation `/NM` identity. NeoReader preserved those values while editing imported `/Ink`, allowing the returned PDF to be matched back to the original Supernote elements.
+
+## Real-document BOOX → Supernote return
+
+Plugin **0.0.6** adds **Apply BOOX Return Test** for the first returned real document. The embedded fixture was extracted from the BOOX PDF after the user:
+
+- moved the original long Supernote line;
+- deleted the original gray underline;
+- added seven new NeoReader-native handwriting strokes;
+- embedded NeoReader data back into the PDF.
+
+The action is intentionally specific to page 1 of the original annotated PDF. It:
+
+1. finds the moved original by its preserved Supernote UUID and updates its native point/pressure accessors;
+2. deletes the missing original underline by its native `numInPage`;
+3. inserts the seven new BOOX strokes as native Supernote pressure-pen elements;
+4. tags inserted strokes with BOOX source IDs so repeating the action does not duplicate them;
+5. applies the initial small vertical calibration correction found during the BOOX visual check;
+6. reloads the document once all operations finish.
+
+Text-selection highlights are not part of this ink proof. Supernote stores them outside the documented handwritten `Element` stream, so they require a separate annotation adapter.
 
 ## Build
 
@@ -82,6 +102,12 @@ Then on BOOX:
 3. delete at least one Supernote-originated stroke;
 4. use **Embed Data to PDF**.
 
-The returned PDF can then be parsed by stable annotation identity and translated into Supernote insert/modify/delete operations for the final return trip.
+### 4. Apply the BOOX return on Supernote
+
+1. Install/update InkBridge Test to **0.0.6**.
+2. Open page 1 of the original Supernote-annotated PDF copy—not the returned BOOX PDF.
+3. Tap **Apply BOOX Return Test** once.
+4. Verify the long line moved, the gray underline disappeared, the BOOX handwriting appeared, and the unchanged word was not duplicated.
+5. Verify all resulting handwriting remains lassoable, movable and erasable.
 
 The first real-document milestone is deliberately page-at-a-time and manually transferred. Automatic Syncthing/cloud transport and whole-document background synchronization come after this round-trip behavior is proven.
