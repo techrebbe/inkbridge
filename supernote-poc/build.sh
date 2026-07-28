@@ -17,6 +17,7 @@ cp "$ROOT/overlay/index.js" "$PROJECT/index.js"
 cp "$ROOT/overlay/app.json" "$PROJECT/app.json"
 cp "$ROOT/overlay/booxFixture.js" "$PROJECT/booxFixture.js"
 cp "$ROOT/overlay/booxReturnFixture.js" "$PROJECT/booxReturnFixture.js"
+cp "$ROOT/overlay/returnApply.js" "$PROJECT/returnApply.js"
 cp "$ROOT/PluginConfig.json" "$PROJECT/PluginConfig.json"
 
 mkdir -p "$PROJECT/assets"
