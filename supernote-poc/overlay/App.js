@@ -6,6 +6,7 @@ import {
   PointUtils,
 } from 'sn-plugin-lib';
 import {BOOX_NATIVE_STROKE_FIXTURE} from './booxFixture';
+import {BOOX_RETURN_FIXTURE} from './booxReturnFixture';
 
 const OFFSET_X_PX = 80;
 const OFFSET_Y_PX = 50;
@@ -33,6 +34,41 @@ async function currentDocumentContext() {
     'getPageSize',
   );
   return {filePath, page, pageSize};
+}
+
+function samplesToEmr(samples, pageSize, normalizedYOffset = 0) {
+  return samples.map(([normalizedX, normalizedY]) => {
+    const correctedY = Math.max(
+      0,
+      Math.min(1, normalizedY + normalizedYOffset),
+    );
+    const pixel = {
+      x: Math.max(
+        0,
+        Math.min(pageSize.width - 1, normalizedX * (pageSize.width - 1)),
+      ),
+      y: Math.max(
+        0,
+        Math.min(pageSize.height - 1, correctedY * (pageSize.height - 1)),
+      ),
+    };
+    return PointUtils.androidPoint2Emr(pixel, pageSize);
+  });
+}
+
+function samplePressures(samples) {
+  return samples.map(([, , pressure]) =>
+    Math.max(0, Math.min(4096, Math.round(pressure ?? 1024))),
+  );
+}
+
+function parseUserData(userData) {
+  if (!userData || typeof userData !== 'string') return null;
+  try {
+    return JSON.parse(userData);
+  } catch {
+    return null;
+  }
 }
 
 async function createNativeStroke({
@@ -137,18 +173,11 @@ export async function duplicateFirstStroke() {
 
 export async function importBooxNativeStroke() {
   const {filePath, page, pageSize} = await currentDocumentContext();
-
-  const points = BOOX_NATIVE_STROKE_FIXTURE.samples.map(([normalizedX, normalizedY]) => {
-    const pixel = {
-      x: Math.max(0, Math.min(pageSize.width - 1, normalizedX * (pageSize.width - 1))),
-      y: Math.max(0, Math.min(pageSize.height - 1, normalizedY * (pageSize.height - 1))),
-    };
-    return PointUtils.androidPoint2Emr(pixel, pageSize);
-  });
-
-  const pressures = BOOX_NATIVE_STROKE_FIXTURE.samples.map(([, , pressure]) =>
-    Math.max(0, Math.min(4096, Math.round(pressure))),
+  const points = samplesToEmr(
+    BOOX_NATIVE_STROKE_FIXTURE.samples,
+    pageSize,
   );
+  const pressures = samplePressures(BOOX_NATIVE_STROKE_FIXTURE.samples);
 
   await createNativeStroke({
     filePath,
@@ -171,6 +200,120 @@ export async function importBooxNativeStroke() {
     page,
     sourceUuid: BOOX_NATIVE_STROKE_FIXTURE.sourceUuid,
     sampleCount: points.length,
+  };
+}
+
+export async function applyBooxReturnTest() {
+  const {filePath, page, pageSize} = await currentDocumentContext();
+  if (page !== BOOX_RETURN_FIXTURE.sourcePageIndex) {
+    throw new Error(
+      `Open page ${BOOX_RETURN_FIXTURE.sourcePageIndex + 1} of the original annotated PDF before applying the BOOX return.`,
+    );
+  }
+
+  let elements = await requireResult(
+    PluginFileAPI.getElements(page, filePath),
+    'getElements',
+  );
+  elements = elements ?? [];
+
+  let modifiedCount = 0;
+  for (const moved of BOOX_RETURN_FIXTURE.moved) {
+    const target = elements.find(
+      element => element?.uuid === moved.sourceUuid && element?.type === 0 && element?.stroke,
+    );
+    if (!target?.stroke) {
+      throw new Error(`Could not find original Supernote stroke ${moved.sourceUuid}. Open the original annotated PDF copy.`);
+    }
+
+    const points = samplesToEmr(
+      moved.samples,
+      pageSize,
+      BOOX_RETURN_FIXTURE.pdfToSupernoteNormalizedYOffset,
+    );
+    const pressures = samplePressures(moved.samples);
+    const oldPointCount = await target.stroke.points.size();
+    if (oldPointCount !== points.length) {
+      throw new Error(
+        `Moved stroke point count changed unexpectedly (${oldPointCount} != ${points.length}).`,
+      );
+    }
+
+    const pointsOk = await target.stroke.points.setRange(
+      0,
+      points.length - 1,
+      points,
+    );
+    if (!pointsOk) throw new Error('Could not update moved stroke points.');
+
+    const pressureOk = await target.stroke.pressures.setRange(
+      0,
+      pressures.length - 1,
+      pressures,
+    );
+    if (!pressureOk) throw new Error('Could not update moved stroke pressure data.');
+
+    await requireResult(
+      PluginFileAPI.modifyElements(filePath, page, [target]),
+      'modifyElements',
+    );
+    modifiedCount += 1;
+  }
+
+  const deleteNums = BOOX_RETURN_FIXTURE.deleted
+    .map(uuid => elements.find(element => element?.uuid === uuid)?.numInPage)
+    .filter(numInPage => Number.isInteger(numInPage));
+  if (deleteNums.length) {
+    await requireResult(
+      PluginFileAPI.deleteElements(filePath, page, deleteNums),
+      'deleteElements',
+    );
+  }
+
+  elements = await requireResult(
+    PluginFileAPI.getElements(page, filePath),
+    'getElements after delete',
+  );
+  const importedIds = new Set(
+    (elements ?? [])
+      .map(element => parseUserData(element?.userData))
+      .filter(data => data?.inkBridgeOrigin === 'boox-neoreader-return')
+      .map(data => data.sourceUuid),
+  );
+
+  let insertedCount = 0;
+  for (const inserted of BOOX_RETURN_FIXTURE.inserted) {
+    if (importedIds.has(inserted.sourceUuid)) continue;
+    const points = samplesToEmr(
+      inserted.samples,
+      pageSize,
+      BOOX_RETURN_FIXTURE.pdfToSupernoteNormalizedYOffset,
+    );
+    const pressures = samplePressures(inserted.samples);
+    await createNativeStroke({
+      filePath,
+      page,
+      points,
+      pressures,
+      thickness: inserted.thickness ?? 400,
+      layerNum: 0,
+      penColor: inserted.penColor ?? 0x00,
+      penType: inserted.penType ?? 16,
+      userData: JSON.stringify({
+        inkBridgeOrigin: 'boox-neoreader-return',
+        sourceUuid: inserted.sourceUuid,
+      }),
+    });
+    insertedCount += 1;
+  }
+
+  await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
+  return {
+    filePath,
+    page,
+    modifiedCount,
+    deletedCount: deleteNums.length,
+    insertedCount,
   };
 }
 
@@ -223,7 +366,7 @@ export async function exportCurrentSupernotePage() {
     .map((element, elementIndex) => ({element, elementIndex}))
     .filter(({element}) => element?.type === 0 && element?.stroke);
   if (!nativeStrokes.length) {
-    throw new Error('No handwritten strokes found on the current page. Annotate the page first, then run Export Supernote Test.');
+    throw new Error('No handwritten strokes found on the current page. Annotate the page first, then run Export Page Test.');
   }
 
   const strokes = [];
