@@ -1,10 +1,10 @@
 import {AppRegistry, Image} from 'react-native';
 import App, {
-  applyBooxReturnTest,
   duplicateFirstStroke,
   exportCurrentSupernotePage,
   importBooxNativeStroke,
 } from './App';
+import {applyBooxReturnTest} from './returnApply';
 import {name as appName} from './app.json';
 import {PluginManager} from 'sn-plugin-lib';
 
