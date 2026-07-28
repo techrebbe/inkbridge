@@ -4,7 +4,7 @@ import App, {
   exportCurrentSupernotePage,
   importBooxNativeStroke,
 } from './App';
-import {applyBooxReturnTest} from './returnApply';
+import {applyBooxReturnTest} from './returnApplyV2';
 import {name as appName} from './app.json';
 import {PluginManager} from 'sn-plugin-lib';
 
@@ -79,7 +79,7 @@ PluginManager.registerButtonListener({
         .then(result => {
           console.log(`INKBRIDGE_RETURN_DONE page=${result.page + 1} modified=${result.modifiedCount} deleted=${result.deletedCount} inserted=${result.insertedCount}`);
         })
-        .catch(error => console.error('InkBridge BOOX return apply failed', error));
+        .catch(error => console.error('INKBRIDGE_RETURN_ERROR', error));
     }
   },
 });
