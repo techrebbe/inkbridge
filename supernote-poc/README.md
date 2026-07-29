@@ -65,7 +65,7 @@ Version 0.0.11 uses the exact vector centerline NeoReader wrote into each
 native BOOX stroke's PDF `/AP` appearance stream:
 
 - The seven letters now retain all 1,044 NeoReader-rendered samples instead of
-  the 235 over-decimated raw points used by 0.0.10.
+  the 251 over-decimated raw points used by 0.0.10.
 - Each appearance segment's variable width is converted back into a pressure
   sample so the native Supernote stroke keeps the visible BOOX weight changes.
 - The already-correct revision-3 long line is left untouched.
