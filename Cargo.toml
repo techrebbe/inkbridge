@@ -6,7 +6,7 @@
 # RR1-AC3: bare `cargo test -p reader-core` builds with `jni` absent from the resolved graph.
 [workspace]
 resolver = "2"
-members = ["build-dict", "device-eink", "inkread-daily", "inkread-dict", "inkread-epub", "inkread-ink", "inkread-lua", "inkread-pdftext", "inkread-update", "reader-core"]
+members = ["build-dict", "device-eink", "inkbridge-convert", "inkread-daily", "inkread-dict", "inkread-epub", "inkread-ink", "inkread-lua", "inkread-pdftext", "inkread-update", "reader-core"]
 
 [workspace.package]
 version = "1.0.1"
@@ -58,6 +58,10 @@ quick-xml = "0.41"
 # inkread-update (ADR-INKREAD-0014): semver comparison of the installed version against the GitHub
 # release tag. Pure Rust, MIT/Apache (AGPL-compatible → auto-passes check-licenses.sh).
 semver = "1"
+# InkBridge native-environment bridge: inspect standard PDF annotations and
+# NeoReader's embedded appearance streams without invoking an external PDF tool.
+lopdf = { version = "0.44", default-features = false }
+sha2 = "0.10"
 
 [profile.release]
 # A reader on a battery e-ink device: optimize for size + speed, strip symbols.

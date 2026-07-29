@@ -73,16 +73,20 @@ InkBridge should therefore become a lightweight translation/synchronization laye
 - Portable identity/journal: small InkBridge sidecar for stable cross-device IDs, tombstones, origin metadata, and conflict resolution.
 - PDF remains the document carrier/interoperability surface, but not the sole multiwriter conflict database.
 
-## Next proof: real cross-device transfer
+## Full round-trip hardware result
 
-The next milestone is not another synthetic native-stroke test. It is a one-way end-to-end transfer using an actual shared PDF:
+The full handwriting round trip passed on a Note Air 4C and Nomad:
 
-1. Create a handwritten stroke in NeoReader and embed it into the PDF.
-2. Transfer that PDF to the Nomad.
-3. InkBridge reads the BOOX annotation geometry/style and inserts an equivalent native Supernote stroke through the official plugin API.
-4. Verify that the transferred stroke is lassoable, movable, and erasable on Supernote.
-5. Repeat in the opposite direction: read a native Supernote stroke, convert it to a standard editable PDF `/Ink` annotation, and verify NeoReader adopts it as editable ink.
+- Supernote strokes arrived in NeoReader as editable PDF ink.
+- NeoReader moved and deleted Supernote-originated strokes while preserving
+  their identities.
+- Native BOOX handwriting returned as native Supernote strokes.
+- The returned handwriting remained lassoable, movable, and erasable.
+- NeoReader vector appearance streams, rather than the raw `onyxpoints` record,
+  reproduced the exact rendered BOOX centerline.
 
-After both one-way transfers work, add stable cross-device stroke IDs, deletion/tombstone handling, transforms, and incremental synchronization.
+The next implementation is no longer a document-specific proof. See
+[`INKBRIDGE-MANIFEST-WORKFLOW.md`](INKBRIDGE-MANIFEST-WORKFLOW.md) for the
+generic operation manifest and Supernote apply path.
 
 The existing Inkread-based BOOX reader work remains a useful fallback and SDK reference. PR #2 should stay draft while the native-reader bridge becomes the primary architecture.

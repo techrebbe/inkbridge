@@ -1,0 +1,65 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+  descriptorMatches,
+  geometryFingerprint,
+  strokeDescriptor,
+  validateManifest,
+} from '../overlay/manifestCore.js';
+
+const style = {
+  layerNum: 0,
+  thickness: 400,
+  penColor: 0,
+  penType: 16,
+};
+const samples = [
+  [0.1, 0.2, 1000],
+  [0.2, 0.3, 1100],
+];
+
+test('geometry fingerprint is stable across Rust and JavaScript', () => {
+  assert.equal(geometryFingerprint(style, samples), 'fnv1a32:ab10185f');
+});
+
+test('descriptor matching tolerates tiny native coordinate round trips', () => {
+  const original = strokeDescriptor({nativeStyle: style, samples});
+  const roundTripped = strokeDescriptor({
+    nativeStyle: style,
+    samples: [
+      [0.1005, 0.1995, 1000],
+      [0.1995, 0.3005, 1100],
+    ],
+  });
+  assert.equal(descriptorMatches(original, roundTripped), true);
+});
+
+test('manifest validation rejects an unconfigured plugin', () => {
+  assert.throws(() => validateManifest(null), /no InkBridge manifest/);
+});
+
+test('manifest validation accepts an upsert operation', () => {
+  const snapshot = {
+    sourceUuid: 'stroke-1',
+    origin: 'boox-neoreader',
+    pageIndex: 0,
+    nativeStyle: style,
+    samples,
+    geometryFingerprint: geometryFingerprint(style, samples),
+  };
+  assert.doesNotThrow(() =>
+    validateManifest({
+      schemaVersion: 1,
+      manifestId: 'manifest-1',
+      operations: [
+        {
+          type: 'upsert_stroke',
+          sourceUuid: 'stroke-1',
+          pageIndex: 0,
+          before: null,
+          after: snapshot,
+        },
+      ],
+    }),
+  );
+});

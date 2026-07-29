@@ -1,0 +1,95 @@
+# InkBridge manifest workflow
+
+InkBridge keeps the manufacturer readers in place:
+
+```text
+Supernote DOC/NOTE
+  -> Export Page Test (portable baseline)
+  -> BOOX NeoReader
+  -> Embed Data to PDF
+  -> inkbridge-convert (add/update/delete manifest)
+  -> Supernote Apply InkBridge Sync
+```
+
+This is the first generic implementation of the native-environment bridge. It
+replaces the document-specific fixtures used by the hardware proofs.
+
+## 1. Capture the Supernote baseline
+
+For each annotated page that will participate in the round trip, run **Export
+Page Test** and save the `INKBRIDGE_EXPORT` log lines. The converter accepts
+either that log or the reconstructed JSON payload.
+
+## 2. Embed NeoReader data
+
+Open the same PDF in NeoReader, make edits, and use **Embed Data to PDF**. The
+PDF is the BOOX-side transport for this milestone.
+
+## 3. Create a manifest
+
+```bash
+cargo run -p inkbridge-convert -- extract \
+  --pdf NeoReader-embedded.pdf \
+  --baseline Supernote-page-1.log \
+  --baseline Supernote-page-2.log \
+  --output inkbridge-manifest.json
+```
+
+The result contains portable, page-normalized operations:
+
+- `upsert_stroke` for new or changed handwriting;
+- `delete_stroke` for a baseline stroke no longer present in the embedded PDF;
+- stable source identities;
+- native Supernote style and pressure data where the baseline supplies them;
+- a deterministic geometry fingerprint for safe repeated application.
+
+Native BOOX `#ONYX-STROKE` geometry comes from NeoReader's vector `/AP`
+appearance stream, which the Note Air 4C hardware proof established as the
+rendered source of truth. Standard PDF `/Ink` geometry comes from `/InkList`.
+
+## 4. Build the Supernote sync package
+
+```bash
+supernote-poc/build.sh inkbridge-manifest.json
+```
+
+Install the resulting `.snplg`, open the target document, and tap **Apply
+InkBridge Sync**. The plugin refuses to apply a baseline-backed manifest when a
+different filename is open.
+
+The plugin resolves an existing native stroke by:
+
+1. its Supernote/InkBridge identity;
+2. an InkBridge tag from an earlier application;
+3. a unique native geometry and style match.
+
+Updates insert the replacement before deleting the superseded native element,
+matching the behavior validated on the Nomad. Re-running the same package is
+idempotent and reports already-current or already-absent operations as skipped.
+
+## Logs
+
+Use:
+
+```text
+INKBRIDGE_SYNC_OP
+INKBRIDGE_SYNC_DONE
+INKBRIDGE_SYNC_ERROR
+```
+
+A successful completion looks like:
+
+```text
+INKBRIDGE_SYNC_DONE manifest=... operations=... added=... updated=... deleted=... skipped=...
+```
+
+## Current transport boundary
+
+The plugin-preview runtime did not reliably load the earlier arbitrary
+filesystem dependency, so this milestone embeds the manifest into a
+document-specific `.snplg` package. The converter and importer are transport
+independent; a companion app, local service, or supported future plugin file API
+can replace this packaging step without changing the manifest or merge logic.
+
+Text-selection highlights remain a separate annotation class and are not part of
+the handwriting manifest.
