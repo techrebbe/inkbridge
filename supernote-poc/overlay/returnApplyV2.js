@@ -5,6 +5,8 @@ import {
 } from 'sn-plugin-lib';
 import {BOOX_RETURN_FIXTURE} from './booxReturnFixture';
 
+const RETURN_INK_REVISION = 2;
+
 const MOVED_FALLBACKS = [
   {
     thickness: 700,
@@ -128,7 +130,15 @@ async function candidateMatches(candidate, fallback, pageSize, expectedPointCoun
   );
 }
 
-async function findStroke(elements, sourceUuid, fallback, pageSize, expectedPointCount, label) {
+async function findStroke(
+  elements,
+  sourceUuid,
+  fallback,
+  pageSize,
+  expectedPointCount,
+  label,
+  allowAbsent = false,
+) {
   const exact = elements.find(
     element =>
       element?.type === 0 &&
@@ -147,6 +157,10 @@ async function findStroke(elements, sourceUuid, fallback, pageSize, expectedPoin
     }
   }
 
+  if (matches.length === 0 && allowAbsent) {
+    console.log(`INKBRIDGE_RETURN_MATCH ${label} method=already-absent`);
+    return null;
+  }
   if (matches.length !== 1) {
     const nums = matches.map(item => item?.numInPage).join(',');
     throw new Error(
@@ -203,6 +217,12 @@ async function createNativeStroke({
   return target;
 }
 
+function returnInkData(element) {
+  const data = parseUserData(element?.userData);
+  if (data?.inkBridgeOrigin !== 'boox-neoreader-return') return null;
+  return data;
+}
+
 export async function applyBooxReturnTest() {
   const {filePath, page, pageSize} = await currentDocumentContext();
   if (page !== BOOX_RETURN_FIXTURE.sourcePageIndex) {
@@ -215,6 +235,18 @@ export async function applyBooxReturnTest() {
     PluginFileAPI.getElements(page, filePath),
     'getElements',
   )) ?? [];
+
+  const insertedUuidSet = new Set(
+    BOOX_RETURN_FIXTURE.inserted.map(item => item.sourceUuid),
+  );
+  const priorReturnElements = elements.filter(element => {
+    const data = parseUserData(element?.userData);
+    return (
+      data?.inkBridgeOrigin === 'boox-neoreader-return-moved' ||
+      (data?.inkBridgeOrigin === 'boox-neoreader-return' && insertedUuidSet.has(data.sourceUuid))
+    );
+  });
+  const isRepairRun = priorReturnElements.length > 0;
 
   const movedTargets = [];
   for (let index = 0; index < BOOX_RETURN_FIXTURE.moved.length; index += 1) {
@@ -246,12 +278,13 @@ export async function applyBooxReturnTest() {
         pageSize,
         null,
         `deleted-${index}`,
+        isRepairRun,
       ),
     );
   }
 
   console.log(
-    `INKBRIDGE_RETURN_STAGE resolved moved=${movedTargets.length} deleted=${deletedTargets.length}`,
+    `INKBRIDGE_RETURN_STAGE resolved moved=${movedTargets.length} deleted=${deletedTargets.filter(Boolean).length} repair=${isRepairRun}`,
   );
 
   let modifiedCount = 0;
@@ -277,16 +310,18 @@ export async function applyBooxReturnTest() {
     target.userData = JSON.stringify({
       inkBridgeOrigin: 'boox-neoreader-return-moved',
       sourceUuid: moved.sourceUuid,
+      inkBridgeRevision: RETURN_INK_REVISION,
     });
     await requireResult(
       PluginFileAPI.modifyElements(filePath, page, [target]),
       'modifyElements',
     );
     modifiedCount += 1;
-    console.log(`INKBRIDGE_RETURN_STAGE modified=${modifiedCount}`);
   }
+  console.log(`INKBRIDGE_RETURN_STAGE modified=${modifiedCount}`);
 
   const deleteNums = deletedTargets
+    .filter(Boolean)
     .map(target => target?.numInPage)
     .filter(numInPage => Number.isInteger(numInPage));
   if (deleteNums.length) {
@@ -299,41 +334,69 @@ export async function applyBooxReturnTest() {
 
   elements = (await requireResult(
     PluginFileAPI.getElements(page, filePath),
-    'getElements after delete',
+    'getElements after source updates',
   )) ?? [];
-  const importedIds = new Set(
-    elements
-      .map(element => parseUserData(element?.userData))
-      .filter(data => data?.inkBridgeOrigin === 'boox-neoreader-return')
-      .map(data => data.sourceUuid),
-  );
 
-  let insertedCount = 0;
-  for (const inserted of BOOX_RETURN_FIXTURE.inserted) {
-    if (importedIds.has(inserted.sourceUuid)) continue;
-    const points = samplesToEmr(
-      inserted.samples,
-      pageSize,
-      BOOX_RETURN_FIXTURE.pdfToSupernoteNormalizedYOffset,
-    );
-    const pressures = samplePressures(inserted.samples);
-    await createNativeStroke({
-      filePath,
-      page,
-      points,
-      pressures,
-      thickness: inserted.thickness ?? 400,
-      layerNum: 0,
-      penColor: inserted.penColor ?? 0x00,
-      penType: inserted.penType ?? 16,
-      userData: JSON.stringify({
-        inkBridgeOrigin: 'boox-neoreader-return',
-        sourceUuid: inserted.sourceUuid,
-      }),
-    });
-    insertedCount += 1;
+  const existingBySource = new Map();
+  for (const element of elements) {
+    const data = returnInkData(element);
+    if (!data || !insertedUuidSet.has(data.sourceUuid)) continue;
+    const list = existingBySource.get(data.sourceUuid) ?? [];
+    list.push({element, data});
+    existingBySource.set(data.sourceUuid, list);
   }
-  console.log(`INKBRIDGE_RETURN_STAGE inserted=${insertedCount}`);
+
+  const alreadyCorrect = BOOX_RETURN_FIXTURE.inserted.every(inserted => {
+    const matches = existingBySource.get(inserted.sourceUuid) ?? [];
+    return matches.length === 1 && matches[0].data.inkBridgeRevision === RETURN_INK_REVISION;
+  });
+
+  let replacedCount = 0;
+  let insertedCount = 0;
+  if (!alreadyCorrect) {
+    const replaceNums = [];
+    for (const matches of existingBySource.values()) {
+      for (const {element} of matches) {
+        if (Number.isInteger(element?.numInPage)) replaceNums.push(element.numInPage);
+      }
+    }
+    if (replaceNums.length) {
+      await requireResult(
+        PluginFileAPI.deleteElements(filePath, page, replaceNums),
+        'delete incorrect BOOX return strokes',
+      );
+      replacedCount = replaceNums.length;
+    }
+    console.log(`INKBRIDGE_RETURN_STAGE replaced=${replacedCount}`);
+
+    for (const inserted of BOOX_RETURN_FIXTURE.inserted) {
+      const points = samplesToEmr(
+        inserted.samples,
+        pageSize,
+        BOOX_RETURN_FIXTURE.pdfToSupernoteNormalizedYOffset,
+      );
+      const pressures = samplePressures(inserted.samples);
+      await createNativeStroke({
+        filePath,
+        page,
+        points,
+        pressures,
+        thickness: inserted.thickness ?? 400,
+        layerNum: 0,
+        penColor: inserted.penColor ?? 0x00,
+        penType: inserted.penType ?? 16,
+        userData: JSON.stringify({
+          inkBridgeOrigin: 'boox-neoreader-return',
+          sourceUuid: inserted.sourceUuid,
+          inkBridgeRevision: RETURN_INK_REVISION,
+        }),
+      });
+      insertedCount += 1;
+    }
+  }
+  console.log(
+    `INKBRIDGE_RETURN_STAGE inserted=${insertedCount} alreadyCorrect=${alreadyCorrect}`,
+  );
 
   await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
   return {
@@ -341,6 +404,8 @@ export async function applyBooxReturnTest() {
     page,
     modifiedCount,
     deletedCount: deleteNums.length,
+    replacedCount,
     insertedCount,
+    alreadyCorrect,
   };
 }
