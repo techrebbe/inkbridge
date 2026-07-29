@@ -50,6 +50,15 @@ The action is intentionally specific to page 1 of the original annotated PDF. It
 
 Text-selection highlights are not part of this ink proof. Supernote stores them outside the documented handwritten `Element` stream, so they require a separate annotation adapter.
 
+### Repair build 0.0.10
+
+Version 0.0.10 corrects the two geometry sources independently:
+
+- The moved Supernote-originated line is restored from NeoReader's authoritative standard PDF `/InkList`. Version 0.0.9 incorrectly replaced it with a BOOX-native point stream that described a diagonal spanning most of the page.
+- New NeoReader handwriting uses the readable native `/onyxpoints` centerline, with four low-pressure terminal pen-up outliers removed. Those points created visible tails on Supernote that NeoReader does not show.
+- The moved line is replaced atomically instead of shortening its point accessor in place. This guarantees that the 207 surplus points written by version 0.0.9 cannot remain at the end of the repaired stroke.
+- Revision tags make the repair safe to inspect after one completed run and prevent the corrected BOOX strokes from being duplicated.
+
 ## Build
 
 ```bash

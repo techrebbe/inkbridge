@@ -3,9 +3,9 @@ import {
   PluginFileAPI,
   PointUtils,
 } from 'sn-plugin-lib';
-import {BOOX_RETURN_FIXTURE} from './booxReturnFixture';
+import {BOOX_RETURN_FIXTURE_V3 as BOOX_RETURN_FIXTURE} from './booxReturnFixtureV3';
 
-const RETURN_INK_REVISION = 2;
+const RETURN_INK_REVISION = 3;
 
 const MOVED_FALLBACKS = [
   {
@@ -288,9 +288,21 @@ export async function applyBooxReturnTest() {
   );
 
   let modifiedCount = 0;
+  let movedReplacedCount = 0;
+  let movedAlreadyCorrectCount = 0;
   for (let index = 0; index < BOOX_RETURN_FIXTURE.moved.length; index += 1) {
     const moved = BOOX_RETURN_FIXTURE.moved[index];
     const target = movedTargets[index];
+    const targetData = parseUserData(target?.userData);
+    const isAlreadyCorrect =
+      targetData?.inkBridgeOrigin === 'boox-neoreader-return-moved' &&
+      targetData?.sourceUuid === moved.sourceUuid &&
+      targetData?.inkBridgeRevision === RETURN_INK_REVISION;
+    if (isAlreadyCorrect) {
+      movedAlreadyCorrectCount += 1;
+      continue;
+    }
+
     const points = samplesToEmr(
       moved.samples,
       pageSize,
@@ -298,27 +310,47 @@ export async function applyBooxReturnTest() {
     );
     const pressures = samplePressures(moved.samples);
 
-    const pointsOk = await target.stroke.points.setRange(0, points.length - 1, points);
-    if (!pointsOk) throw new Error('Could not update moved stroke points.');
-    const pressureOk = await target.stroke.pressures.setRange(
-      0,
-      pressures.length - 1,
+    await createNativeStroke({
+      filePath,
+      page,
+      points,
       pressures,
-    );
-    if (!pressureOk) throw new Error('Could not update moved stroke pressure data.');
-
-    target.userData = JSON.stringify({
-      inkBridgeOrigin: 'boox-neoreader-return-moved',
-      sourceUuid: moved.sourceUuid,
-      inkBridgeRevision: RETURN_INK_REVISION,
+      thickness: target.thickness ?? 700,
+      layerNum: target.layerNum ?? 0,
+      penColor: target.stroke.penColor ?? 0x00,
+      penType: target.stroke.penType ?? 10,
+      userData: JSON.stringify({
+        inkBridgeOrigin: 'boox-neoreader-return-moved',
+        sourceUuid: moved.sourceUuid,
+        inkBridgeRevision: RETURN_INK_REVISION,
+      }),
     });
+    const elementsWithReplacement = (await requireResult(
+      PluginFileAPI.getElements(page, filePath),
+      'getElements after moved-stroke replacement insert',
+    )) ?? [];
+    const supersededTarget = elementsWithReplacement.find(element => {
+      if (target.uuid && element?.uuid === target.uuid) return true;
+      const data = parseUserData(element?.userData);
+      return (
+        data?.inkBridgeOrigin === 'boox-neoreader-return-moved' &&
+        data?.sourceUuid === moved.sourceUuid &&
+        data?.inkBridgeRevision !== RETURN_INK_REVISION
+      );
+    });
+    if (!Number.isInteger(supersededTarget?.numInPage)) {
+      throw new Error('Could not locate the superseded moved stroke after inserting its replacement.');
+    }
     await requireResult(
-      PluginFileAPI.modifyElements(filePath, page, [target]),
-      'modifyElements',
+      PluginFileAPI.deleteElements(filePath, page, [supersededTarget.numInPage]),
+      'delete superseded moved stroke',
     );
+    movedReplacedCount += 1;
     modifiedCount += 1;
   }
-  console.log(`INKBRIDGE_RETURN_STAGE modified=${modifiedCount}`);
+  console.log(
+    `INKBRIDGE_RETURN_STAGE modified=${modifiedCount} movedReplaced=${movedReplacedCount} movedAlreadyCorrect=${movedAlreadyCorrectCount}`,
+  );
 
   const deleteNums = deletedTargets
     .filter(Boolean)
@@ -403,6 +435,8 @@ export async function applyBooxReturnTest() {
     filePath,
     page,
     modifiedCount,
+    movedReplacedCount,
+    movedAlreadyCorrectCount,
     deletedCount: deleteNums.length,
     replacedCount,
     insertedCount,
