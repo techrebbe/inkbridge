@@ -17,13 +17,13 @@ fn run() -> Result<(), String> {
         return Err(usage());
     }
 
-    let mut pdf = None;
-    let mut output = None;
+    let mut pdf: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
     let mut baselines = Vec::new();
     let mut y_offset = -0.0008f64;
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--pdf" => pdf = Some(required_value(&mut args, "--pdf")?.into()),
+            "--pdf" => pdf = Some(PathBuf::from(required_value(&mut args, "--pdf")?)),
             "--baseline" => baselines.push(PathBuf::from(required_value(&mut args, "--baseline")?)),
             "--output" => output = Some(PathBuf::from(required_value(&mut args, "--output")?)),
             "--y-offset" => {
