@@ -77,7 +77,9 @@ PluginManager.registerButtonListener({
     if (event?.id === APPLY_BOOX_RETURN_BUTTON_ID) {
       applyBooxReturnTest()
         .then(result => {
-          console.log(`INKBRIDGE_RETURN_DONE page=${result.page + 1} modified=${result.modifiedCount} deleted=${result.deletedCount} inserted=${result.insertedCount}`);
+          console.log(
+            `INKBRIDGE_RETURN_DONE page=${result.page + 1} modified=${result.modifiedCount} deleted=${result.deletedCount} replaced=${result.replacedCount} inserted=${result.insertedCount} alreadyCorrect=${result.alreadyCorrect}`,
+          );
         })
         .catch(error => console.error('INKBRIDGE_RETURN_ERROR', error));
     }
