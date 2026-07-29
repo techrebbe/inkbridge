@@ -122,9 +122,7 @@ fn extract_json(text: &str) -> Result<String, String> {
             chunks.len()
         ));
     }
-    Ok((1..=total)
-        .map(|index| chunks[&index].as_str())
-        .collect())
+    Ok((1..=total).map(|index| chunks[&index].as_str()).collect())
 }
 
 pub fn index_baseline(strokes: Vec<StrokeSnapshot>) -> HashMap<String, StrokeSnapshot> {
