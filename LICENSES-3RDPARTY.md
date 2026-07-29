@@ -13,6 +13,13 @@ the dependency set changes.
 
 - **WordNet 3.0** (Princeton University) — the English dictionary corpus (definitions + synsets) imported into `app/src/main/assets/dict.db` by `scripts/stage-dict.sh`, sourced from the Hu Zheng StarDict packaging (`download.huzheng.org`). **WordNet License** — permissive: free use/redistribution provided the Princeton copyright + license notice is retained (ADR-INKREAD-0009 / RR22-FR5). The `dict.db` artifact is gitignored and regenerated at build time. Other languages are looked up online (opt-in) and cached, not bundled.
 
+## InkBridge converter
+
+- **lopdf 0.44.0** — **MIT** — parses standard PDF `/Ink` annotations and
+  NeoReader vector appearance streams without an external PDF process.
+- **sha2 0.10.9** — **MIT OR Apache-2.0** — creates deterministic document and
+  manifest identities.
+
 ## Rust dependencies (163 crates, all features)
 
 | Crate | Version | License (SPDX) |

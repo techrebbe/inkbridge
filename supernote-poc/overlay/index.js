@@ -5,6 +5,7 @@ import App, {
   importBooxNativeStroke,
 } from './App';
 import {applyBooxReturnTest} from './returnApplyV2';
+import {applyEmbeddedManifest} from './manifestApply';
 import {name as appName} from './app.json';
 import {PluginManager} from 'sn-plugin-lib';
 
@@ -12,6 +13,7 @@ const DUPLICATE_BUTTON_ID = 100;
 const IMPORT_BOOX_BUTTON_ID = 101;
 const EXPORT_SUPERNOTE_BUTTON_ID = 102;
 const APPLY_BOOX_RETURN_BUTTON_ID = 103;
+const APPLY_INKBRIDGE_SYNC_BUTTON_ID = 104;
 const icon = Image.resolveAssetSource(require('./assets/icon.png')).uri;
 
 AppRegistry.registerComponent(appName, () => App);
@@ -41,6 +43,13 @@ PluginManager.registerButton(1, ['NOTE', 'DOC'], {
 PluginManager.registerButton(1, ['NOTE', 'DOC'], {
   id: APPLY_BOOX_RETURN_BUTTON_ID,
   name: 'Apply BOOX Return Test',
+  icon,
+  showType: 0,
+});
+
+PluginManager.registerButton(1, ['NOTE', 'DOC'], {
+  id: APPLY_INKBRIDGE_SYNC_BUTTON_ID,
+  name: 'Apply InkBridge Sync',
   icon,
   showType: 0,
 });
@@ -82,6 +91,17 @@ PluginManager.registerButtonListener({
           );
         })
         .catch(error => console.error('INKBRIDGE_RETURN_ERROR', error));
+      return;
+    }
+
+    if (event?.id === APPLY_INKBRIDGE_SYNC_BUTTON_ID) {
+      applyEmbeddedManifest()
+        .then(result => {
+          console.log(
+            `INKBRIDGE_SYNC_DONE manifest=${result.manifestId} operations=${result.operationCount} added=${result.added} updated=${result.updated} deleted=${result.deleted} skipped=${result.skipped}`,
+          );
+        })
+        .catch(error => console.error('INKBRIDGE_SYNC_ERROR', error));
     }
   },
 });
