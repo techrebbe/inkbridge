@@ -18,6 +18,7 @@ cp "$ROOT/overlay/app.json" "$PROJECT/app.json"
 cp "$ROOT/overlay/booxFixture.js" "$PROJECT/booxFixture.js"
 cp "$ROOT/overlay/booxReturnFixture.js" "$PROJECT/booxReturnFixture.js"
 cp "$ROOT/overlay/booxReturnFixtureV3.js" "$PROJECT/booxReturnFixtureV3.js"
+cp "$ROOT/overlay/booxReturnFixtureV4.js" "$PROJECT/booxReturnFixtureV4.js"
 cp "$ROOT/overlay/returnApplyV2.js" "$PROJECT/returnApplyV2.js"
 cp "$ROOT/PluginConfig.json" "$PROJECT/PluginConfig.json"
 

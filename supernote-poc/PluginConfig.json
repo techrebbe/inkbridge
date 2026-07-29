@@ -4,8 +4,8 @@
   "pluginID": "ibpoc20260724001",
   "iconPath": "assets/icon.png",
   "desc": "InkBridge native-stroke interoperability proof",
-  "versionCode": "10",
-  "versionName": "0.0.10",
+  "versionCode": "11",
+  "versionName": "0.0.11",
   "jsMainPath": "index",
   "author": "InkBridge"
 }

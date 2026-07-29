@@ -3,9 +3,10 @@ import {
   PluginFileAPI,
   PointUtils,
 } from 'sn-plugin-lib';
-import {BOOX_RETURN_FIXTURE_V3 as BOOX_RETURN_FIXTURE} from './booxReturnFixtureV3';
+import {BOOX_RETURN_FIXTURE_V4 as BOOX_RETURN_FIXTURE} from './booxReturnFixtureV4';
 
-const RETURN_INK_REVISION = 3;
+const MOVED_INK_REVISION = 3;
+const INSERTED_INK_REVISION = 4;
 
 const MOVED_FALLBACKS = [
   {
@@ -297,7 +298,7 @@ export async function applyBooxReturnTest() {
     const isAlreadyCorrect =
       targetData?.inkBridgeOrigin === 'boox-neoreader-return-moved' &&
       targetData?.sourceUuid === moved.sourceUuid &&
-      targetData?.inkBridgeRevision === RETURN_INK_REVISION;
+      targetData?.inkBridgeRevision === MOVED_INK_REVISION;
     if (isAlreadyCorrect) {
       movedAlreadyCorrectCount += 1;
       continue;
@@ -322,7 +323,7 @@ export async function applyBooxReturnTest() {
       userData: JSON.stringify({
         inkBridgeOrigin: 'boox-neoreader-return-moved',
         sourceUuid: moved.sourceUuid,
-        inkBridgeRevision: RETURN_INK_REVISION,
+        inkBridgeRevision: MOVED_INK_REVISION,
       }),
     });
     const elementsWithReplacement = (await requireResult(
@@ -335,7 +336,7 @@ export async function applyBooxReturnTest() {
       return (
         data?.inkBridgeOrigin === 'boox-neoreader-return-moved' &&
         data?.sourceUuid === moved.sourceUuid &&
-        data?.inkBridgeRevision !== RETURN_INK_REVISION
+        data?.inkBridgeRevision !== MOVED_INK_REVISION
       );
     });
     if (!Number.isInteger(supersededTarget?.numInPage)) {
@@ -380,7 +381,7 @@ export async function applyBooxReturnTest() {
 
   const alreadyCorrect = BOOX_RETURN_FIXTURE.inserted.every(inserted => {
     const matches = existingBySource.get(inserted.sourceUuid) ?? [];
-    return matches.length === 1 && matches[0].data.inkBridgeRevision === RETURN_INK_REVISION;
+    return matches.length === 1 && matches[0].data.inkBridgeRevision === INSERTED_INK_REVISION;
   });
 
   let replacedCount = 0;
@@ -420,7 +421,7 @@ export async function applyBooxReturnTest() {
         userData: JSON.stringify({
           inkBridgeOrigin: 'boox-neoreader-return',
           sourceUuid: inserted.sourceUuid,
-          inkBridgeRevision: RETURN_INK_REVISION,
+          inkBridgeRevision: INSERTED_INK_REVISION,
         }),
       });
       insertedCount += 1;

@@ -1,0 +1,69 @@
+// Authoritative return fixture for repair revision 4.
+// NeoReader's vector appearance streams are the source of truth for native BOOX additions.
+import {BOOX_RETURN_FIXTURE_V3} from './booxReturnFixtureV3';
+
+const BASE64_ALPHABET =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+const ENCODED_INSERTED = [{"sourceUuid":"25e9b930-67bb-4a82-9beb-e0a0bb34c14c","penColor":0,"penType":16,"thickness":400,"sampleCount":144,"samplesBase64":"JSFjqxYDJCFhqxYDIyFfqzoDISFbq2oDHiFWq58DGyFQq9gDFiFJqwkEEiFEqzAEDSE/q0oECSE8q1YEBiE7q1kEBSE8q1QEBCE+q0wEBCFAq0QEBSFDqzwEByFGqzcECiFJqzMEDSFKqzEEESFLqy8EFSFMqy0EGSFMqywEHCFLqysEHyFLqywEISFLqy8EIyFMqzUEJSFNqz4EJyFOq0wEKSFQq14EKiFSq3YEKyFVq5YELCFYq7wELSFcq+wELSFiqyYFLSFoq2kFLSFvq7YFLSF4qwoGLCGDq2MGKyGOq8EGKSGcqyEHJyGrq4IHJiG8q+EHJCHPqz0IIiHlq5UIISH8q+cIHyEVrDMJHSEvrHYJGiFMrLIJFyFrrOUJEiGMrBAKDiGvrDMKCiHUrFEKByH7rGkKBSEjrX0KBCFOrY4KBCF6rZ0KAyGorasKAiHYrbkKACEKrsYK/SA+rtMK+SB0rt8K9CCsrusK7yDlrvYK6yAfr/8K5yBbrwYL4yCYrwsL3yDWrw0L3CAVsA4L2SBUsA4L1iCTsA8L0yDRsBELzyANsRYLySBHsR8LwyB/sSkLuyC0sTYLsyDnsUILqiAYsk0LoCBHslcLliB1smALjCCgsmcLgiDKsm0LeSDysnQLcCAXs3oLZyA7s4ILXSBds4oLUiB+s5MLSCCes5wLPSC9s6ULMiDbs64LJyD5s7YLHSAUtL0LFCAvtMMLDSBHtMcLBiBetMsL/x9ztM0L+R+GtM4L8h+XtM4L7R+mtM8L6B+ytNAL5B+8tNEL4B/DtNEL3x/ItNEL3h/MtM8L3x/OtMsL4R/PtMUL4x/QtLwL5h/QtLAL6R/PtKML7R/PtJML8B/PtIEL8x/NtG0L9h/MtFYL+B/JtD0L+h/GtCIL+x/DtAYL/B/AtOcK/B+8tMcK/B+4tKMK+x+0tHkK+h+wtEcK+R+rtA0K+B+ltMwJ9x+ftIUJ9x+YtDkJ9x+RtOoI9h+LtJkI9h+FtEgI9B9/tPUH8x96tKIH8R91tE0H7x9wtPUG7h9qtJgG7h9jtDgG7h9btNUF8B9RtG8F8x9HtAcF9x88tJsE+x8ytCwEACAptL8DBCAhtFoDCCAatAIDCyAWtLoCDSAUtIUCDiAStGMCDiAStFEC"},{"sourceUuid":"630f96c8-09a3-4bd4-bbb4-a3ccadb0c120","penColor":0,"penType":16,"thickness":400,"sampleCount":150,"samplesBase64":"TyEcsQ0CTiEbsQ0CSyEasR4CSCEYsTUCQyEVsU8CPiESsW0COCEOsYgCMiEKsaECLSEHsbQCKSEFscECJSEDsckCIyECscwCIiEBsc0CIiEAscwCIyH/sMsCJSH+sM0CJiH+sNECJyH9sNsCKCH8sOwCKSH7sAUDKSH7sCYDKSH7sE0DKCH7sHoDJyH7sKkDJSH7sNkDIyH8sAoEISH8sDsEHiH8sGwEGyH8sJ8EGCH8sNIEFSH8sAgFEiH8sEIFDyH8sIAFDCH8sMMFCSH7sAoGBiH7sFIGAyH6sJsGACH6sOIG/iD5sCgH/SD4sGsH/SD3sKwH/SD2sOkH/SD1sCII/iD1sFcI/iD0sIkI/SD0sLYI/SD0sOMI/CDzsA8J/CDzsD0J/SDzsGwJ/yDysJ0JAiHysM0JByHysPsJDCHysCcKEiHysE0KGSHxsG4KICHwsIsKJyHwsKIKLyHvsLYKNyHvsMYKQCHwsNQKSiHysOAKVSH0sOwKYSH2sPgKbiH5sAILeyH9sA0LiSEAsRkLlyEEsSULpSEHsTILtCEKsT4LxCENsUoL1yEQsVUL7CESsV0LBSIUsWMLICIUsWcLPSIUsWkLXCIUsWsLfCITsWwLnSIRsW0LvyIPsW0L4iIMsW0LBiMJsWsLKiMEsWoLTyP/sGgLdSP6sGYLnCPzsGMLxCPssGAL7iPksF4LGCTbsFwLQiTQsFoLbCTFsFgLliS4sFcLvySrsFUL6CSesFQLECWSsFILOCWFsFELYCV4sFALhyVssE4LriVfsE0L1CVSsEwL+iVFsEwLHiY4sEsLQSYrsEsLYyYesEsLgyYRsEsLoSYFsEsLvCb6r0wL1ibvr00L7Sbmr04LAifdr04LFSfVr08LJifOr04LNSfHr04LQyfBr0wLTye8r0kLWSe3r0YLYSezr0ILZyewrz0LayeurzcLbSetrzALbSetrycLbCeurxwLayewrxALaCezrwALZCe2r+0KXie6r9UKVie+r7cKTSfEr5EKQSfKr18KNCfRryEKJSfZr9gJFSfhr4IJBCfrryIJ8yb0r7gI4ib/r0gI0SYJsNQHwCYUsF4HryYesOcGnyYnsHEGjyYwsPwFgCY4sIgFciY/sBMFZiZFsJoEXCZKsCYEVCZNsLoDTyZQsFwDTCZRsA8DSyZSsNcCSyZSsLICSyZSsJ8C"},{"sourceUuid":"e7651c0d-914a-4755-ad52-2ddc43f8cd16","penColor":0,"penType":16,"thickness":400,"sampleCount":134,"samplesBase64":"xChIqoADxChEqoADxCg8qq4Dwygvqu0DwygeqjcEwSgJqokEwCjxqdYEvyjYqRoFvyi/qVEFvyioqXgFwCiTqZQFwyiBqagFxyhxqbgFzChkqcwF0ihYqecF2ShOqQkG4ShDqTMG6Sg5qWEG8igvqZAG/CgkqbwGBykZqeQGEikOqQYHHykDqSEHKyn4qDcHNynuqEoHQynlqF0HTSndqHIHVinWqIwHXinQqKsHZSnNqM8HainLqPgHbynKqCMIcinLqFAIdSnOqH0IdinTqKsIdynaqN0IdiniqBQJdCntqFAJcin7qJEJbykMqdUJaykiqRsKZyk8qV8KYSlaqZ8KWil+qdgKUCmnqQoLQynVqTULNCkJqlkLJClDqnYLEimCqo0LACnHqp8L7SgRq64L2ihfq7kLyCiwq8ELtSgFrMcLoihcrMwLkCi0rNALfSgNrdQLayhmrdcLWSi9rdsLSCgSruALNyhkruULKCiyrusLGSj9rvELDChEr/gLACiHrwAM9ifHrwcM6ycFsA8M4idAsBYM2Sd6sB0M0SexsCUMyyfnsC0MxiccsTUMwSdPsT0MvSeAsUQMuCewsUsMsiffsVAMrCcMslUMpSc4sloMnSdjsl4MlSeMsmIMjie0smYMhifasmkMfyf/sm0MeCcjs3AMcSdGs3MMaSdos3UMYSeIs3cMWSems3gMUSfCs3oMSifcs3sMRCf0s3wMPycJtH0MPCcctH8MOicstIEMOSc6tIIMOSdGtIMMOCdStIMMOCdctIIMNydltIAMNydutHwMNid2tHcMNid9tHEMNieDtGkMNyeJtGAMNyeNtFUMOCeQtEgMOCeRtDkMNyeStCgMNyeRtBYMNieQtAIMNSeOtOsLNSeLtNILNCeItLcLNCeEtJgLNSd/tHQLNid5tEsLNydytBsLOSdptOIKOydftJwKPidTtEcKQidEtOMJRicztG4JTCcftOgIUicJtFQIWifws7MHYifVswgHaye6s1IGcyehs6AFeieMs/oEgCd6s2oEhCdts/QDhydls58DiCdis2kDiCdis04D"},{"sourceUuid":"00f1a3a8-fcb0-467c-bf31-72817b72b0c4","penColor":0,"penType":16,"thickness":400,"sampleCount":196,"samplesBase64":"tipGstIFtCpEstIFsSpBsg4GrSo9smIGqSo4ssIGpCoysioHoCousoYHnCoqss4HmioosvsHmSoosg4ImSopsgsInCossvgHoSoust4HqCoxssUHsiozsrIHvyo0sqoHziozsqwH3ioxsrkH8Couss4HAisrsugHFCsnsgUIJisksiEIOSshsjoISysesk8IXSsbsl8IcSsXsmoIhSsUsnIImSsPsncIrisKsnwIwysEsoII2Cv+sYsI7iv3sZcIBCzwsacIGyznsboIMyzesc4ITSzUseQIaCzJsfkIhSy+sQ0JoiyxsSEJvyyjsTYJ3SyUsUwJ/CyEsWIJHC1zsXkJPC1hsZAJXi1OsaUJgS06sbkJpC0mscsJyC0RsdsJ7C37sOoJEC7lsPgJNC7PsAUKWC64sBIKey6gsB4Kni6IsCoKwC5wsDMK4y5XsDoKBi89sD8KKi8jsEEKTS8JsEEKcC/ur0AKki/Urz0KtC+5rzoK1S+frzYK9S+FrzMKFDBqrzAKMjBQry0KTzA1rykKazAZryQKhjD9rh0KnzDhrhUKtTDErgoKyTCmrv0J2zCIru4J7DBprtsJ+jBLrsUJCDEtrqwJEzEPrpIJHDH0rXYJIjHZrVsJJjHBrUMJKDGqrS8JJjGWrR8JITGDrRUJGTFzrQ8JDTFlrQ0J/TBZrQ4J6TBQrRAJ0jBJrRQJuDBFrRgJmjBCrR0JeTBCrSMJVDBFrSwJLDBJrTgJATBQrUkJ1C9arV4Joy9mrXkJcS91rZkJPC+Hrb4JBi+crecJzi60rRIKlS7RrUAKWS7xrWwKHC4VrpgK3i0+rsIKnS1qrukKWy2arg0LGS3Ori4L1SwHr00LkCxEr2kLSiyFr4MLBCzLr5sLvSsTsLALeCtfsMQLNCussNcL8ir6sOgLtCpIsfgLeCqWsQYMQSrjsRMMDioush4M4Cl2sigMtim9sjEMkikBszkMdClCs0EMWymBs0cMSCm9s00MOin2s1MMMikstFgMLylgtF0MMSmQtGEMOCm8tGQMQynmtGYMUikMtWgMZSkutWoMeylMtWsMlClotWsMsSmAtWsM0CmUtWkM8ymmtWgMGSq0tWUMQirAtWMMbirJtV8MnCrPtVwMzSrStVgM/yrStVMMNCvQtU4MaivLtUkMoSvEtUQM2Su6tT4MEyyttTcMTSyetTAMiSyNtSkMxCx7tSIMAC1mtRsMOy1RtRUMdS05tQ4Mri0htQYM5y0Htf8LIC7stPYLWS7QtO0Lki60tOMLzC6XtNkLBS96tM0LQC9ctMALei89tLILtS8etKIL8S/9s48LLTDds3wLaTC7s2ULpTCZs00L4jB2szELHjFUsxILWjExs+4KljEOs8QK0jHtspIKDDLMslQKRjKtsgwKfjKPsrgJtTJyslkJ6zJWsvEIHjM7soIIUDMisg8IfzMJspkHrDPzsSMH1jPdsa4G/jPKsToGJDS4sccFRzSosVMFaDSYsd0EhTSLsV4EnjR/sd8DsjR2sWUDwjRvsfYCzDRqsZgC0jRnsVAC1DRmsR8C1DRmsQMC"},{"sourceUuid":"bca8d5ab-5ef3-4fcf-9ebc-6df26a5dfd50","penColor":0,"penType":16,"thickness":400,"sampleCount":112,"samplesBase64":"jzrqqSUDkDroqSUDkTrkqVYDlDrdqZwDlzrTqfADmjrHqVAEnzq6qasEpTqsqf8ErDqeqUcFtDqQqYMFvDqEqbgFxTp6qekFzjpyqRoG1jprqU0G3zplqX8G5zphqa8G8DpcqdkG+jpZqf0GAztVqRoHDTtSqS8HFztRqUEHIDtQqVQHKDtQqWwHLztRqYwHNDtUqbYHNztYqesHODtdqSwIODtkqXYINztuqcoINDt6qSEJMTuJqXoJKzudqdAJJDu0qSAKGjvQqWcKDTvxqaUK/joWqtkK7Do/qgML1zptqiULwTqeqkALqjrUqlYLkjoNq2gLeTpKq3gLYTqJq4YLSDrKq5QLMDoOrKALGDpTrKsLATqbrLUL6jnkrL4L1TkwrcULwDl8rcwLrTnKrdQLmjkYrtsLiTlmruILeTm0ruoLaTkBr/ILWzlNr/oLTDmYrwIMPznirwkMMTkssBAMJDl2sBYMFzm+sB0MCjkGsSMM/jhNsSkM8ziTsS8M6DjYsTQM3zgbsjkM1zhbsj0M0DiXskAMyjjQskMMxTgEs0UMwjg0s0YMwDhfs0cMvjiHs0gMvjirs0gMvjjMs0gMvzjrs0cMvzgItEgMwDgjtEgMwjg9tEgMwjhVtEgMwzhttEYMwziEtEQMwjiatEAMwDivtDsMvzjCtDUMvTjTtC4MuzjitCYMuTjutBsMuDj4tA8MtjgAtQEMtDgFtfELsjgJtd4LrzgLtcgLrTgMtbALqjgLtZQLqDgJtXILpTgHtUgLozgCtRALojj9tMMKojj1tFwKojjstNYJpDjgtDIJpjjStHAIqTjCtJQHrDiwtKAGrzigtKoFsTiRtMEEtDiEtPQDtTh7tEwDtjh1tNMCtjhytIQCtjhytF0C"},{"sourceUuid":"ae4a3d9e-3f30-43d9-a1b8-96d6425e755c","penColor":0,"penType":16,"thickness":400,"sampleCount":104,"samplesBase64":"/EBCqs0C/EBCqs0C/UBBqvkC/kBAqjsDAEE+qpADAEE9qvgDAUE8qmsEAUE8quQEAUE8ql0FAUE9qtMFAUE/qkUGAUFCqrAGAkFFqhgHA0FKqnwHBEFPquAHBEFWqkUIBUFeqqwIBEFnqhMJA0FzqnoJAEGCqt0J+0CVqjkK9UCsqowK7EDHqtQK4UDnqhEL00AMq0ILwkA3q2kLrkBmq4cLl0Caq54LfEDTq7ALX0AQrL4LQEBTrMoLIECZrNUL/z/jrN8L3T8wregLvD9/rfILmz/PrfsLej8hrgMMWj9yrgsMOz/CrhMMHT8SrxoMAD9hryAM5D6wryUMyj79ryoMsT5IsC4Mmj6RsDMMhT7YsDcMcj4dsTsMYD5fsT4MTz6esUEMPz7csUIMLz4ZskMMIT5TskQMEj6NskUMBD7FskUM9z38skYM6j0ys0YM3j1ms0gM0z2Xs0kMxz3Fs0oMvT3xs0sMtD0ZtEwMqz0/tEwMpD1jtEwMnz2EtEsMmz2jtEoMlz3BtEgMkz3etEYMjz35tEIMiz0TtT0Mhj0rtTgMgj1BtTIMfj1UtSwMez1ntSUMeD12tR0Mdj2EtRUMdD2PtQwMcz2ZtQIMcj2gtfgLcT2mte0Lbz2rteALbj2utdELbD2xtcALaj20ta0LaD22tZcLZz24tX4LZj25tWELZj26tT4LZz25tRMLaD24td0Kaz22tZUKbj2ytToKcz2ttcgJeT2ntUAJgD2ftaEIiT2Vte8Hkz2ItSsHnj17tVQGqD1ttXsFsT1hta0EuT1WtfcDvz1OtV8Dwj1JtfACxD1GtaYCxD1GtX4C"},{"sourceUuid":"a8e94cbe-2e97-4571-9cec-f3d9604baba7","penColor":0,"penType":16,"thickness":400,"sampleCount":204,"samplesBase64":"W0eXsRsCXEeVsRsCXUeSsUMCX0eNsXwCYUeHsb8CZUeAsQoDaUd5sU8DbkdxsYsDc0dqsbkDeUdjsdYDgEdcseYDhkdXsewDjUdRse4DlEdLse8DnEdEsfUDpEc9sQMErEc2sRoEtEcusTwEvUclsWcExUccsZkEzUcTsdEE1EcKsQ0F20cCsUwF4Uf5sI4F50fxsNMF60fpsBkG70fisGEG8kfbsKwG9EfUsPkG9UfOsEgH9kfHsJgH9ke/sOgH9Ue3sDYI80evsIII8kensMwI8EeesBMJ7keVsFcJ7EeMsJcJ6keDsNIJ50d6sAYK5EdxsDQK4UdnsFsK30desHsK3EdUsJUK2UdKsKoK1kdAsLsK00c1sMoK0EcrsNcKzkchsOQKzEcXsPEKyUcOsP4Kx0cFsA0LxEf9rxwLwUf1rysLvkfurzsLukfor0kLtkfhr1cLs0fbr2MLr0fVr24LrEfOr3cLqUfIr38Lp0fAr4ULpEe5r4oLokeyr44Lnkesr5ILmkenr5QLlkeir5YLkEeer5YLikebr5YLgkeZr5QLeUeXr5ALb0eXr4sLY0eXr4MLVkeYr3oLRkeZr20LNEecr14LH0ehr0sLCEemrzcL70atryAL00a2rwgLtEbBr+8Kk0bOr9cKcEbdr8EKSUbvr6wKH0YEsJkK8UUcsIgKv0U3sHoKikVWsG4KUEV3sGUKFEWasGAK1UTAsGAKlkTosGUKVkQSsXAKF0Q+sYMK2UNrsZwKnUOZsbwKY0PJseEKLEP6sQkL90IusjMLxUJjsl0LlkKZsoQLakLSsqcLQkIMs8QLHkJIs90L/UGFs/AL30HEs/0LxUEDtAYMrkFDtAwMmkGCtA8MikG/tBEMfEH8tBIMckE2tRIMbEFttRMMaUGgtRQMa0HQtRcMcEH7tRoMeUEith4MhkFFtiIMmEFktiYMrUF/tikMxUGWtiwM4kGpti0MA0K4ti0MJ0LDtiwMT0LLtikMekLPtiYMqkLRtiEM3ELOthsMEkPIthMMTEO/tgoMiEOytgAMyEOitvULDESPtucLU0R4ttkLnURetssL6URBtr0LN0UhtrALh0X+taUL10XYtZsLKEawtZILekaEtYoLzUZWtYMLIkcltXoLd0fytHELzUe8tGcLJUiCtFoLfUhGtEsL1UgGtDoLLUnEsycLhUmAsxQL3Uk7swALNUr0suwKjEqtstgK4kplssYKN0scsrUKiEvTsaUK1kuKsZgKIExAsYwKZEz2sIIKo0ytsHsK3ExksHYKD00esHUKO03ar3gKYE2Zr3wKf01cr4IKmE0hr4kKq03pro8KuE21rpUKwE2ErpsKw01WrqAKwU0rrqcKvE0Drq8Ksk3frboKpE2/rckKkk2hrdkKe02IresKX01yrfwKP01frQwLGU1QrRsL7kxFrSgLv0w+rTMLikw8rTwLUkw/rUILFExGrUYL00tUrUcLjUtnrUULQ0uArT4L9UqerTILpErArSELUErorQgL/EkTruYKqElCrrUKVUl0rm0KBEmorgkKtUjeroQJakgWr9oIJkhMrwMI6kd9rxgHuUenrycGlEfJr0YFe0fgr4MEbUfvr+0DZ0f2r4YDZ0f2r0wD"}];
+
+function decodeBase64(value) {
+  const bytes = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const character of value) {
+    if (character === '=') break;
+    const digit = BASE64_ALPHABET.indexOf(character);
+    if (digit < 0) continue;
+    buffer = (buffer << 6) | digit;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+      buffer &= (1 << bits) - 1;
+    }
+  }
+  return bytes;
+}
+
+function decodeSamples({samplesBase64, sampleCount}) {
+  const bytes = decodeBase64(samplesBase64);
+  if (bytes.length !== sampleCount * 6) {
+    throw new Error(
+      `InkBridge appearance geometry size mismatch: expected ${sampleCount * 6}, got ${bytes.length}.`,
+    );
+  }
+
+  const samples = [];
+  for (let offset = 0; offset < bytes.length; offset += 6) {
+    const normalizedX = (bytes[offset] | (bytes[offset + 1] << 8)) / 65535;
+    const normalizedY = (bytes[offset + 2] | (bytes[offset + 3] << 8)) / 65535;
+    const pressure = bytes[offset + 4] | (bytes[offset + 5] << 8);
+    samples.push([normalizedX, normalizedY, pressure]);
+  }
+  return samples;
+}
+
+export const BOOX_RETURN_FIXTURE_V4 = {
+  ...BOOX_RETURN_FIXTURE_V3,
+  source: 'BOOX NeoReader round-trip result (vector appearance geometry v4)',
+  sourceFileName:
+    'A_Brief_History_of_Philosophy_of_Technol-InkBridge-SN-to-BOOX.pdf',
+  inserted: ENCODED_INSERTED.map(({samplesBase64, sampleCount, ...metadata}) => ({
+    ...metadata,
+    samples: decodeSamples({samplesBase64, sampleCount}),
+  })),
+  geometrySources: {
+    ...BOOX_RETURN_FIXTURE_V3.geometrySources,
+    inserted:
+      'native #ONYX-STROKE /AP vector centerlines exactly as rendered by NeoReader',
+  },
+  insertedEncoding: {
+    source:
+      'PDF appearance streams containing variable-width line segments in page coordinates',
+    compactFixture:
+      'little-endian uint16 normalized x, uint16 normalized y, uint16 pressure',
+    pressure:
+      'derived from NeoReader appearance width using widthPt ~= 0.4 + pressure / 2000',
+  },
+};

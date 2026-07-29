@@ -59,6 +59,19 @@ Version 0.0.10 corrects the two geometry sources independently:
 - The moved line is replaced atomically instead of shortening its point accessor in place. This guarantees that the 207 surplus points written by version 0.0.9 cannot remain at the end of the repaired stroke.
 - Revision tags make the repair safe to inspect after one completed run and prevent the corrected BOOX strokes from being duplicated.
 
+### Repair build 0.0.11
+
+Version 0.0.11 uses the exact vector centerline NeoReader wrote into each
+native BOOX stroke's PDF `/AP` appearance stream:
+
+- The seven letters now retain all 1,044 NeoReader-rendered samples instead of
+  the 235 over-decimated raw points used by 0.0.10.
+- Each appearance segment's variable width is converted back into a pressure
+  sample so the native Supernote stroke keeps the visible BOOX weight changes.
+- The already-correct revision-3 long line is left untouched.
+- Only the seven revision-3 BOOX additions are replaced, making this safe to
+  run once on the page already repaired by 0.0.10.
+
 ## Build
 
 ```bash
