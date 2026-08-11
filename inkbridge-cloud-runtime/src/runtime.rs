@@ -34,6 +34,7 @@ pub struct RegisterDocumentRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RuntimeOutcome {
     Ignored { reason: String },
+    Rejected { reason: String },
     Processed { outcome: ProcessOutcome },
 }
 
@@ -55,9 +56,10 @@ impl RuntimeService {
         headers: &BTreeMap<String, String>,
         body: &[u8],
     ) -> Result<RuntimeOutcome, String> {
-        let mut event = match translate_storage_finalized_event(&self.bucket, headers, body)? {
-            EventTranslation::Process(event) => event,
-            EventTranslation::Ignore { reason } => {
+        let mut event = match translate_storage_finalized_event(&self.bucket, headers, body) {
+            Err(reason) => return Ok(RuntimeOutcome::Rejected { reason }),
+            Ok(EventTranslation::Process(event)) => event,
+            Ok(EventTranslation::Ignore { reason }) => {
                 return Ok(RuntimeOutcome::Ignored { reason });
             }
         };
@@ -77,7 +79,9 @@ impl RuntimeService {
                 ));
             }
         } else {
-            hydrate_content_hash(&mut event, &source.bytes)?;
+            if let Err(reason) = hydrate_content_hash(&mut event, &source.bytes) {
+                return Ok(RuntimeOutcome::Rejected { reason });
+            }
         }
         let mut storage = storage;
         let outcome = Broker::default()
@@ -130,7 +134,12 @@ async fn eventarc_handler(
 ) -> Response {
     let headers = header_map(&headers);
     match tokio::task::spawn_blocking(move || service.handle_storage_event(&headers, &body)).await {
-        Ok(Ok(outcome)) => (StatusCode::OK, Json(json!(outcome))).into_response(),
+        Ok(Ok(outcome)) => {
+            if let RuntimeOutcome::Rejected { reason } = &outcome {
+                eprintln!("rejected permanent Eventarc input: {reason}");
+            }
+            (StatusCode::OK, Json(json!(outcome))).into_response()
+        }
         Ok(Err(error)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
@@ -316,6 +325,73 @@ mod tests {
             }
         );
         assert_eq!(active.device(DeviceSide::Supernote).revision, 1);
+    }
+
+    #[test]
+    fn malformed_device_metadata_and_false_hash_are_acknowledged_as_rejected() {
+        let objects = Arc::new(MemoryObjectStore::default());
+        let states = Arc::new(MemoryCanonicalStateStore::default());
+        let service = RuntimeService::new("sync-bucket", objects.clone(), states);
+        let path = "BOOX_Folder/doc/view.pdf";
+        let object = objects.put(path, b"pdf".to_vec());
+
+        let missing_metadata = serde_json::to_vec(&json!({
+            "bucket": "sync-bucket",
+            "name": path,
+            "generation": object.generation.to_string(),
+            "metadata": {}
+        }))
+        .unwrap();
+        assert!(matches!(
+            service
+                .handle_storage_event(&headers("malformed-metadata"), &missing_metadata)
+                .unwrap(),
+            RuntimeOutcome::Rejected { .. }
+        ));
+
+        let false_hash = serde_json::to_vec(&json!({
+            "bucket": "sync-bucket",
+            "name": path,
+            "generation": object.generation.to_string(),
+            "metadata": {
+                "inkbridge-document-id": "doc",
+                "inkbridge-source-revision": "1",
+                "inkbridge-based-on-boox": "0",
+                "inkbridge-based-on-supernote": "0",
+                "inkbridge-content-sha256": "not-the-object-hash"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            service
+                .handle_storage_event(&headers("false-hash"), &false_hash)
+                .unwrap(),
+            RuntimeOutcome::Rejected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_adapter_returns_success_for_permanently_rejected_event() {
+        let objects = Arc::new(MemoryObjectStore::default());
+        let states = Arc::new(MemoryCanonicalStateStore::default());
+        let service = Arc::new(RuntimeService::new("sync-bucket", objects, states));
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("ce-id", "bad-event".parse().unwrap());
+        request_headers.insert(
+            "ce-type",
+            crate::STORAGE_FINALIZED_EVENT_TYPE.parse().unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "bucket": "sync-bucket",
+                "name": "BOOX_Folder/doc/view.pdf",
+                "generation": "1",
+                "metadata": {}
+            }))
+            .unwrap(),
+        );
+        let response = eventarc_handler(State(service), request_headers, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn states_record(service: &RuntimeService, document_id: &str) -> CanonicalDocumentState {

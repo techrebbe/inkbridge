@@ -25,6 +25,12 @@ Broker outputs already carry the producer, source event, document ID, source
 revision pair, and content hash. The Eventarc adapter reconstructs the trusted
 broker-output marker so the core records but does not reprocess the output.
 
+Missing/invalid device metadata and a declared SHA-256 that does not match the
+finalized generation are permanent input failures. The HTTP adapter logs an
+explicit `rejected` result and acknowledges them with HTTP 200 so Eventarc does
+not retry an immutable bad event forever. Cloud Storage, Firestore, and pending
+outbox failures still return 500 and remain eligible for Eventarc retry.
+
 ## Firestore transaction and durable outbox
 
 `inkbridgeDocuments/{documentId}` stores a generation/hash pointer to the last
