@@ -91,7 +91,7 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
                 Err(error) => {
                     eprintln!("warning: skipped annotation on page {page_number}: {error}");
                     skipped += 1;
-                    if let Some(source_uuid) = annotation_source_uuid(annotation) {
+                    if let Some(source_uuid) = annotation_source_uuid(&document, annotation) {
                         incomplete_pages.insert(page_index);
                         failed_source_uuids.insert(source_uuid);
                     }
@@ -158,10 +158,12 @@ fn extract_annotation(
     page_index: u32,
     geometry: PageGeometry,
 ) -> Result<Vec<StrokeSnapshot>, String> {
-    let subtype = name(annotation.get(b"Subtype").ok());
+    let subtype = name(document, annotation.get(b"Subtype").ok());
     match subtype.as_deref() {
         Some("Ink") => extract_standard_ink(document, annotation, page_index, geometry),
-        Some("Stamp") if name(annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") => {
+        Some("Stamp")
+            if name(document, annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") =>
+        {
             extract_onyx_stroke(document, annotation, page_index, geometry)
                 .map(|stroke| vec![stroke])
         }
@@ -169,12 +171,16 @@ fn extract_annotation(
     }
 }
 
-fn annotation_source_uuid(annotation: &Dictionary) -> Option<String> {
-    let subtype = name(annotation.get(b"Subtype").ok());
+fn annotation_source_uuid(document: &Document, annotation: &Dictionary) -> Option<String> {
+    let subtype = name(document, annotation.get(b"Subtype").ok());
     match subtype.as_deref() {
-        Some("Ink") => pdf_string(annotation.get(b"NM").ok()).or_else(|| onyx_tag_id(annotation)),
-        Some("Stamp") if name(annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") => {
-            onyx_tag_id(annotation).or_else(|| pdf_string(annotation.get(b"NM").ok()))
+        Some("Ink") => pdf_string(document, annotation.get(b"NM").ok())
+            .or_else(|| onyx_tag_id(document, annotation)),
+        Some("Stamp")
+            if name(document, annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") =>
+        {
+            onyx_tag_id(document, annotation)
+                .or_else(|| pdf_string(document, annotation.get(b"NM").ok()))
         }
         _ => None,
     }
@@ -186,8 +192,8 @@ fn extract_standard_ink(
     page_index: u32,
     geometry: PageGeometry,
 ) -> Result<Vec<StrokeSnapshot>, String> {
-    let base_source_uuid = pdf_string(annotation.get(b"NM").ok())
-        .or_else(|| onyx_tag_id(annotation))
+    let base_source_uuid = pdf_string(document, annotation.get(b"NM").ok())
+        .or_else(|| onyx_tag_id(document, annotation))
         .ok_or_else(|| "standard /Ink annotation has no /NM or Onyx id".to_owned())?;
     let ink_list = resolve(document, annotation.get(b"InkList").map_err(display_error)?)?;
     let paths = ink_list
@@ -248,8 +254,8 @@ fn extract_onyx_stroke(
     page_index: u32,
     geometry: PageGeometry,
 ) -> Result<StrokeSnapshot, String> {
-    let source_uuid = onyx_tag_id(annotation)
-        .or_else(|| pdf_string(annotation.get(b"NM").ok()))
+    let source_uuid = onyx_tag_id(document, annotation)
+        .or_else(|| pdf_string(document, annotation.get(b"NM").ok()))
         .ok_or_else(|| "BOOX stroke has no stable Onyx id".to_owned())?;
     let stream = appearance_stream(document, annotation)?;
     let stream_matrix = stream
@@ -410,8 +416,8 @@ fn annotation_luminance(document: &Document, annotation: &Dictionary) -> i64 {
     (luminance.clamp(0.0, 1.0) * 255.0).round() as i64
 }
 
-fn onyx_tag_id(annotation: &Dictionary) -> Option<String> {
-    let tag = pdf_string(annotation.get(b"onyxtag").ok())?;
+fn onyx_tag_id(document: &Document, annotation: &Dictionary) -> Option<String> {
+    let tag = pdf_string(document, annotation.get(b"onyxtag").ok())?;
     let value: Value = serde_json::from_str(&tag).ok()?;
     value.get("id")?.as_str().map(ToOwned::to_owned)
 }
@@ -441,16 +447,24 @@ fn number(object: &Object) -> Option<f64> {
     }
 }
 
-fn name(object: Option<&Object>) -> Option<String> {
+fn name(document: &Document, object: Option<&Object>) -> Option<String> {
     match object? {
         Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| name(document, Some(value))),
         _ => None,
     }
 }
 
-fn pdf_string(object: Option<&Object>) -> Option<String> {
+fn pdf_string(document: &Document, object: Option<&Object>) -> Option<String> {
     match object? {
         Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| pdf_string(document, Some(value))),
         _ => None,
     }
 }
@@ -616,8 +630,28 @@ mod tests {
             "InkList" => Object::Null,
         };
         assert_eq!(
-            annotation_source_uuid(&annotation).as_deref(),
+            annotation_source_uuid(&Document::new(), &annotation).as_deref(),
             Some("moved-but-damaged")
+        );
+    }
+
+    #[test]
+    fn resolves_indirect_annotation_identity() {
+        let mut document = Document::new();
+        let identity_id = document.add_object(Object::string_literal("indirect-stroke"));
+        let annotation = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => identity_id,
+            "InkList" => Object::Null,
+        };
+        assert_eq!(
+            annotation_source_uuid(&document, &annotation).as_deref(),
+            Some("indirect-stroke")
+        );
+        assert!(
+            extract_standard_ink(&document, &annotation, 0, test_geometry())
+                .expect_err("geometry remains deliberately malformed")
+                .contains("invalid /InkList")
         );
     }
 
