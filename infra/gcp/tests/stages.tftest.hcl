@@ -33,12 +33,12 @@ run "bootstrap_omits_runtime" {
   command = plan
 
   variables {
-    enable_deployment          = true
-    deployment_acknowledgement = "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
-    project_id                 = "inkbridge-plan-test"
-    project_number             = "123456789012"
-    region                     = "me-west1"
-    bucket_name                = "inkbridge-plan-test-sync"
+    enable_deployment              = true
+    deployment_acknowledgement     = "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
+    project_id                     = "inkbridge-plan-test"
+    project_number                 = "123456789012"
+    region                         = "me-west1"
+    bucket_name                    = "inkbridge-plan-test-sync"
     cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
   }
 
@@ -85,14 +85,14 @@ run "immutable_digest_enables_runtime" {
   command = plan
 
   variables {
-    enable_deployment          = true
-    deployment_acknowledgement = "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
-    project_id                 = "inkbridge-plan-test"
-    project_number             = "123456789012"
-    region                     = "me-west1"
-    bucket_name                = "inkbridge-plan-test-sync"
+    enable_deployment              = true
+    deployment_acknowledgement     = "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
+    project_id                     = "inkbridge-plan-test"
+    project_number                 = "123456789012"
+    region                         = "me-west1"
+    bucket_name                    = "inkbridge-plan-test-sync"
     cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
-    cloud_run_image            = "me-west1-docker.pkg.dev/inkbridge-plan-test/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    cloud_run_image                = "me-west1-docker.pkg.dev/inkbridge-plan-test/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 
   assert {
@@ -115,14 +115,14 @@ run "foreign_image_digest_is_rejected" {
   command = plan
 
   variables {
-    enable_deployment          = true
-    deployment_acknowledgement = "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
-    project_id                 = "inkbridge-plan-test"
-    project_number             = "123456789012"
-    region                     = "me-west1"
-    bucket_name                = "inkbridge-plan-test-sync"
+    enable_deployment              = true
+    deployment_acknowledgement     = "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
+    project_id                     = "inkbridge-plan-test"
+    project_number                 = "123456789012"
+    region                         = "me-west1"
+    bucket_name                    = "inkbridge-plan-test-sync"
     cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
-    cloud_run_image            = "me-west1-docker.pkg.dev/another-project/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    cloud_run_image                = "me-west1-docker.pkg.dev/another-project/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 
   expect_failures = [terraform_data.deployment_guard[0]]
