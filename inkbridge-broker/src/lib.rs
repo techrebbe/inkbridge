@@ -7,5 +7,5 @@ pub use broker::{
     boox_view_path, original_path, state_path, supernote_manifest_path, Broker, BrokerError,
 };
 pub use model::*;
-pub use pdf_view::write_boox_view;
+pub use pdf_view::{write_boox_view, write_boox_view_with_tombstones};
 pub use storage::*;

@@ -30,11 +30,25 @@ pub fn write_boox_view(
     original_pdf: &[u8],
     strokes: impl IntoIterator<Item = StrokeSnapshot>,
 ) -> Result<Vec<u8>, String> {
+    write_boox_view_with_tombstones(original_pdf, strokes, std::iter::empty::<String>())
+}
+
+pub fn write_boox_view_with_tombstones(
+    original_pdf: &[u8],
+    strokes: impl IntoIterator<Item = StrokeSnapshot>,
+    tombstones: impl IntoIterator<Item = String>,
+) -> Result<Vec<u8>, String> {
     let mut document = Document::load_mem(original_pdf)
         .map_err(|error| format!("could not load immutable original PDF: {error}"))?;
     let pages = document.get_pages();
+    let strokes = strokes.into_iter().collect::<Vec<_>>();
+    let mut canonical_ids = strokes
+        .iter()
+        .map(|stroke| stroke.source_uuid.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    canonical_ids.extend(tombstones);
     for page_id in pages.values() {
-        strip_supported_ink_annotations(&mut document, *page_id)?;
+        strip_canonical_ink_annotations(&mut document, *page_id, &canonical_ids)?;
     }
     let mut by_page = BTreeMap::<u32, Vec<StrokeSnapshot>>::new();
     for stroke in strokes {
@@ -64,9 +78,10 @@ pub fn write_boox_view(
     Ok(output)
 }
 
-fn strip_supported_ink_annotations(
+fn strip_canonical_ink_annotations(
     document: &mut Document,
     page_id: ObjectId,
+    canonical_ids: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
     let annots = document
         .get_dictionary(page_id)
@@ -92,7 +107,9 @@ fn strip_supported_ink_annotations(
     };
     let retained = entries
         .into_iter()
-        .filter(|annotation| !is_supported_ink_annotation(document, annotation))
+        .filter(|annotation| {
+            annotation_stable_id(document, annotation).is_none_or(|id| !canonical_ids.contains(&id))
+        })
         .collect::<Vec<_>>();
     if let Some(array_id) = array_id {
         *document
@@ -109,27 +126,39 @@ fn strip_supported_ink_annotations(
     Ok(())
 }
 
-fn is_supported_ink_annotation(document: &Document, annotation: &Object) -> bool {
+fn annotation_stable_id(document: &Document, annotation: &Object) -> Option<String> {
     let dictionary = match annotation {
         Object::Reference(id) => document.get_dictionary(*id).ok(),
         Object::Dictionary(dictionary) => Some(dictionary),
         _ => None,
-    };
-    let Some(dictionary) = dictionary else {
-        return false;
-    };
-    if dictionary
+    }?;
+    let is_ink = dictionary
         .get(b"Subtype")
-        .is_ok_and(|value| object_name_is(document, value, b"Ink"))
-    {
-        return true;
-    }
-    dictionary
+        .is_ok_and(|value| object_name_is(document, value, b"Ink"));
+    let is_onyx = dictionary
         .get(b"Subtype")
         .is_ok_and(|value| object_name_is(document, value, b"Stamp"))
         && dictionary
             .get(b"Name")
-            .is_ok_and(|value| object_name_is(document, value, b"#ONYX-STROKE"))
+            .is_ok_and(|value| object_name_is(document, value, b"#ONYX-STROKE"));
+    if !is_ink && !is_onyx {
+        return None;
+    }
+    let nm = dictionary
+        .get(b"NM")
+        .ok()
+        .and_then(|value| object_string(document, value));
+    let onyx_id = dictionary
+        .get(b"onyxtag")
+        .ok()
+        .and_then(|value| object_string(document, value))
+        .and_then(|tag| serde_json::from_str::<serde_json::Value>(&tag).ok())
+        .and_then(|tag| tag.get("id")?.as_str().map(ToOwned::to_owned));
+    if is_onyx {
+        onyx_id.or(nm)
+    } else {
+        nm.or(onyx_id)
+    }
 }
 
 fn object_name_is(document: &Document, object: &Object, expected: &[u8]) -> bool {
@@ -139,6 +168,17 @@ fn object_name_is(document: &Document, object: &Object, expected: &[u8]) -> bool
             .get_object(*id)
             .is_ok_and(|value| object_name_is(document, value, expected)),
         _ => false,
+    }
+}
+
+fn object_string(document: &Document, object: &Object) -> Option<String> {
+    match object {
+        Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| object_string(document, value)),
+        _ => None,
     }
 }
 
@@ -338,14 +378,22 @@ mod tests {
             "NM" => Object::string_literal("original-ink"),
             "InkList" => vec![Object::Array(vec![10.into(), 10.into(), 20.into(), 20.into()])],
         });
+        let anonymous_ink_id = document.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Ink",
+            "InkList" => vec![Object::Array(vec![30.into(), 30.into(), 40.into(), 40.into()])],
+        });
         let highlight_id = document.add_object(dictionary! {
             "Type" => "Annot",
             "Subtype" => "Highlight",
             "NM" => Object::string_literal("keep-highlight"),
             "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
         });
-        let annots_id =
-            document.add_object(Object::Array(vec![ink_id.into(), highlight_id.into()]));
+        let annots_id = document.add_object(Object::Array(vec![
+            ink_id.into(),
+            anonymous_ink_id.into(),
+            highlight_id.into(),
+        ]));
         let page_id = document.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages_id,
@@ -390,7 +438,14 @@ mod tests {
     fn generated_view_replaces_original_ink_but_preserves_other_annotations() {
         let original = original_with_ink_and_highlight();
         let without_canonical = write_boox_view(&original, []).unwrap();
-        assert_eq!(annotation_subtypes(&without_canonical), ["Highlight"]);
+        assert_eq!(
+            annotation_subtypes(&without_canonical),
+            ["Ink", "Ink", "Highlight"]
+        );
+
+        let tombstoned =
+            write_boox_view_with_tombstones(&original, [], ["original-ink".to_owned()]).unwrap();
+        assert_eq!(annotation_subtypes(&tombstoned), ["Ink", "Highlight"]);
 
         let style = inkbridge_convert::NativeStyle::default();
         let samples = vec![[0.2, 0.3, 900.0], [0.3, 0.4, 1000.0]];
@@ -403,7 +458,10 @@ mod tests {
             samples,
         };
         let with_canonical = write_boox_view(&original, [canonical]).unwrap();
-        assert_eq!(annotation_subtypes(&with_canonical), ["Highlight", "Ink"]);
+        assert_eq!(
+            annotation_subtypes(&with_canonical),
+            ["Ink", "Highlight", "Ink"]
+        );
     }
 
     #[test]

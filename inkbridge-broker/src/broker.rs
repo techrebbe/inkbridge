@@ -1,5 +1,5 @@
 use crate::model::*;
-use crate::pdf_view::write_boox_view;
+use crate::pdf_view::write_boox_view_with_tombstones;
 use crate::storage::*;
 use inkbridge_convert::{
     build_manifest, parse_baseline_bytes, Manifest, Operation, StrokeSnapshot,
@@ -278,8 +278,14 @@ impl Broker {
                     .filter(|stroke| stroke.tombstone.is_none())
                     .map(|stroke| stroke.snapshot.clone())
                     .collect::<Vec<_>>();
-                let pdf =
-                    write_boox_view(&original.bytes, active).map_err(BrokerError::Conversion)?;
+                let tombstones = state
+                    .strokes
+                    .values()
+                    .filter(|stroke| stroke.tombstone.is_some())
+                    .map(|stroke| stroke.stroke_id.clone())
+                    .collect::<Vec<_>>();
+                let pdf = write_boox_view_with_tombstones(&original.bytes, active, tombstones)
+                    .map_err(BrokerError::Conversion)?;
                 (boox_view_path(&state), pdf)
             }
         };
