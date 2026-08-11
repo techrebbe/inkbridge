@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - 'supernote-poc/**'
+      - 'scripts/inkbridge-runner*.mjs'
+      - 'scripts/test/inkbridge-runner.test.mjs'
+      - 'scripts/InkBridge-Runner.cmd'
       - '.github/workflows/supernote-poc-build.yml'
   push:
     branches:
@@ -30,6 +33,9 @@ jobs:
 
       - name: Test InkBridge manifest logic
         run: npm test --prefix supernote-poc
+
+      - name: Test InkBridge Runner
+        run: node --test scripts/test/inkbridge-runner.test.mjs
 
       - name: Build .snplg
         run: |

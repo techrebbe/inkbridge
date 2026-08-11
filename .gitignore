@@ -44,6 +44,7 @@ local.properties
 .cxx/
 .kotlin/
 captures/
+/inkbridge-runs/
 
 # Signing keys — NEVER commit (debug.keystore is fine to keep)
 *.keystore

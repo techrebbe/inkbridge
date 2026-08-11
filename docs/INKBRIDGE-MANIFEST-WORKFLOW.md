@@ -14,6 +14,11 @@ Supernote DOC/NOTE
 This is the first generic implementation of the native-environment bridge. It
 replaces the document-specific fixtures used by the hardware proofs.
 
+For the Windows/ADB-assisted version of these steps, see
+[`INKBRIDGE-RUNNER.md`](INKBRIDGE-RUNNER.md). The runner detects both tablets,
+captures a complete page export, pulls the BOOX PDF, converts it, builds a
+uniquely versioned plugin, and verifies the copy placed in Supernote `MyStyle`.
+
 ## 1. Capture the Supernote baseline
 
 For each annotated page that will participate in the round trip, run **Export

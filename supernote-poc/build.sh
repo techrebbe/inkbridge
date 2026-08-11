@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST_PATH="${1:-}"
+PLUGIN_CONFIG_PATH="${INKBRIDGE_PLUGIN_CONFIG:-$ROOT/PluginConfig.json}"
+OUTPUT_DIR="${INKBRIDGE_OUTPUT_DIR:-$ROOT/out}"
 WORK_ROOT="$(mktemp -d)"
 trap 'rm -rf "$WORK_ROOT"' EXIT
 
@@ -28,7 +30,7 @@ if [[ -n "$MANIFEST_PATH" ]]; then
 else
   cp "$ROOT/overlay/generatedManifest.js" "$PROJECT/generatedManifest.js"
 fi
-cp "$ROOT/PluginConfig.json" "$PROJECT/PluginConfig.json"
+cp "$PLUGIN_CONFIG_PATH" "$PROJECT/PluginConfig.json"
 
 mkdir -p "$PROJECT/assets"
 cat > "$PROJECT/assets/icon.png.b64" <<'B64'
@@ -45,9 +47,9 @@ chmod +x buildPlugin.sh
 MSYS2_ARG_CONV_EXCL='/icon.png' ./buildPlugin.sh
 popd >/dev/null
 
-mkdir -p "$ROOT/out"
-rm -f "$ROOT/out"/*.snplg
-cp "$PROJECT"/build/outputs/*.snplg "$ROOT/out/"
+mkdir -p "$OUTPUT_DIR"
+rm -f "$OUTPUT_DIR"/*.snplg
+cp "$PROJECT"/build/outputs/*.snplg "$OUTPUT_DIR/"
 
 echo "Built Supernote plugin:"
-ls -lh "$ROOT/out"/*.snplg
+ls -lh "$OUTPUT_DIR"/*.snplg
