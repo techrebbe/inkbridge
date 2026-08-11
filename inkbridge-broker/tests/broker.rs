@@ -6,20 +6,28 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn original_pdf() -> Vec<u8> {
+    original_pdf_with_pages(1)
+}
+
+fn original_pdf_with_pages(page_count: usize) -> Vec<u8> {
     let mut document = Document::with_version("1.7");
     let pages_id = document.new_object_id();
-    let page_id = document.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => pages_id,
-        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-        "Resources" => dictionary! {},
-    });
+    let page_ids = (0..page_count)
+        .map(|_| {
+            document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {},
+            })
+        })
+        .collect::<Vec<_>>();
     document.objects.insert(
         pages_id,
         dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
+            "Kids" => page_ids.into_iter().map(Into::into).collect::<Vec<_>>(),
+            "Count" => page_count as i64,
         }
         .into(),
     );
@@ -34,12 +42,16 @@ fn original_pdf() -> Vec<u8> {
 }
 
 fn stroke(id: &str, x: f64, y: f64) -> StrokeSnapshot {
+    stroke_on_page(id, 0, x, y)
+}
+
+fn stroke_on_page(id: &str, page_index: u32, x: f64, y: f64) -> StrokeSnapshot {
     let native_style = NativeStyle::default();
     let samples = vec![[x, y, 900.0], [x + 0.08, y + 0.04, 1100.0]];
     StrokeSnapshot {
         source_uuid: id.to_owned(),
         origin: "supernote-native".to_owned(),
-        page_index: 0,
+        page_index,
         geometry_fingerprint: geometry_fingerprint(&native_style, &samples),
         native_style,
         samples,
@@ -47,9 +59,13 @@ fn stroke(id: &str, x: f64, y: f64) -> StrokeSnapshot {
 }
 
 fn supernote_export(strokes: &[StrokeSnapshot]) -> Vec<u8> {
+    supernote_export_page(0, strokes)
+}
+
+fn supernote_export_page(page_index: u32, strokes: &[StrokeSnapshot]) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "sourceFileName": "document.pdf",
-        "pageIndex": 0,
+        "pageIndex": page_index,
         "strokes": strokes.iter().map(|stroke| json!({
             "sourceUuid": stroke.source_uuid,
             "sourceKey": stroke.source_uuid,
@@ -72,7 +88,10 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let original = original_pdf();
+        Self::with_original(original_pdf())
+    }
+
+    fn with_original(original: Vec<u8>) -> Self {
         let mut storage = MemoryStorage::default();
         let broker = Broker::default();
         let state = broker
@@ -195,6 +214,7 @@ fn supernote_only_update_emits_editable_boox_pdf() {
         .unwrap();
     let state = harness.state();
     let path = boox_view_path(&state);
+    assert!(path.ends_with("/document.pdf"));
     let view = harness.storage.object(&path).unwrap();
     let document = Document::load_mem(&view.bytes).unwrap();
     let page = *document.get_pages().get(&1).unwrap();
@@ -209,6 +229,16 @@ fn supernote_only_update_emits_editable_boox_pdf() {
         b"sn-a"
     );
     assert!(annotations[0].get(b"AP").is_ok());
+}
+
+#[test]
+fn event_ids_with_the_same_readable_form_get_distinct_manifest_paths() {
+    let document_id = "inkbridge-doc-v1-test";
+    let slash = supernote_manifest_path(document_id, "a/b");
+    let question = supernote_manifest_path(document_id, "a?b");
+    assert_ne!(slash, question);
+    assert!(slash.ends_with(".operations.json"));
+    assert!(question.ends_with(".operations.json"));
 }
 
 #[test]
@@ -425,6 +455,59 @@ fn boox_move_and_deletion_update_canonical_strokes_and_tombstones() {
         &harness
             .storage
             .object(&supernote_manifest_path(&harness.document_id, "boox-1"))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(manifest.summary.upserted, 1);
+    assert_eq!(manifest.summary.deleted, 1);
+}
+
+#[test]
+fn boox_cross_page_move_to_lower_page_remains_active() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let original = stroke_on_page("cross-page", 1, 0.1, 0.2);
+    let initial = harness.event(
+        "sn-page-2",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_page(1, &[original]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let moved = stroke_on_page("cross-page", 0, 0.25, 0.35);
+    let returned = write_boox_view(&harness.original, [moved.clone()]).unwrap();
+    let boox = harness.event(
+        "boox-cross-page",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        returned,
+    );
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let canonical = &harness.state().strokes["cross-page"];
+    assert_eq!(canonical.snapshot.page_index, 0);
+    assert_eq!(
+        canonical.snapshot.geometry_fingerprint,
+        moved.geometry_fingerprint
+    );
+    assert!(canonical.tombstone.is_none());
+
+    let manifest: Manifest = serde_json::from_slice(
+        &harness
+            .storage
+            .object(&supernote_manifest_path(
+                &harness.document_id,
+                "boox-cross-page",
+            ))
             .unwrap()
             .bytes,
     )

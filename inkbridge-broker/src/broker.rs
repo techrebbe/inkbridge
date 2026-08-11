@@ -387,7 +387,7 @@ impl Broker {
         let preserved_path = format!(
             "Conflicts/{}/{}/incoming.{extension}",
             event.document_id,
-            safe_segment(&event.event_id)
+            event_path_segment(&event.event_id)
         );
         let mut conflict_writes = vec![ConditionalWrite {
             path: preserved_path.clone(),
@@ -420,7 +420,7 @@ impl Broker {
             let current_path = format!(
                 "Conflicts/{}/{}/current-{side_name}.{current_extension}",
                 event.document_id,
-                safe_segment(&event.event_id),
+                event_path_segment(&event.event_id),
             );
             competing_preserved_paths.push(current_path.clone());
             conflict_writes.push(ConditionalWrite {
@@ -574,47 +574,66 @@ fn mark_event_only<S: BrokerStorage>(
 fn apply_manifest(state: &mut CanonicalDocumentState, manifest: &Manifest, event: &StorageEvent) {
     let mut revisions = event.based_on;
     revisions.set(event.source, event.source_revision);
+    let upserted_ids = manifest
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            Operation::UpsertStroke { source_uuid, .. } => Some(source_uuid.as_str()),
+            Operation::DeleteStroke { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    // A cross-page move is encoded as a delete on the old page plus an upsert
+    // on the new page. Apply only terminal deletions here; the upsert pass below
+    // makes the result independent of manifest page ordering.
     for operation in &manifest.operations {
-        match operation {
-            Operation::UpsertStroke {
-                source_uuid, after, ..
-            } => {
-                state.strokes.insert(
-                    source_uuid.clone(),
-                    CanonicalStroke {
-                        stroke_id: source_uuid.clone(),
-                        snapshot: after.clone(),
-                        last_modified_by: event.source,
-                        source_revisions: revisions,
-                        tombstone: None,
-                    },
-                );
-            }
-            Operation::DeleteStroke {
-                source_uuid,
-                before,
-                ..
-            } => {
-                let canonical =
-                    state
-                        .strokes
-                        .entry(source_uuid.clone())
-                        .or_insert_with(|| CanonicalStroke {
-                            stroke_id: source_uuid.clone(),
-                            snapshot: before.clone(),
-                            last_modified_by: event.source,
-                            source_revisions: revisions,
-                            tombstone: None,
-                        });
-                canonical.last_modified_by = event.source;
-                canonical.source_revisions = revisions;
-                canonical.tombstone = Some(Tombstone {
-                    deleted_by: event.source,
-                    deleted_at_revision: event.source_revision,
-                    event_id: event.event_id.clone(),
-                });
-            }
+        let Operation::DeleteStroke {
+            source_uuid,
+            before,
+            ..
+        } = operation
+        else {
+            continue;
+        };
+        if upserted_ids.contains(source_uuid.as_str()) {
+            continue;
         }
+        let canonical =
+            state
+                .strokes
+                .entry(source_uuid.clone())
+                .or_insert_with(|| CanonicalStroke {
+                    stroke_id: source_uuid.clone(),
+                    snapshot: before.clone(),
+                    last_modified_by: event.source,
+                    source_revisions: revisions,
+                    tombstone: None,
+                });
+        canonical.last_modified_by = event.source;
+        canonical.source_revisions = revisions;
+        canonical.tombstone = Some(Tombstone {
+            deleted_by: event.source,
+            deleted_at_revision: event.source_revision,
+            event_id: event.event_id.clone(),
+        });
+    }
+    for operation in &manifest.operations {
+        let Operation::UpsertStroke {
+            source_uuid, after, ..
+        } = operation
+        else {
+            continue;
+        };
+        state.strokes.insert(
+            source_uuid.clone(),
+            CanonicalStroke {
+                stroke_id: source_uuid.clone(),
+                snapshot: after.clone(),
+                last_modified_by: event.source,
+                source_revisions: revisions,
+                tombstone: None,
+            },
+        );
     }
 }
 
@@ -750,8 +769,8 @@ fn add_newline(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-fn safe_segment(value: &str) -> String {
-    value
+fn readable_segment(value: &str) -> String {
+    let segment = value
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
@@ -760,7 +779,32 @@ fn safe_segment(value: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect::<String>();
+    if segment.is_empty() {
+        "item".to_owned()
+    } else {
+        segment
+    }
+}
+
+fn event_path_segment(event_id: &str) -> String {
+    let prefix = readable_segment(event_id)
+        .chars()
+        .take(48)
+        .collect::<String>();
+    format!("{prefix}-{}", sha256_hex(event_id.as_bytes()))
+}
+
+fn safe_pdf_file_name(original_file_name: &str) -> String {
+    let base_name = original_file_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("document.pdf");
+    let stem = base_name
+        .strip_suffix(".pdf")
+        .or_else(|| base_name.strip_suffix(".PDF"))
+        .unwrap_or(base_name);
+    format!("{}.pdf", readable_segment(stem))
 }
 
 pub fn original_path(document_id: &str) -> String {
@@ -774,7 +818,7 @@ pub fn state_path(document_id: &str) -> String {
 pub fn supernote_manifest_path(document_id: &str, event_id: &str) -> String {
     format!(
         "Supernote_Folder/{document_id}/incoming/{}.operations.json",
-        safe_segment(event_id)
+        event_path_segment(event_id)
     )
 }
 
@@ -782,6 +826,6 @@ pub fn boox_view_path(state: &CanonicalDocumentState) -> String {
     format!(
         "BOOX_Folder/{}/{}",
         state.document_id,
-        safe_segment(&state.original_file_name)
+        safe_pdf_file_name(&state.original_file_name)
     )
 }
