@@ -91,8 +91,8 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
                 Err(error) => {
                     eprintln!("warning: skipped annotation on page {page_number}: {error}");
                     skipped += 1;
-                    incomplete_pages.insert(page_index);
                     if let Some(source_uuid) = annotation_source_uuid(annotation) {
+                        incomplete_pages.insert(page_index);
                         failed_source_uuids.insert(source_uuid);
                     }
                 }

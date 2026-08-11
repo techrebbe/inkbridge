@@ -1,12 +1,46 @@
 use inkbridge_broker::*;
 use inkbridge_convert::{geometry_fingerprint, Manifest, NativeStyle, Operation, StrokeSnapshot};
-use lopdf::{dictionary, Document};
+use lopdf::{dictionary, Document, Object};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn original_pdf() -> Vec<u8> {
     original_pdf_with_pages(1)
+}
+
+fn original_pdf_with_anonymous_ink() -> Vec<u8> {
+    let mut document = Document::with_version("1.7");
+    let pages_id = document.new_object_id();
+    let anonymous_ink_id = document.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Ink",
+        "InkList" => vec![Object::Array(vec![30.into(), 30.into(), 40.into(), 40.into()])],
+    });
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {},
+        "Annots" => vec![Object::Reference(anonymous_ink_id)],
+    });
+    document.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes).unwrap();
+    bytes
 }
 
 fn original_pdf_with_pages(page_count: usize) -> Vec<u8> {
@@ -196,6 +230,57 @@ fn boox_only_update_emits_supernote_manifest() {
             .bytes,
         harness.original
     );
+}
+
+#[test]
+fn anonymous_original_ink_does_not_hide_a_canonical_boox_deletion() {
+    let mut harness = Harness::with_original(original_pdf_with_anonymous_ink());
+    let supernote = harness.event(
+        "sn-with-tracked-stroke",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("tracked-stroke", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &supernote)
+        .unwrap();
+
+    // This is the generated BOOX view after the tracked stroke is erased:
+    // the anonymous original ink remains, but the canonical stroke is absent.
+    let edited = write_boox_view(&harness.original, []).unwrap();
+    let boox = harness.event(
+        "boox-delete-beside-anonymous",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        edited,
+    );
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let manifest: Manifest = serde_json::from_slice(
+        &harness
+            .storage
+            .object(&supernote_manifest_path(
+                &harness.document_id,
+                "boox-delete-beside-anonymous",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(manifest.summary.deleted, 1);
+    assert!(matches!(
+        &manifest.operations[0],
+        Operation::DeleteStroke { source_uuid, .. } if source_uuid == "tracked-stroke"
+    ));
+    assert!(harness.state().strokes["tracked-stroke"]
+        .tombstone
+        .is_some());
 }
 
 #[test]
