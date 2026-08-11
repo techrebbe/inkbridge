@@ -813,6 +813,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkbridge-broker"
+version = "1.0.1"
+dependencies = [
+ "inkbridge-convert",
+ "lopdf",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "inkbridge-convert"
 version = "1.0.1"
 dependencies = [

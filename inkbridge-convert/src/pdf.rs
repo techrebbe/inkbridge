@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::Command;
 
 const MAX_APPEARANCE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INDIRECT_REFERENCE_DEPTH: usize = 32;
+const MAX_PAGE_TREE_DEPTH: usize = 64;
 
 pub struct PdfStrokeExtraction {
     pub page_count: usize,
@@ -91,8 +93,8 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
                 Err(error) => {
                     eprintln!("warning: skipped annotation on page {page_number}: {error}");
                     skipped += 1;
-                    incomplete_pages.insert(page_index);
-                    if let Some(source_uuid) = annotation_source_uuid(annotation) {
+                    if let Some(source_uuid) = annotation_source_uuid(&document, annotation) {
+                        incomplete_pages.insert(page_index);
                         failed_source_uuids.insert(source_uuid);
                     }
                 }
@@ -158,10 +160,12 @@ fn extract_annotation(
     page_index: u32,
     geometry: PageGeometry,
 ) -> Result<Vec<StrokeSnapshot>, String> {
-    let subtype = name(annotation.get(b"Subtype").ok());
+    let subtype = name(document, annotation.get(b"Subtype").ok());
     match subtype.as_deref() {
         Some("Ink") => extract_standard_ink(document, annotation, page_index, geometry),
-        Some("Stamp") if name(annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") => {
+        Some("Stamp")
+            if name(document, annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") =>
+        {
             extract_onyx_stroke(document, annotation, page_index, geometry)
                 .map(|stroke| vec![stroke])
         }
@@ -169,12 +173,16 @@ fn extract_annotation(
     }
 }
 
-fn annotation_source_uuid(annotation: &Dictionary) -> Option<String> {
-    let subtype = name(annotation.get(b"Subtype").ok());
+fn annotation_source_uuid(document: &Document, annotation: &Dictionary) -> Option<String> {
+    let subtype = name(document, annotation.get(b"Subtype").ok());
     match subtype.as_deref() {
-        Some("Ink") => pdf_string(annotation.get(b"NM").ok()).or_else(|| onyx_tag_id(annotation)),
-        Some("Stamp") if name(annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") => {
-            onyx_tag_id(annotation).or_else(|| pdf_string(annotation.get(b"NM").ok()))
+        Some("Ink") => pdf_string(document, annotation.get(b"NM").ok())
+            .or_else(|| onyx_tag_id(document, annotation)),
+        Some("Stamp")
+            if name(document, annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") =>
+        {
+            onyx_tag_id(document, annotation)
+                .or_else(|| pdf_string(document, annotation.get(b"NM").ok()))
         }
         _ => None,
     }
@@ -186,8 +194,8 @@ fn extract_standard_ink(
     page_index: u32,
     geometry: PageGeometry,
 ) -> Result<Vec<StrokeSnapshot>, String> {
-    let base_source_uuid = pdf_string(annotation.get(b"NM").ok())
-        .or_else(|| onyx_tag_id(annotation))
+    let base_source_uuid = pdf_string(document, annotation.get(b"NM").ok())
+        .or_else(|| onyx_tag_id(document, annotation))
         .ok_or_else(|| "standard /Ink annotation has no /NM or Onyx id".to_owned())?;
     let ink_list = resolve(document, annotation.get(b"InkList").map_err(display_error)?)?;
     let paths = ink_list
@@ -209,7 +217,7 @@ fn extract_standard_ink(
         .and_then(|value| resolve(document, value).ok())
         .and_then(|value| value.as_dict().ok())
         .and_then(|dict| dict.get(b"W").ok())
-        .and_then(number)
+        .and_then(|value| resolved_number(document, value))
         .unwrap_or(1.168_064_48);
     let style = NativeStyle {
         layer_num: 0,
@@ -226,8 +234,10 @@ fn extract_standard_ink(
     }
     let mut samples = Vec::with_capacity(coordinates.len() / 2);
     for pair in coordinates.chunks_exact(2) {
-        let x = number(&pair[0]).ok_or_else(|| "non-numeric /Ink x coordinate".to_owned())?;
-        let y = number(&pair[1]).ok_or_else(|| "non-numeric /Ink y coordinate".to_owned())?;
+        let x = resolved_number(document, &pair[0])
+            .ok_or_else(|| "non-numeric /Ink x coordinate".to_owned())?;
+        let y = resolved_number(document, &pair[1])
+            .ok_or_else(|| "non-numeric /Ink y coordinate".to_owned())?;
         let (normalized_x, normalized_y) = geometry.normalize(x, y);
         samples.push([normalized_x, normalized_y, pressure]);
     }
@@ -248,8 +258,8 @@ fn extract_onyx_stroke(
     page_index: u32,
     geometry: PageGeometry,
 ) -> Result<StrokeSnapshot, String> {
-    let source_uuid = onyx_tag_id(annotation)
-        .or_else(|| pdf_string(annotation.get(b"NM").ok()))
+    let source_uuid = onyx_tag_id(document, annotation)
+        .or_else(|| pdf_string(document, annotation.get(b"NM").ok()))
         .ok_or_else(|| "BOOX stroke has no stable Onyx id".to_owned())?;
     let stream = appearance_stream(document, annotation)?;
     let stream_matrix = stream
@@ -270,7 +280,7 @@ fn extract_onyx_stroke(
         .and_then(|value| resolve(document, value).ok())
         .and_then(|value| value.as_dict().ok())
         .and_then(|dict| dict.get(b"W").ok())
-        .and_then(number)
+        .and_then(|value| resolved_number(document, value))
         .unwrap_or(1.168_064_48);
     let mut matrix = stream_matrix;
     let mut stack = Vec::new();
@@ -331,7 +341,7 @@ fn extract_onyx_stroke(
             .and_then(|value| resolve(document, value).ok())
             .and_then(|value| value.as_dict().ok())
             .and_then(|dict| dict.get(b"W").ok())
-            .and_then(number)
+            .and_then(|value| resolved_number(document, value))
             .map(width_to_supernote_thickness)
             .unwrap_or(400),
         pen_color: annotation_luminance(document, annotation),
@@ -365,7 +375,7 @@ fn matrix_from_object(document: &Document, object: &Object) -> Result<Matrix, St
         .as_array()
         .map_err(|_| "appearance /Matrix is not an array".to_owned())?
         .iter()
-        .map(number)
+        .map(|value| resolved_number(document, value))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| "appearance /Matrix contains non-numeric values".to_owned())?;
     if values.len() != 6 {
@@ -401,7 +411,10 @@ fn annotation_luminance(document: &Document, annotation: &Dictionary) -> i64 {
     else {
         return 0;
     };
-    let channels = color.iter().filter_map(number).collect::<Vec<_>>();
+    let channels = color
+        .iter()
+        .filter_map(|value| resolved_number(document, value))
+        .collect::<Vec<_>>();
     let luminance = match channels.as_slice() {
         [gray] => *gray,
         [red, green, blue, ..] => 0.2126 * red + 0.7152 * green + 0.0722 * blue,
@@ -410,8 +423,8 @@ fn annotation_luminance(document: &Document, annotation: &Dictionary) -> i64 {
     (luminance.clamp(0.0, 1.0) * 255.0).round() as i64
 }
 
-fn onyx_tag_id(annotation: &Dictionary) -> Option<String> {
-    let tag = pdf_string(annotation.get(b"onyxtag").ok())?;
+fn onyx_tag_id(document: &Document, annotation: &Dictionary) -> Option<String> {
+    let tag = pdf_string(document, annotation.get(b"onyxtag").ok())?;
     let value: Value = serde_json::from_str(&tag).ok()?;
     value.get("id")?.as_str().map(ToOwned::to_owned)
 }
@@ -441,16 +454,42 @@ fn number(object: &Object) -> Option<f64> {
     }
 }
 
-fn name(object: Option<&Object>) -> Option<String> {
+fn name(document: &Document, object: Option<&Object>) -> Option<String> {
+    name_with_depth(document, object, 0)
+}
+
+fn name_with_depth(document: &Document, object: Option<&Object>, depth: usize) -> Option<String> {
+    if depth >= MAX_INDIRECT_REFERENCE_DEPTH {
+        return None;
+    }
     match object? {
         Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| name_with_depth(document, Some(value), depth + 1)),
         _ => None,
     }
 }
 
-fn pdf_string(object: Option<&Object>) -> Option<String> {
+fn pdf_string(document: &Document, object: Option<&Object>) -> Option<String> {
+    pdf_string_with_depth(document, object, 0)
+}
+
+fn pdf_string_with_depth(
+    document: &Document,
+    object: Option<&Object>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= MAX_INDIRECT_REFERENCE_DEPTH {
+        return None;
+    }
     match object? {
         Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| pdf_string_with_depth(document, Some(value), depth + 1)),
         _ => None,
     }
 }
@@ -464,8 +503,12 @@ fn page_geometry(document: &Document, page_id: lopdf::ObjectId) -> Result<PageGe
     let mut crop_box = None;
     let mut media_box = None;
     let mut rotation = None;
+    let mut visited = HashSet::new();
 
     loop {
+        if visited.len() >= MAX_PAGE_TREE_DEPTH || !visited.insert(current_id) {
+            return Err("PDF page has a cyclic or excessively deep Parent chain".to_owned());
+        }
         let dictionary = document.get_dictionary(current_id).map_err(|error| {
             format!("could not resolve page tree object {current_id:?}: {error}")
         })?;
@@ -485,7 +528,7 @@ fn page_geometry(document: &Document, page_id: lopdf::ObjectId) -> Result<PageGe
             rotation = dictionary
                 .get(b"Rotate")
                 .ok()
-                .and_then(number)
+                .and_then(|object| resolved_number(document, object))
                 .map(|value| value.round() as i64);
         }
         let Some(parent) = dictionary
@@ -520,13 +563,30 @@ fn rectangle(document: &Document, object: &Object) -> Result<[f64; 4], String> {
         .as_array()
         .map_err(|_| "page box is not an array".to_owned())?
         .iter()
-        .map(number)
+        .map(|value| resolved_number(document, value))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| "page box contains non-numeric values".to_owned())?;
     if values.len() != 4 {
         return Err("page box does not contain four values".to_owned());
     }
     Ok([values[0], values[1], values[2], values[3]])
+}
+
+fn resolved_number(document: &Document, object: &Object) -> Option<f64> {
+    resolved_number_at_depth(document, object, 0)
+}
+
+fn resolved_number_at_depth(document: &Document, object: &Object, depth: usize) -> Option<f64> {
+    if depth >= MAX_INDIRECT_REFERENCE_DEPTH {
+        return None;
+    }
+    match object {
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| resolved_number_at_depth(document, value, depth + 1)),
+        value => number(value),
+    }
 }
 
 impl PageGeometry {
@@ -578,7 +638,7 @@ mod tests {
             "InkList" => vec![
                 Object::Array(vec![60.into(), 600.into(), 120.into(), 560.into()])
             ],
-            "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
+            "BS" => dictionary! {"W" => Object::Real(1.168_064_5)},
             "C" => vec![0.into(), 0.into(), 0.into()],
         };
         let strokes = extract_standard_ink(&document, &annotation, 0, test_geometry()).unwrap();
@@ -591,6 +651,31 @@ mod tests {
     }
 
     #[test]
+    fn reads_standard_ink_with_indirect_coordinates() {
+        let mut document = Document::new();
+        let x1 = document.add_object(Object::Integer(60));
+        let y1 = document.add_object(Object::Integer(600));
+        let x2 = document.add_object(Object::Integer(120));
+        let y2 = document.add_object(Object::Integer(560));
+        let annotation = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("indirect-coordinate-stroke"),
+            "InkList" => vec![Object::Array(vec![
+                Object::Reference(x1),
+                Object::Reference(y1),
+                Object::Reference(x2),
+                Object::Reference(y2),
+            ])],
+        };
+
+        let strokes = extract_standard_ink(&document, &annotation, 0, test_geometry()).unwrap();
+        assert_eq!(strokes.len(), 1);
+        assert_eq!(strokes[0].samples.len(), 2);
+        assert!((strokes[0].samples[0][0] - 0.1).abs() < 0.000_001);
+        assert!((strokes[0].samples[0][1] - 0.25).abs() < 0.000_001);
+    }
+
+    #[test]
     fn rejects_grouped_standard_ink_without_per_path_ids() {
         let document = Document::new();
         let annotation = dictionary! {
@@ -600,7 +685,7 @@ mod tests {
                 Object::Array(vec![60.into(), 600.into(), 120.into(), 560.into()]),
                 Object::Array(vec![180.into(), 520.into(), 240.into(), 480.into()]),
             ],
-            "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
+            "BS" => dictionary! {"W" => Object::Real(1.168_064_5)},
             "C" => vec![0.into(), 0.into(), 0.into()],
         };
         let error = extract_standard_ink(&document, &annotation, 0, test_geometry())
@@ -616,9 +701,100 @@ mod tests {
             "InkList" => Object::Null,
         };
         assert_eq!(
-            annotation_source_uuid(&annotation).as_deref(),
+            annotation_source_uuid(&Document::new(), &annotation).as_deref(),
             Some("moved-but-damaged")
         );
+    }
+
+    #[test]
+    fn resolves_indirect_annotation_identity() {
+        let mut document = Document::new();
+        let identity_id = document.add_object(Object::string_literal("indirect-stroke"));
+        let annotation = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => identity_id,
+            "InkList" => Object::Null,
+        };
+        assert_eq!(
+            annotation_source_uuid(&document, &annotation).as_deref(),
+            Some("indirect-stroke")
+        );
+        assert!(
+            extract_standard_ink(&document, &annotation, 0, test_geometry())
+                .expect_err("geometry remains deliberately malformed")
+                .contains("invalid /InkList")
+        );
+    }
+
+    #[test]
+    fn cyclic_identity_references_are_rejected_without_recursing_forever() {
+        let mut document = Document::new();
+        let cycle_id = document.new_object_id();
+        document
+            .objects
+            .insert(cycle_id, Object::Reference(cycle_id));
+        assert_eq!(name(&document, Some(&Object::Reference(cycle_id))), None);
+        assert_eq!(
+            pdf_string(&document, Some(&Object::Reference(cycle_id))),
+            None
+        );
+    }
+
+    #[test]
+    fn page_geometry_resolves_indirect_rotation() {
+        let mut document = Document::new();
+        let rotation_id = document.add_object(Object::Integer(-90));
+        let page_id = document.add_object(dictionary! {
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Rotate" => rotation_id,
+        });
+
+        assert_eq!(page_geometry(&document, page_id).unwrap().rotation, 270);
+    }
+
+    #[test]
+    fn page_geometry_resolves_indirect_page_box_coordinates() {
+        let mut document = Document::new();
+        let right_id = document.add_object(Object::Integer(612));
+        let top_id = document.add_object(Object::Integer(792));
+        let page_id = document.add_object(dictionary! {
+            "MediaBox" => vec![
+                0.into(),
+                0.into(),
+                Object::Reference(right_id),
+                Object::Reference(top_id),
+            ],
+        });
+
+        let geometry = page_geometry(&document, page_id).unwrap();
+        assert_eq!(geometry.width, 612.0);
+        assert_eq!(geometry.height, 792.0);
+    }
+
+    #[test]
+    fn page_geometry_rejects_cyclic_parent_chain() {
+        let mut document = Document::new();
+        let page_id = document.new_object_id();
+        let parent_id = document.new_object_id();
+        document.objects.insert(
+            page_id,
+            dictionary! {
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Parent" => parent_id,
+            }
+            .into(),
+        );
+        document.objects.insert(
+            parent_id,
+            dictionary! {
+                "Parent" => page_id,
+            }
+            .into(),
+        );
+
+        assert!(page_geometry(&document, page_id)
+            .unwrap_err()
+            .contains("cyclic or excessively deep"));
     }
 
     #[test]
@@ -638,7 +814,7 @@ mod tests {
                 r#"{"id":"boox-stroke","type":"BrushStroke"}"#
             ),
             "AP" => dictionary! {"N" => appearance_id},
-            "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
+            "BS" => dictionary! {"W" => Object::Real(1.168_064_5)},
             "C" => vec![0.into(), Object::Real(0.69), Object::Real(0.21)],
         };
         let stroke = extract_onyx_stroke(&document, &annotation, 0, test_geometry()).unwrap();
