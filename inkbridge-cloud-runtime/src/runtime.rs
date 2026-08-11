@@ -78,10 +78,8 @@ impl RuntimeService {
                     event.source_generation, source.generation
                 ));
             }
-        } else {
-            if let Err(reason) = hydrate_content_hash(&mut event, &source.bytes) {
-                return Ok(RuntimeOutcome::Rejected { reason });
-            }
+        } else if let Err(reason) = hydrate_content_hash(&mut event, &source.bytes) {
+            return Ok(RuntimeOutcome::Rejected { reason });
         }
         let mut storage = storage;
         let outcome = Broker::default()
