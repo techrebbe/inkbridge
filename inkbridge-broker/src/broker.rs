@@ -750,6 +750,12 @@ fn write_baselines(
             .or_default()
             .push(&canonical.snapshot);
     }
+    // build_manifest derives its Supernote document guard from baseline
+    // exports. Keep that guard even before the first stroke exists (or after
+    // every stroke has been tombstoned) by emitting one empty page baseline.
+    if pages.is_empty() {
+        pages.insert(0, Vec::new());
+    }
     let mut paths = Vec::new();
     for (page_index, mut strokes) in pages {
         strokes.sort_by(|left, right| left.source_uuid.cmp(&right.source_uuid));

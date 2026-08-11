@@ -233,6 +233,33 @@ fn boox_only_update_emits_supernote_manifest() {
 }
 
 #[test]
+fn empty_initial_boox_update_still_targets_the_registered_document() {
+    let mut harness = Harness::new();
+    let event = harness.event(
+        "boox-empty-1",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        harness.original.clone(),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+
+    let output = harness
+        .storage
+        .object(&supernote_manifest_path(
+            &harness.document_id,
+            "boox-empty-1",
+        ))
+        .unwrap();
+    let manifest: Manifest = serde_json::from_slice(&output.bytes).unwrap();
+    assert_eq!(manifest.document.target_file_names, ["document.pdf"]);
+    assert!(manifest.operations.is_empty());
+}
+
+#[test]
 fn anonymous_original_ink_does_not_hide_a_canonical_boox_deletion() {
     let mut harness = Harness::with_original(original_pdf_with_anonymous_ink());
     let supernote = harness.event(
