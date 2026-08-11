@@ -18,7 +18,9 @@ replaces the document-specific fixtures used by the hardware proofs.
 
 For each annotated page that will participate in the round trip, run **Export
 Page Test** and save the `INKBRIDGE_EXPORT` log lines. The converter accepts
-either that log or the reconstructed JSON payload.
+either that log or the reconstructed JSON payload. Every baseline supplied to
+one conversion must name the same source document; mixed-document exports are
+rejected before a manifest is created.
 
 ## 2. Embed NeoReader data
 
@@ -76,6 +78,10 @@ The plugin resolves an existing native stroke by:
 Updates insert the replacement before deleting the superseded native element,
 matching the behavior validated on the Nomad. Re-running the same package is
 idempotent and reports already-current or already-absent operations as skipped.
+An InkBridge tag alone is not treated as proof that a stroke is current: the
+plugin also verifies the live native geometry after applying the Supernote
+color and coordinate transforms, so lasso edits are not hidden by stale tag
+metadata.
 The plugin scans each affected page once and batches its insertions and
 deletions, avoiding a full native-stroke rescan after every operation.
 

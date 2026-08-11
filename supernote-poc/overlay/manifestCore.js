@@ -15,6 +15,43 @@ export function supernotePenColor(sourcePenColor) {
     : 0x9d;
 }
 
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+export function liveSnapshotMatches(
+  liveSnapshot,
+  sourceSnapshot,
+  normalizedYOffset,
+  coordinateTolerance = 0.0015,
+) {
+  if (!liveSnapshot || !sourceSnapshot) return false;
+  const liveStyle = liveSnapshot.nativeStyle;
+  const sourceStyle = sourceSnapshot.nativeStyle;
+  if (!liveStyle || !sourceStyle) return false;
+  if (
+    liveStyle.thickness !== sourceStyle.thickness ||
+    liveStyle.penColor !== supernotePenColor(sourceStyle.penColor) ||
+    liveStyle.penType !== sourceStyle.penType
+  ) {
+    return false;
+  }
+  const liveSamples = liveSnapshot.samples ?? [];
+  const sourceSamples = sourceSnapshot.samples ?? [];
+  if (liveSamples.length !== sourceSamples.length) return false;
+  return liveSamples.every(([liveX, liveY, livePressure], index) => {
+    const [sourceX, sourceY, sourcePressure] = sourceSamples[index];
+    const expectedX = clamp(sourceX, 0, 1);
+    const expectedY = clamp(sourceY + normalizedYOffset, 0, 1);
+    const expectedPressure = clamp(Math.round(sourcePressure ?? 1024), 0, 4096);
+    return (
+      Math.abs(liveX - expectedX) <= coordinateTolerance &&
+      Math.abs(liveY - expectedY) <= coordinateTolerance &&
+      Math.abs(livePressure - expectedPressure) <= 1
+    );
+  });
+}
+
 function fnv1a32(text) {
   let hash = 0x811c9dc5;
   for (let index = 0; index < text.length; index += 1) {

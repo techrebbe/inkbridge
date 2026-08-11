@@ -29,10 +29,7 @@ pub fn build_manifest(
     for path in baseline_paths {
         let export = load_baseline(path)?;
         if let Some(source_file_name) = export.source_file_name {
-            if !source_file_name.trim().is_empty() && !target_file_names.contains(&source_file_name)
-            {
-                target_file_names.push(source_file_name);
-            }
+            add_target_file_name(&mut target_file_names, source_file_name)?;
         }
         baseline_strokes.extend(export.strokes);
     }
@@ -83,6 +80,22 @@ pub fn build_manifest(
             skipped,
         },
     })
+}
+
+fn add_target_file_name(targets: &mut Vec<String>, candidate: String) -> Result<(), String> {
+    if candidate.trim().is_empty() {
+        return Ok(());
+    }
+    if let Some(existing) = targets.first() {
+        if existing != &candidate {
+            return Err(format!(
+                "baseline exports name different target documents: {existing} and {candidate}"
+            ));
+        }
+    } else {
+        targets.push(candidate);
+    }
+    Ok(())
 }
 
 fn validate_baseline_pages(strokes: &[StrokeSnapshot], page_count: usize) -> Result<(), String> {
@@ -298,5 +311,18 @@ mod tests {
         assert!(error.contains("out-of-range"));
         assert!(error.contains("page 3"));
         assert!(error.contains("2 pages"));
+    }
+
+    #[test]
+    fn baseline_exports_must_name_the_same_target_document() {
+        let mut targets = Vec::new();
+        add_target_file_name(&mut targets, "document-a.pdf".to_owned()).unwrap();
+        add_target_file_name(&mut targets, "document-a.pdf".to_owned()).unwrap();
+        let error = add_target_file_name(&mut targets, "document-b.pdf".to_owned())
+            .expect_err("operations cannot safely target two different documents");
+
+        assert_eq!(targets, vec!["document-a.pdf"]);
+        assert!(error.contains("document-a.pdf"));
+        assert!(error.contains("document-b.pdf"));
     }
 }

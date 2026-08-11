@@ -7,6 +7,7 @@ import {EMBEDDED_MANIFEST} from './generatedManifest';
 import {
   descriptorMatches,
   geometryFingerprint,
+  liveSnapshotMatches,
   parseUserData,
   supernotePenColor,
   strokeDescriptor,
@@ -109,13 +110,14 @@ function taggedMatch(described, sourceUuid) {
   );
 }
 
-function currentAfterMatch(described, operation) {
+function currentAfterMatch(described, operation, yOffset) {
   const fingerprint = operation.after?.geometryFingerprint;
   return described.find(
     item =>
       (item.data?.inkBridgeOrigin === 'inkbridge-sync' &&
         item.data?.sourceUuid === operation.sourceUuid &&
-        item.data?.contentHash === fingerprint) ||
+        item.data?.contentHash === fingerprint &&
+        liveSnapshotMatches(item.snapshot, operation.after, yOffset)) ||
       (item.snapshot.geometryFingerprint === fingerprint &&
         (item.element.uuid === operation.sourceUuid ||
           item.data?.sourceUuid === operation.sourceUuid)),
@@ -296,7 +298,7 @@ async function applyPage({
       continue;
     }
 
-    const current = currentAfterMatch(described, operation);
+    const current = currentAfterMatch(described, operation, yOffset);
     if (current) {
       const superseded = operation.before
         ? findSupersededTarget(described, operation, current, null)
