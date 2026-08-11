@@ -41,6 +41,15 @@ test('descriptor matching tolerates tiny native coordinate round trips', () => {
   assert.equal(descriptorMatches(original, roundTripped), true);
 });
 
+test('descriptor fallback does not match ink from another native layer', () => {
+  const original = strokeDescriptor({nativeStyle: style, samples});
+  const otherLayer = strokeDescriptor({
+    nativeStyle: {...style, layerNum: 1},
+    samples,
+  });
+  assert.equal(descriptorMatches(original, otherLayer), false);
+});
+
 test('manifest validation rejects an unconfigured plugin', () => {
   assert.throws(() => validateManifest(null), /no InkBridge manifest/);
 });

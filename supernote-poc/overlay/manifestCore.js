@@ -146,6 +146,9 @@ export function strokeDescriptor(snapshot) {
 export function descriptorMatches(left, right, tolerance = 0.003) {
   if (!left || !right) return false;
   if (left.pointCount !== right.pointCount) return false;
+  if ((left.nativeStyle.layerNum ?? 0) !== (right.nativeStyle.layerNum ?? 0)) {
+    return false;
+  }
   if (left.nativeStyle.thickness !== right.nativeStyle.thickness) return false;
   if (left.nativeStyle.penColor !== right.nativeStyle.penColor) return false;
   if (left.nativeStyle.penType !== right.nativeStyle.penType) return false;
