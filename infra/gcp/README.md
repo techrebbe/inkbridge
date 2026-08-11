@@ -19,9 +19,10 @@ Cloud Build must exist before that image can be built. The same Terraform
 configuration therefore has two explicit enabled stages:
 
 1. **Bootstrap** — `cloud_run_image = ""`. Enables only the bootstrap APIs and
-   creates the private versioned data bucket, Firestore database, runtime
-   service account and IAM, and regional Artifact Registry repository. Cloud
-   Run and Eventarc are deliberately absent.
+   creates the private versioned data bucket, a separate transient Cloud Build
+   source bucket, Firestore database, runtime service account and IAM, and
+   regional Artifact Registry repository. Cloud Run and Eventarc are
+   deliberately absent.
 2. **Runtime** — set `cloud_run_image` to the immutable Artifact Registry
    `@sha256:` URI produced by Cloud Build. Adds the private Cloud Run service,
    Eventarc service account/IAM, runtime APIs, and finalized-object trigger.
@@ -64,6 +65,7 @@ saved plans. Copy `terraform.tfvars.example` to a private `.tfvars` file.
      --project=PROJECT_ID \
      --region=REGION \
      --config=cloudbuild.runtime.yaml \
+     --gcs-source-staging-dir=gs://BUILD_SOURCE_BUCKET/source \
      --service-account=projects/PROJECT_ID/serviceAccounts/inkbridge-builder@PROJECT_ID.iam.gserviceaccount.com \
      --substitutions=_IMAGE=REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/runtime:GIT_SHA
    ```
@@ -82,8 +84,10 @@ saved plans. Copy `terraform.tfvars.example` to a private `.tfvars` file.
    finalized update from each device folder.
 
 The Artifact Registry repository keeps the five most recent versions and
-deletes untagged versions older than seven days. Cloud Run remains private,
-uses zero minimum instances, one maximum instance, and concurrency one.
+deletes untagged versions older than seven days. The dedicated build-source
+bucket deletes source archives after one day, and the builder can read that
+bucket but not the device-data bucket. Cloud Run remains private, uses zero
+minimum instances, one maximum instance, and concurrency one.
 
 ## Planned resources
 
@@ -91,6 +95,7 @@ The enabled stages manage:
 
 - required project APIs (budget API only when a nonzero budget is requested);
 - private regional Artifact Registry repository;
+- private, short-lived Cloud Build source bucket;
 - private versioned device-data bucket;
 - Firestore Native database with deletion protection and point-in-time recovery;
 - least-scope build, runtime, and Eventarc service accounts/IAM;

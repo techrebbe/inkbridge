@@ -34,6 +34,12 @@ variable "bucket_name" {
   default     = "inkbridge-not-configured"
 }
 
+variable "cloud_build_source_bucket_name" {
+  description = "Globally unique private bucket used only for transient Cloud Build source archives."
+  type        = string
+  default     = "inkbridge-build-source-not-configured"
+}
+
 variable "cloud_run_image" {
   description = "Immutable linux/amd64 Artifact Registry digest. Empty performs the bootstrap stage without Cloud Run or Eventarc."
   type        = string

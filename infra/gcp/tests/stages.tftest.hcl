@@ -39,6 +39,7 @@ run "bootstrap_omits_runtime" {
     project_number             = "123456789012"
     region                     = "me-west1"
     bucket_name                = "inkbridge-plan-test-sync"
+    cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
   }
 
   assert {
@@ -54,6 +55,19 @@ run "bootstrap_omits_runtime" {
   assert {
     condition     = length(google_service_account.builder) == 1
     error_message = "Bootstrap must create the least-privilege image builder."
+  }
+
+  assert {
+    condition     = length(google_storage_bucket.build_source) == 1
+    error_message = "Bootstrap must create a dedicated build-source bucket."
+  }
+
+  assert {
+    condition = (
+      google_storage_bucket_iam_member.builder_source[0].bucket ==
+      google_storage_bucket.build_source[0].name
+    )
+    error_message = "The builder source-reader grant must be scoped to the dedicated source bucket."
   }
 
   assert {
@@ -77,6 +91,7 @@ run "immutable_digest_enables_runtime" {
     project_number             = "123456789012"
     region                     = "me-west1"
     bucket_name                = "inkbridge-plan-test-sync"
+    cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
     cloud_run_image            = "me-west1-docker.pkg.dev/inkbridge-plan-test/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 
@@ -106,6 +121,7 @@ run "foreign_image_digest_is_rejected" {
     project_number             = "123456789012"
     region                     = "me-west1"
     bucket_name                = "inkbridge-plan-test-sync"
+    cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
     cloud_run_image            = "me-west1-docker.pkg.dev/another-project/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 

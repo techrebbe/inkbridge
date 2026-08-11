@@ -27,3 +27,8 @@ output "cloud_build_service_account" {
   description = "Least-privilege service account used for the reviewed image build."
   value       = local.enabled ? google_service_account.builder[0].email : null
 }
+
+output "cloud_build_source_bucket" {
+  description = "Dedicated transient source bucket readable by the image-builder account."
+  value       = local.enabled ? google_storage_bucket.build_source[0].name : null
+}

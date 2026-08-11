@@ -64,6 +64,28 @@ resource "google_storage_bucket" "sync" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_storage_bucket" "build_source" {
+  count = local.enabled ? 1 : 0
+
+  name                        = var.cloud_build_source_bucket_name
+  location                    = var.region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = false
+
+  lifecycle_rule {
+    condition {
+      age = 1
+    }
+
+    action {
+      type = "Delete"
+    }
+  }
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_artifact_registry_repository" "runtime" {
   count = local.enabled ? 1 : 0
 
@@ -167,12 +189,12 @@ resource "google_project_iam_member" "builder_logs" {
   member  = "serviceAccount:${google_service_account.builder[0].email}"
 }
 
-resource "google_project_iam_member" "builder_source" {
+resource "google_storage_bucket_iam_member" "builder_source" {
   count = local.enabled ? 1 : 0
 
-  project = var.project_id
-  role    = "roles/storage.objectViewer"
-  member  = "serviceAccount:${google_service_account.builder[0].email}"
+  bucket = google_storage_bucket.build_source[0].name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.builder[0].email}"
 }
 
 resource "google_project_iam_member" "runtime_firestore" {

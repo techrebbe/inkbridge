@@ -121,5 +121,7 @@ and adds those two resources. Real applies use the partial GCS backend so
 canonical infrastructure state is not left on one workstation.
 
 `cloudbuild.runtime.yaml` builds the existing runtime Dockerfile as Linux
-amd64. The reviewed operator flow tags a source commit, resolves that tag to a
-digest, and supplies only the immutable digest to Terraform.
+amd64. Source archives are submitted through the dedicated private build-source
+bucket, so the builder account has no read access to the device-data bucket.
+The reviewed operator flow tags a source commit, resolves that tag to a digest,
+and supplies only the immutable digest to Terraform.
