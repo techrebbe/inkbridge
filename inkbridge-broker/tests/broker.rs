@@ -282,6 +282,34 @@ fn repeated_event_is_idempotent() {
 }
 
 #[test]
+fn out_of_order_event_for_overwritten_path_is_ignored_as_stale() {
+    let mut harness = Harness::new();
+    let stale = harness.event(
+        "sn-stale-generation",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("old", 0.2, 0.3)]),
+    );
+    harness.storage.put_unchecked(
+        &stale.object_path,
+        b"newer generation bytes".to_vec(),
+        BTreeMap::new(),
+    );
+
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &stale)
+            .unwrap(),
+        ProcessOutcome::IgnoredStaleSource { .. }
+    ));
+    let state = harness.state();
+    assert_eq!(state.supernote.revision, 0);
+    assert!(state.processed_event_ids.contains("sn-stale-generation"));
+}
+
+#[test]
 fn broker_generated_output_event_is_ignored() {
     let mut harness = Harness::new();
     let event = harness.event(

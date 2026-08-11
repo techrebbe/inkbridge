@@ -166,6 +166,25 @@ impl Broker {
             .read(&event.object_path)
             .map_err(BrokerError::Storage)?
             .ok_or_else(|| BrokerError::MissingObject(event.object_path.clone()))?;
+        if source.generation != event.source_generation {
+            if source.generation > event.source_generation {
+                mark_event_only(
+                    storage,
+                    &mut state,
+                    &state_path,
+                    state_object.generation,
+                    event,
+                )?;
+                return Ok(ProcessOutcome::IgnoredStaleSource {
+                    document_id: event.document_id.clone(),
+                    event_id: event.event_id.clone(),
+                });
+            }
+            return Err(BrokerError::InvalidEvent(format!(
+                "event generation {} is newer than stored source generation {}",
+                event.source_generation, source.generation
+            )));
+        }
         let actual_hash = sha256_hex(&source.bytes);
         if actual_hash != event.content_sha256 {
             return Err(BrokerError::InvalidEvent(format!(
@@ -185,25 +204,6 @@ impl Broker {
                 document_id: event.document_id.clone(),
                 event_id: event.event_id.clone(),
             });
-        }
-        if source.generation != event.source_generation {
-            if source.generation > event.source_generation {
-                mark_event_only(
-                    storage,
-                    &mut state,
-                    &state_path,
-                    state_object.generation,
-                    event,
-                )?;
-                return Ok(ProcessOutcome::IgnoredStaleSource {
-                    document_id: event.document_id.clone(),
-                    event_id: event.event_id.clone(),
-                });
-            }
-            return Err(BrokerError::InvalidEvent(format!(
-                "event generation {} is newer than stored source generation {}",
-                event.source_generation, source.generation
-            )));
         }
         let current = state.revisions();
         let source_state = state.device(event.source);
