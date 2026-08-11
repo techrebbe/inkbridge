@@ -578,7 +578,7 @@ mod tests {
             "InkList" => vec![
                 Object::Array(vec![60.into(), 600.into(), 120.into(), 560.into()])
             ],
-            "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
+            "BS" => dictionary! {"W" => Object::Real(1.168_064_5)},
             "C" => vec![0.into(), 0.into(), 0.into()],
         };
         let strokes = extract_standard_ink(&document, &annotation, 0, test_geometry()).unwrap();
@@ -600,7 +600,7 @@ mod tests {
                 Object::Array(vec![60.into(), 600.into(), 120.into(), 560.into()]),
                 Object::Array(vec![180.into(), 520.into(), 240.into(), 480.into()]),
             ],
-            "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
+            "BS" => dictionary! {"W" => Object::Real(1.168_064_5)},
             "C" => vec![0.into(), 0.into(), 0.into()],
         };
         let error = extract_standard_ink(&document, &annotation, 0, test_geometry())
@@ -638,7 +638,7 @@ mod tests {
                 r#"{"id":"boox-stroke","type":"BrushStroke"}"#
             ),
             "AP" => dictionary! {"N" => appearance_id},
-            "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
+            "BS" => dictionary! {"W" => Object::Real(1.168_064_5)},
             "C" => vec![0.into(), Object::Real(0.69), Object::Real(0.21)],
         };
         let stroke = extract_onyx_stroke(&document, &annotation, 0, test_geometry()).unwrap();
