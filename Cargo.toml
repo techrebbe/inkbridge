@@ -6,7 +6,7 @@
 # RR1-AC3: bare `cargo test -p reader-core` builds with `jni` absent from the resolved graph.
 [workspace]
 resolver = "2"
-members = ["build-dict", "device-eink", "inkbridge-convert", "inkread-daily", "inkread-dict", "inkread-epub", "inkread-ink", "inkread-lua", "inkread-pdftext", "inkread-update", "reader-core"]
+members = ["build-dict", "device-eink", "inkbridge-broker", "inkbridge-convert", "inkread-daily", "inkread-dict", "inkread-epub", "inkread-ink", "inkread-lua", "inkread-pdftext", "inkread-update", "reader-core"]
 
 [workspace.package]
 version = "1.0.1"
@@ -27,6 +27,7 @@ inkread-lua = { path = "inkread-lua" }
 inkread-pdftext = { path = "inkread-pdftext" }
 inkread-update = { path = "inkread-update" }
 reader-core = { path = "reader-core" }
+inkbridge-convert = { path = "inkbridge-convert" }
 
 # External — versions verified against docs.rs at implementation time.
 # pdfium-render: latest is 0.9.1 (0.9.2 does not exist on crates.io).

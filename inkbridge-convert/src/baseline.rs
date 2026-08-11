@@ -26,17 +26,29 @@ struct ExportStroke {
     samples: Vec<[f64; 3]>,
 }
 
+#[derive(Clone, Debug)]
 pub struct BaselineExport {
     pub source_file_name: Option<String>,
+    pub page_index: u32,
     pub strokes: Vec<StrokeSnapshot>,
 }
 
 pub fn load_baseline(path: &Path) -> Result<BaselineExport, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("could not read baseline {}: {error}", path.display()))?;
-    let json = extract_json(&text)?;
+    parse_baseline_text(&text, &path.display().to_string())
+}
+
+pub fn parse_baseline_bytes(bytes: &[u8], source_name: &str) -> Result<BaselineExport, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("Supernote export {source_name} is not UTF-8: {error}"))?;
+    parse_baseline_text(text, source_name)
+}
+
+fn parse_baseline_text(text: &str, source_name: &str) -> Result<BaselineExport, String> {
+    let json = extract_json(text)?;
     let page: ExportPage = serde_json::from_str(&json)
-        .map_err(|error| format!("invalid baseline JSON in {}: {error}", path.display()))?;
+        .map_err(|error| format!("invalid baseline JSON in {source_name}: {error}"))?;
 
     let source_file_name = page.source_file_name.clone();
     let strokes = page
@@ -46,8 +58,7 @@ pub fn load_baseline(path: &Path) -> Result<BaselineExport, String> {
             let source_uuid = stroke.source_uuid.unwrap_or(stroke.source_key);
             if source_uuid.trim().is_empty() {
                 return Err(format!(
-                    "baseline {} contains a stroke without an identity",
-                    path.display()
+                    "baseline {source_name} contains a stroke without an identity"
                 ));
             }
             if stroke.samples.len() < 2 {
@@ -74,6 +85,7 @@ pub fn load_baseline(path: &Path) -> Result<BaselineExport, String> {
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BaselineExport {
         source_file_name,
+        page_index: page.page_index,
         strokes,
     })
 }

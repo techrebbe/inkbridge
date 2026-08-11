@@ -7,6 +7,11 @@
 
 <h1 align="center">inkread</h1>
 
+> InkBridge development note: the current cross-device synchronization milestone is the
+> storage-independent two-folder broker described in
+> [docs/INKBRIDGE_BROKER_ARCHITECTURE.md](docs/INKBRIDGE_BROKER_ARCHITECTURE.md). It does not deploy
+> cloud resources.
+
 <p align="center">
   <strong>A Rust-core, e-ink-first document reader with first-class handwriting.</strong><br>
   KOReader-class reading meets Supernote-class inking — open source, in a clean Rust core.

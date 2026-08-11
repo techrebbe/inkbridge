@@ -2,6 +2,7 @@ mod baseline;
 mod model;
 mod pdf;
 
+pub use baseline::{parse_baseline_bytes, BaselineExport};
 pub use model::{
     geometry_fingerprint, CoordinateTransform, DocumentIdentity, Manifest, NativeStyle, Operation,
     StrokeSnapshot, Summary,

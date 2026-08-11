@@ -1,0 +1,787 @@
+use crate::model::*;
+use crate::pdf_view::write_boox_view;
+use crate::storage::*;
+use inkbridge_convert::{
+    build_manifest, parse_baseline_bytes, Manifest, Operation, StrokeSnapshot,
+};
+use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+const GENERATED_BY_KEY: &str = "inkbridge-generated-by";
+const GENERATED_EVENT_KEY: &str = "inkbridge-event-id";
+const GENERATED_DOCUMENT_KEY: &str = "inkbridge-document-id";
+const GENERATED_REVISIONS_KEY: &str = "inkbridge-source-revisions";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrokerError {
+    InvalidEvent(String),
+    MissingObject(String),
+    CorruptState(String),
+    Conversion(String),
+    StaleDestination {
+        path: String,
+        expected_hash: Option<String>,
+        actual_hash: Option<String>,
+    },
+    ConditionalWrite(CommitError),
+    Storage(String),
+}
+
+impl fmt::Display for BrokerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEvent(message)
+            | Self::MissingObject(message)
+            | Self::CorruptState(message)
+            | Self::Conversion(message)
+            | Self::Storage(message) => formatter.write_str(message),
+            Self::StaleDestination {
+                path,
+                expected_hash,
+                actual_hash,
+            } => write!(
+                formatter,
+                "destination {path} changed since the broker generated it (expected {expected_hash:?}, found {actual_hash:?})"
+            ),
+            Self::ConditionalWrite(error) => write!(formatter, "conditional write failed: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for BrokerError {}
+
+pub struct Broker {
+    normalized_y_offset: f64,
+}
+
+impl Default for Broker {
+    fn default() -> Self {
+        Self {
+            normalized_y_offset: -0.0008,
+        }
+    }
+}
+
+impl Broker {
+    pub fn with_normalized_y_offset(normalized_y_offset: f64) -> Self {
+        Self {
+            normalized_y_offset,
+        }
+    }
+
+    pub fn register_document<S: BrokerStorage>(
+        &self,
+        storage: &mut S,
+        original_file_name: &str,
+        original_pdf: &[u8],
+    ) -> Result<CanonicalDocumentState, BrokerError> {
+        if original_file_name.trim().is_empty() {
+            return Err(BrokerError::InvalidEvent(
+                "original file name must not be empty".to_owned(),
+            ));
+        }
+        // Parsing now prevents registering a hash-stable but unusable original.
+        lopdf::Document::load_mem(original_pdf).map_err(|error| {
+            BrokerError::InvalidEvent(format!("immutable original is not a readable PDF: {error}"))
+        })?;
+        let document_id = stable_document_id(original_pdf);
+        let original_path = original_path(&document_id);
+        let state_path = state_path(&document_id);
+        if let Some(existing) = storage.read(&state_path).map_err(BrokerError::Storage)? {
+            let state = decode_state(&existing.bytes)?;
+            if state.original_pdf_sha256 != sha256_hex(original_pdf) {
+                return Err(BrokerError::InvalidEvent(
+                    "document id collision with a different immutable original".to_owned(),
+                ));
+            }
+            return Ok(state);
+        }
+        let state = CanonicalDocumentState {
+            schema_version: STATE_SCHEMA_VERSION,
+            document_id: document_id.clone(),
+            original_object_path: original_path.clone(),
+            original_pdf_sha256: sha256_hex(original_pdf),
+            original_file_name: original_file_name.to_owned(),
+            state_revision: 0,
+            boox: DeviceRevision::default(),
+            supernote: DeviceRevision::default(),
+            last_common_revisions: RevisionPair::default(),
+            processed_event_ids: BTreeSet::new(),
+            strokes: BTreeMap::new(),
+            source_generations: BTreeMap::new(),
+            generated_views: BTreeMap::new(),
+            conflicts: Vec::new(),
+        };
+        let writes = vec![
+            ConditionalWrite {
+                path: original_path,
+                bytes: original_pdf.to_vec(),
+                metadata: BTreeMap::from([
+                    ("inkbridge-kind".to_owned(), "immutable-original".to_owned()),
+                    (GENERATED_DOCUMENT_KEY.to_owned(), document_id),
+                ]),
+                precondition: GenerationPrecondition::DoesNotExist,
+            },
+            state_write(&state_path, &state, GenerationPrecondition::DoesNotExist)?,
+        ];
+        storage
+            .commit(writes)
+            .map_err(BrokerError::ConditionalWrite)?;
+        Ok(state)
+    }
+
+    pub fn process<S: BrokerStorage>(
+        &self,
+        storage: &mut S,
+        event: &StorageEvent,
+    ) -> Result<ProcessOutcome, BrokerError> {
+        validate_event(event)?;
+        let state_path = state_path(&event.document_id);
+        let state_object = storage
+            .read(&state_path)
+            .map_err(BrokerError::Storage)?
+            .ok_or_else(|| {
+                BrokerError::MissingObject(format!(
+                    "canonical state does not exist for {}",
+                    event.document_id
+                ))
+            })?;
+        let mut state = decode_state(&state_object.bytes)?;
+        if state.document_id != event.document_id {
+            return Err(BrokerError::CorruptState(
+                "state path contains a different document id".to_owned(),
+            ));
+        }
+        if state.processed_event_ids.contains(&event.event_id) {
+            return Ok(ProcessOutcome::Duplicate {
+                document_id: event.document_id.clone(),
+                event_id: event.event_id.clone(),
+            });
+        }
+
+        let source = storage
+            .read(&event.object_path)
+            .map_err(BrokerError::Storage)?
+            .ok_or_else(|| BrokerError::MissingObject(event.object_path.clone()))?;
+        if is_broker_output(event, &source.metadata) {
+            mark_event_only(
+                storage,
+                &mut state,
+                &state_path,
+                state_object.generation,
+                event,
+            )?;
+            return Ok(ProcessOutcome::IgnoredBrokerOutput {
+                document_id: event.document_id.clone(),
+                event_id: event.event_id.clone(),
+            });
+        }
+        if source.generation != event.source_generation {
+            if source.generation > event.source_generation {
+                mark_event_only(
+                    storage,
+                    &mut state,
+                    &state_path,
+                    state_object.generation,
+                    event,
+                )?;
+                return Ok(ProcessOutcome::IgnoredStaleSource {
+                    document_id: event.document_id.clone(),
+                    event_id: event.event_id.clone(),
+                });
+            }
+            return Err(BrokerError::InvalidEvent(format!(
+                "event generation {} is newer than stored source generation {}",
+                event.source_generation, source.generation
+            )));
+        }
+        let actual_hash = sha256_hex(&source.bytes);
+        if actual_hash != event.content_sha256 {
+            return Err(BrokerError::InvalidEvent(format!(
+                "source content hash mismatch: event={}, actual={actual_hash}",
+                event.content_sha256
+            )));
+        }
+
+        let current = state.revisions();
+        let source_state = state.device(event.source);
+        if event.source_revision <= source_state.revision {
+            if event.source_revision == source_state.revision
+                && event.content_sha256 != source_state.content_sha256
+            {
+                return self.preserve_conflict(
+                    storage,
+                    state,
+                    state_object.generation,
+                    event,
+                    &source.bytes,
+                );
+            }
+            mark_event_only(
+                storage,
+                &mut state,
+                &state_path,
+                state_object.generation,
+                event,
+            )?;
+            return Ok(ProcessOutcome::IgnoredStaleSource {
+                document_id: event.document_id.clone(),
+                event_id: event.event_id.clone(),
+            });
+        }
+        if event.source_revision != event.based_on.get(event.source) + 1 {
+            return Err(BrokerError::InvalidEvent(format!(
+                "source revision {} must immediately follow based-on revision {}",
+                event.source_revision,
+                event.based_on.get(event.source)
+            )));
+        }
+        if event.based_on != current {
+            return self.preserve_conflict(
+                storage,
+                state,
+                state_object.generation,
+                event,
+                &source.bytes,
+            );
+        }
+
+        let (destination_path, output_bytes) = match event.source {
+            DeviceSide::Boox => {
+                let manifest = self.boox_to_supernote(&state, event, &source.bytes)?;
+                apply_manifest(&mut state, &manifest, event);
+                let bytes = serde_json::to_vec_pretty(&manifest)
+                    .map_err(|error| BrokerError::Conversion(error.to_string()))?;
+                (
+                    supernote_manifest_path(&event.document_id, &event.event_id),
+                    add_newline(bytes),
+                )
+            }
+            DeviceSide::Supernote => {
+                apply_supernote_export(&mut state, event, &source.bytes)?;
+                let original = storage
+                    .read(&state.original_object_path)
+                    .map_err(BrokerError::Storage)?
+                    .ok_or_else(|| {
+                        BrokerError::MissingObject(state.original_object_path.clone())
+                    })?;
+                if sha256_hex(&original.bytes) != state.original_pdf_sha256 {
+                    return Err(BrokerError::CorruptState(
+                        "immutable original PDF hash changed".to_owned(),
+                    ));
+                }
+                let active = state
+                    .strokes
+                    .values()
+                    .filter(|stroke| stroke.tombstone.is_none())
+                    .map(|stroke| stroke.snapshot.clone())
+                    .collect::<Vec<_>>();
+                let pdf =
+                    write_boox_view(&original.bytes, active).map_err(BrokerError::Conversion)?;
+                (boox_view_path(&state), pdf)
+            }
+        };
+
+        let revisions = {
+            let device = state.device_mut(event.source);
+            device.revision = event.source_revision;
+            device.content_sha256.clone_from(&event.content_sha256);
+            device.source_generation = event.source_generation;
+            device.source_object_path.clone_from(&event.object_path);
+            if event.source == DeviceSide::Boox {
+                device.source_file_name = Path::new(&event.object_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(ToOwned::to_owned);
+            }
+            state.revisions()
+        };
+        state.last_common_revisions = revisions;
+        state
+            .source_generations
+            .insert(event.object_path.clone(), event.source_generation);
+        state.processed_event_ids.insert(event.event_id.clone());
+        state.state_revision += 1;
+
+        let output_hash = sha256_hex(&output_bytes);
+        let destination = storage
+            .read(&destination_path)
+            .map_err(BrokerError::Storage)?;
+        let destination_precondition =
+            destination_precondition(&state, &destination_path, &destination)?;
+        state.generated_views.insert(
+            destination_path.clone(),
+            GeneratedView {
+                object_path: destination_path.clone(),
+                content_sha256: output_hash.clone(),
+                source_revisions: revisions,
+                event_id: event.event_id.clone(),
+            },
+        );
+        let marker = BrokerOutputMarker {
+            producer: BROKER_PRODUCER.to_owned(),
+            event_id: event.event_id.clone(),
+            document_id: event.document_id.clone(),
+            source_revisions: revisions,
+        };
+        let writes = vec![
+            ConditionalWrite {
+                path: destination_path.clone(),
+                bytes: output_bytes,
+                metadata: output_metadata(&marker, &output_hash),
+                precondition: destination_precondition,
+            },
+            state_write(
+                &state_path,
+                &state,
+                GenerationPrecondition::Match(state_object.generation),
+            )?,
+        ];
+        let committed = storage
+            .commit(writes)
+            .map_err(BrokerError::ConditionalWrite)?;
+        Ok(ProcessOutcome::Applied {
+            document_id: event.document_id.clone(),
+            event_id: event.event_id.clone(),
+            destination_path,
+            destination_generation: committed[0].generation,
+            source_revisions: revisions,
+        })
+    }
+
+    fn boox_to_supernote(
+        &self,
+        state: &CanonicalDocumentState,
+        event: &StorageEvent,
+        pdf: &[u8],
+    ) -> Result<Manifest, BrokerError> {
+        let work =
+            tempfile::tempdir().map_err(|error| BrokerError::Conversion(error.to_string()))?;
+        let file_name = Path::new(&event.object_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("document.pdf");
+        let pdf_path = work.path().join(file_name);
+        std::fs::write(&pdf_path, pdf)
+            .map_err(|error| BrokerError::Conversion(error.to_string()))?;
+        let baselines = write_baselines(work.path(), state)?;
+        build_manifest(&pdf_path, &baselines, self.normalized_y_offset)
+            .map_err(BrokerError::Conversion)
+    }
+
+    fn preserve_conflict<S: BrokerStorage>(
+        &self,
+        storage: &mut S,
+        mut state: CanonicalDocumentState,
+        state_generation: u64,
+        event: &StorageEvent,
+        input: &[u8],
+    ) -> Result<ProcessOutcome, BrokerError> {
+        let current = state.revisions();
+        let extension = Path::new(&event.object_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("bin");
+        let preserved_path = format!(
+            "Conflicts/{}/{}/incoming.{extension}",
+            event.document_id,
+            safe_segment(&event.event_id)
+        );
+        let mut conflict_writes = vec![ConditionalWrite {
+            path: preserved_path.clone(),
+            bytes: input.to_vec(),
+            metadata: BTreeMap::from([
+                ("inkbridge-kind".to_owned(), "conflict-input".to_owned()),
+                (GENERATED_DOCUMENT_KEY.to_owned(), event.document_id.clone()),
+                (GENERATED_EVENT_KEY.to_owned(), event.event_id.clone()),
+            ]),
+            precondition: GenerationPrecondition::DoesNotExist,
+        }];
+        let mut competing_preserved_paths = Vec::new();
+        for side in [DeviceSide::Boox, DeviceSide::Supernote] {
+            let device = state.device(side);
+            if device.revision <= event.based_on.get(side) || device.source_object_path.is_empty() {
+                continue;
+            }
+            let current_input = storage
+                .read(&device.source_object_path)
+                .map_err(BrokerError::Storage)?
+                .ok_or_else(|| BrokerError::MissingObject(device.source_object_path.clone()))?;
+            let current_extension = Path::new(&device.source_object_path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("bin");
+            let side_name = match side {
+                DeviceSide::Boox => "boox",
+                DeviceSide::Supernote => "supernote",
+            };
+            let current_path = format!(
+                "Conflicts/{}/{}/current-{side_name}.{current_extension}",
+                event.document_id,
+                safe_segment(&event.event_id),
+            );
+            competing_preserved_paths.push(current_path.clone());
+            conflict_writes.push(ConditionalWrite {
+                path: current_path,
+                bytes: current_input.bytes,
+                metadata: BTreeMap::from([
+                    (
+                        "inkbridge-kind".to_owned(),
+                        "conflict-competing-input".to_owned(),
+                    ),
+                    (GENERATED_DOCUMENT_KEY.to_owned(), event.document_id.clone()),
+                    (GENERATED_EVENT_KEY.to_owned(), event.event_id.clone()),
+                ]),
+                precondition: GenerationPrecondition::DoesNotExist,
+            });
+        }
+        state.conflicts.push(PreservedInput {
+            event_id: event.event_id.clone(),
+            source: event.source,
+            object_path: event.object_path.clone(),
+            preserved_path: preserved_path.clone(),
+            competing_preserved_paths,
+            source_generation: event.source_generation,
+            source_revision: event.source_revision,
+            content_sha256: event.content_sha256.clone(),
+            based_on: event.based_on,
+            current_revisions: current,
+        });
+        state.processed_event_ids.insert(event.event_id.clone());
+        state.state_revision += 1;
+        conflict_writes.push(state_write(
+            &state_path(&event.document_id),
+            &state,
+            GenerationPrecondition::Match(state_generation),
+        )?);
+        storage
+            .commit(conflict_writes)
+            .map_err(BrokerError::ConditionalWrite)?;
+        Ok(ProcessOutcome::Conflict {
+            document_id: event.document_id.clone(),
+            event_id: event.event_id.clone(),
+            preserved_path,
+            current_revisions: current,
+            based_on: event.based_on,
+        })
+    }
+}
+
+fn validate_event(event: &StorageEvent) -> Result<(), BrokerError> {
+    if event.schema_version != EVENT_SCHEMA_VERSION {
+        return Err(BrokerError::InvalidEvent(format!(
+            "unsupported event schema version {}",
+            event.schema_version
+        )));
+    }
+    if event.event_id.trim().is_empty()
+        || event.document_id.trim().is_empty()
+        || event.object_path.trim().is_empty()
+    {
+        return Err(BrokerError::InvalidEvent(
+            "event id, document id, and object path are required".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_broker_output(event: &StorageEvent, metadata: &BTreeMap<String, String>) -> bool {
+    let envelope_matches = event.broker_output.as_ref().is_some_and(|marker| {
+        marker.producer == BROKER_PRODUCER
+            && marker.document_id == event.document_id
+            && metadata.get(GENERATED_EVENT_KEY) == Some(&marker.event_id)
+    });
+    let metadata_matches = metadata.get(GENERATED_BY_KEY).map(String::as_str)
+        == Some(BROKER_PRODUCER)
+        && metadata.get(GENERATED_DOCUMENT_KEY) == Some(&event.document_id);
+    metadata_matches && envelope_matches
+}
+
+fn output_metadata(marker: &BrokerOutputMarker, hash: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (GENERATED_BY_KEY.to_owned(), marker.producer.clone()),
+        (GENERATED_EVENT_KEY.to_owned(), marker.event_id.clone()),
+        (
+            GENERATED_DOCUMENT_KEY.to_owned(),
+            marker.document_id.clone(),
+        ),
+        (
+            GENERATED_REVISIONS_KEY.to_owned(),
+            format!(
+                "{}:{}",
+                marker.source_revisions.boox, marker.source_revisions.supernote
+            ),
+        ),
+        ("inkbridge-content-sha256".to_owned(), hash.to_owned()),
+    ])
+}
+
+fn destination_precondition(
+    state: &CanonicalDocumentState,
+    path: &str,
+    current: &Option<StoredObject>,
+) -> Result<GenerationPrecondition, BrokerError> {
+    match (state.generated_views.get(path), current) {
+        (None, None) => Ok(GenerationPrecondition::DoesNotExist),
+        (Some(previous), Some(current)) => {
+            let actual_hash = sha256_hex(&current.bytes);
+            if actual_hash != previous.content_sha256 {
+                return Err(BrokerError::StaleDestination {
+                    path: path.to_owned(),
+                    expected_hash: Some(previous.content_sha256.clone()),
+                    actual_hash: Some(actual_hash),
+                });
+            }
+            Ok(GenerationPrecondition::Match(current.generation))
+        }
+        (Some(previous), None) => Err(BrokerError::StaleDestination {
+            path: path.to_owned(),
+            expected_hash: Some(previous.content_sha256.clone()),
+            actual_hash: None,
+        }),
+        (None, Some(current)) => Err(BrokerError::StaleDestination {
+            path: path.to_owned(),
+            expected_hash: None,
+            actual_hash: Some(sha256_hex(&current.bytes)),
+        }),
+    }
+}
+
+fn mark_event_only<S: BrokerStorage>(
+    storage: &mut S,
+    state: &mut CanonicalDocumentState,
+    path: &str,
+    generation: u64,
+    event: &StorageEvent,
+) -> Result<(), BrokerError> {
+    state.processed_event_ids.insert(event.event_id.clone());
+    state
+        .source_generations
+        .insert(event.object_path.clone(), event.source_generation);
+    state.state_revision += 1;
+    storage
+        .commit(vec![state_write(
+            path,
+            state,
+            GenerationPrecondition::Match(generation),
+        )?])
+        .map_err(BrokerError::ConditionalWrite)?;
+    Ok(())
+}
+
+fn apply_manifest(state: &mut CanonicalDocumentState, manifest: &Manifest, event: &StorageEvent) {
+    let mut revisions = event.based_on;
+    revisions.set(event.source, event.source_revision);
+    for operation in &manifest.operations {
+        match operation {
+            Operation::UpsertStroke {
+                source_uuid, after, ..
+            } => {
+                state.strokes.insert(
+                    source_uuid.clone(),
+                    CanonicalStroke {
+                        stroke_id: source_uuid.clone(),
+                        snapshot: after.clone(),
+                        last_modified_by: event.source,
+                        source_revisions: revisions,
+                        tombstone: None,
+                    },
+                );
+            }
+            Operation::DeleteStroke {
+                source_uuid,
+                before,
+                ..
+            } => {
+                let canonical =
+                    state
+                        .strokes
+                        .entry(source_uuid.clone())
+                        .or_insert_with(|| CanonicalStroke {
+                            stroke_id: source_uuid.clone(),
+                            snapshot: before.clone(),
+                            last_modified_by: event.source,
+                            source_revisions: revisions,
+                            tombstone: None,
+                        });
+                canonical.last_modified_by = event.source;
+                canonical.source_revisions = revisions;
+                canonical.tombstone = Some(Tombstone {
+                    deleted_by: event.source,
+                    deleted_at_revision: event.source_revision,
+                    event_id: event.event_id.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn apply_supernote_export(
+    state: &mut CanonicalDocumentState,
+    event: &StorageEvent,
+    bytes: &[u8],
+) -> Result<(), BrokerError> {
+    let export =
+        parse_baseline_bytes(bytes, &event.object_path).map_err(BrokerError::Conversion)?;
+    if let Some(source_file_name) = export.source_file_name.clone() {
+        state.supernote.source_file_name = Some(source_file_name);
+    }
+    let page_index = export.page_index;
+    let incoming_ids = export
+        .strokes
+        .iter()
+        .map(|stroke| stroke.source_uuid.clone())
+        .collect::<BTreeSet<_>>();
+    let mut revisions = event.based_on;
+    revisions.set(event.source, event.source_revision);
+    for canonical in state.strokes.values_mut().filter(|stroke| {
+        stroke.snapshot.page_index == page_index
+            && stroke.tombstone.is_none()
+            && !incoming_ids.contains(&stroke.stroke_id)
+    }) {
+        canonical.last_modified_by = event.source;
+        canonical.source_revisions = revisions;
+        canonical.tombstone = Some(Tombstone {
+            deleted_by: event.source,
+            deleted_at_revision: event.source_revision,
+            event_id: event.event_id.clone(),
+        });
+    }
+    for snapshot in export.strokes {
+        let stroke_id = snapshot.source_uuid.clone();
+        state.strokes.insert(
+            stroke_id.clone(),
+            CanonicalStroke {
+                stroke_id,
+                snapshot,
+                last_modified_by: event.source,
+                source_revisions: revisions,
+                tombstone: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn write_baselines(
+    directory: &Path,
+    state: &CanonicalDocumentState,
+) -> Result<Vec<PathBuf>, BrokerError> {
+    let mut pages = BTreeMap::<u32, Vec<&StrokeSnapshot>>::new();
+    for canonical in state
+        .strokes
+        .values()
+        .filter(|stroke| stroke.tombstone.is_none())
+    {
+        pages
+            .entry(canonical.snapshot.page_index)
+            .or_default()
+            .push(&canonical.snapshot);
+    }
+    let mut paths = Vec::new();
+    for (page_index, mut strokes) in pages {
+        strokes.sort_by(|left, right| left.source_uuid.cmp(&right.source_uuid));
+        let exported = strokes
+            .iter()
+            .map(|stroke| {
+                json!({
+                    "sourceUuid": stroke.source_uuid,
+                    "sourceKey": stroke.source_uuid,
+                    "layerNum": stroke.native_style.layer_num,
+                    "thickness": stroke.native_style.thickness,
+                    "penColor": stroke.native_style.pen_color,
+                    "penType": stroke.native_style.pen_type,
+                    "samples": stroke.samples,
+                })
+            })
+            .collect::<Vec<_>>();
+        let page = json!({
+            "sourceFileName": state.supernote.source_file_name.as_deref().unwrap_or(&state.original_file_name),
+            "pageIndex": page_index,
+            "strokes": exported,
+        });
+        let path = directory.join(format!("baseline-page-{page_index}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&page)
+                .map_err(|error| BrokerError::Conversion(error.to_string()))?,
+        )
+        .map_err(|error| BrokerError::Conversion(error.to_string()))?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn state_write(
+    path: &str,
+    state: &CanonicalDocumentState,
+    precondition: GenerationPrecondition,
+) -> Result<ConditionalWrite, BrokerError> {
+    Ok(ConditionalWrite {
+        path: path.to_owned(),
+        bytes: add_newline(
+            serde_json::to_vec_pretty(state)
+                .map_err(|error| BrokerError::CorruptState(error.to_string()))?,
+        ),
+        metadata: BTreeMap::from([
+            ("inkbridge-kind".to_owned(), "canonical-state".to_owned()),
+            (GENERATED_DOCUMENT_KEY.to_owned(), state.document_id.clone()),
+        ]),
+        precondition,
+    })
+}
+
+fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, BrokerError> {
+    let state: CanonicalDocumentState = serde_json::from_slice(bytes)
+        .map_err(|error| BrokerError::CorruptState(error.to_string()))?;
+    if state.schema_version != STATE_SCHEMA_VERSION {
+        return Err(BrokerError::CorruptState(format!(
+            "unsupported state schema version {}",
+            state.schema_version
+        )));
+    }
+    Ok(state)
+}
+
+fn add_newline(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.push(b'\n');
+    bytes
+}
+
+fn safe_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub fn original_path(document_id: &str) -> String {
+    format!("Originals/{document_id}/original.pdf")
+}
+
+pub fn state_path(document_id: &str) -> String {
+    format!("Canonical/{document_id}/state.json")
+}
+
+pub fn supernote_manifest_path(document_id: &str, event_id: &str) -> String {
+    format!(
+        "Supernote_Folder/{document_id}/incoming/{}.operations.json",
+        safe_segment(event_id)
+    )
+}
+
+pub fn boox_view_path(state: &CanonicalDocumentState) -> String {
+    format!(
+        "BOOX_Folder/{}/{}",
+        state.document_id,
+        safe_segment(&state.original_file_name)
+    )
+}

@@ -1,0 +1,17 @@
+[package]
+name = "inkbridge-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Storage-independent two-folder synchronization broker for InkBridge"
+
+[dependencies]
+inkbridge-convert.workspace = true
+lopdf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile = "3"

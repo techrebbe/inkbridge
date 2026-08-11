@@ -1,0 +1,10 @@
+.git
+.github
+target
+**/build
+**/.gradle
+artifacts-*
+inkbridge-runs
+supernote-poc/out
+*.apk
+*.snplg

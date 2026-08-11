@@ -1,0 +1,58 @@
+name: InkBridge broker
+
+on:
+  push:
+    branches: [master, "agent/inkbridge-broker", "feat/**"]
+    paths:
+      - "inkbridge-broker/**"
+      - "inkbridge-convert/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.broker"
+      - ".dockerignore"
+      - ".github/workflows/inkbridge-broker.yml"
+  pull_request:
+    paths:
+      - "inkbridge-broker/**"
+      - "inkbridge-convert/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.broker"
+      - ".dockerignore"
+      - ".github/workflows/inkbridge-broker.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  broker-core:
+    name: broker fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install qpdf recovery dependency
+        run: sudo apt-get update && sudo apt-get install -y qpdf
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint broker and converter
+        run: cargo clippy -p inkbridge-broker -p inkbridge-convert --all-targets -- -D warnings
+      - name: Test broker and converter
+        run: cargo test -p inkbridge-broker -p inkbridge-convert
+
+  linux-amd64-image:
+    name: Linux amd64 broker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build broker image without publishing
+        run: docker build --platform linux/amd64 -f Dockerfile.broker -t inkbridge-broker:test .
+      - name: Verify broker, converter, and qpdf are packaged
+        run: |
+          docker run --rm --entrypoint /bin/sh inkbridge-broker:test -c '
+            inkbridge-broker --help >/tmp/broker-help 2>&1 || test $? -eq 2
+            grep -q "document-id" /tmp/broker-help
+            inkbridge-convert 2>&1 | grep -q "Usage:"
+            qpdf --version
+          '
