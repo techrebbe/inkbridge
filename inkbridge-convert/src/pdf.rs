@@ -9,6 +9,14 @@ use std::process::Command;
 
 const MAX_APPEARANCE_BYTES: usize = 32 * 1024 * 1024;
 
+pub struct PdfStrokeExtraction {
+    pub page_count: usize,
+    pub strokes: Vec<StrokeSnapshot>,
+    pub skipped: usize,
+    pub incomplete_pages: HashSet<u32>,
+    pub failed_source_uuids: HashSet<String>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PageGeometry {
     left: f64,
@@ -57,14 +65,13 @@ impl Matrix {
     }
 }
 
-pub fn extract_pdf_strokes(
-    path: &Path,
-) -> Result<(usize, Vec<StrokeSnapshot>, usize, HashSet<u32>), String> {
+pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
     let document = load_neoreader_pdf(path)?;
     let pages = document.get_pages();
     let mut strokes = Vec::new();
     let mut skipped = 0usize;
     let mut incomplete_pages = HashSet::new();
+    let mut failed_source_uuids = HashSet::new();
 
     for (page_number, page_id) in &pages {
         let page_index = page_number.saturating_sub(1);
@@ -83,11 +90,20 @@ pub fn extract_pdf_strokes(
                     eprintln!("warning: skipped annotation on page {page_number}: {error}");
                     skipped += 1;
                     incomplete_pages.insert(page_index);
+                    if let Some(source_uuid) = annotation_source_uuid(annotation) {
+                        failed_source_uuids.insert(source_uuid);
+                    }
                 }
             }
         }
     }
-    Ok((pages.len(), strokes, skipped, incomplete_pages))
+    Ok(PdfStrokeExtraction {
+        page_count: pages.len(),
+        strokes,
+        skipped,
+        incomplete_pages,
+        failed_source_uuids,
+    })
 }
 
 fn load_neoreader_pdf(path: &Path) -> Result<Document, String> {
@@ -148,6 +164,17 @@ fn extract_annotation(
                 .map(|stroke| vec![stroke])
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+fn annotation_source_uuid(annotation: &Dictionary) -> Option<String> {
+    let subtype = name(annotation.get(b"Subtype").ok());
+    match subtype.as_deref() {
+        Some("Ink") => pdf_string(annotation.get(b"NM").ok()).or_else(|| onyx_tag_id(annotation)),
+        Some("Stamp") if name(annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") => {
+            onyx_tag_id(annotation).or_else(|| pdf_string(annotation.get(b"NM").ok()))
+        }
+        _ => None,
     }
 }
 
@@ -577,6 +604,19 @@ mod tests {
         let error = extract_standard_ink(&document, &annotation, 0, test_geometry())
             .expect_err("grouped paths cannot be tracked safely by mutable array position");
         assert!(error.contains("without stable per-path identities"));
+    }
+
+    #[test]
+    fn recovers_stable_identity_before_annotation_geometry_is_decoded() {
+        let annotation = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("moved-but-damaged"),
+            "InkList" => Object::Null,
+        };
+        assert_eq!(
+            annotation_source_uuid(&annotation).as_deref(),
+            Some("moved-but-damaged")
+        );
     }
 
     #[test]

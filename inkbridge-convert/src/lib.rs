@@ -8,7 +8,7 @@ pub use model::{
 };
 
 use baseline::{index_baseline, load_baseline};
-use pdf::extract_pdf_strokes;
+use pdf::{extract_pdf_strokes, PdfStrokeExtraction};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -22,7 +22,13 @@ pub fn build_manifest(
     let pdf_bytes = fs::read(pdf_path)
         .map_err(|error| format!("could not read PDF {}: {error}", pdf_path.display()))?;
     let pdf_sha256 = format!("{:x}", Sha256::digest(&pdf_bytes));
-    let (page_count, extracted, mut skipped, incomplete_pages) = extract_pdf_strokes(pdf_path)?;
+    let PdfStrokeExtraction {
+        page_count,
+        strokes: extracted,
+        mut skipped,
+        incomplete_pages,
+        failed_source_uuids,
+    } = extract_pdf_strokes(pdf_path)?;
 
     let mut baseline_strokes = Vec::new();
     let mut target_file_names = Vec::new();
@@ -35,7 +41,12 @@ pub fn build_manifest(
     }
     validate_baseline_pages(&baseline_strokes, page_count)?;
     let baseline = index_baseline(baseline_strokes);
-    let (operations, unchanged) = diff_strokes(extracted, &baseline, &incomplete_pages);
+    let (operations, unchanged) = diff_strokes(
+        extracted,
+        &baseline,
+        &incomplete_pages,
+        &failed_source_uuids,
+    );
 
     let upserted = operations
         .iter()
@@ -116,12 +127,13 @@ fn diff_strokes(
     extracted: Vec<StrokeSnapshot>,
     baseline: &HashMap<String, StrokeSnapshot>,
     incomplete_pages: &HashSet<u32>,
+    failed_source_uuids: &HashSet<String>,
 ) -> (Vec<Operation>, usize) {
     let baseline_pages = baseline
         .values()
         .map(|stroke| stroke.page_index)
         .collect::<HashSet<_>>();
-    let mut active_ids = HashSet::new();
+    let mut active_ids = failed_source_uuids.clone();
     let mut operations = Vec::new();
     let mut unchanged = 0usize;
 
@@ -280,7 +292,12 @@ mod tests {
         after.page_index = 1;
         let baseline = HashMap::from([(before.source_uuid.clone(), before.clone())]);
 
-        let (operations, unchanged) = diff_strokes(vec![after.clone()], &baseline, &HashSet::new());
+        let (operations, unchanged) = diff_strokes(
+            vec![after.clone()],
+            &baseline,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(unchanged, 0);
         assert_eq!(operations.len(), 2);
@@ -324,5 +341,23 @@ mod tests {
         assert_eq!(targets, vec!["document-a.pdf"]);
         assert!(error.contains("document-a.pdf"));
         assert!(error.contains("document-b.pdf"));
+    }
+
+    #[test]
+    fn failed_destination_annotation_preserves_cross_page_source_identity() {
+        let before = test_stroke("moved-but-damaged", 0);
+        let baseline = HashMap::from([(before.source_uuid.clone(), before)]);
+        let incomplete_pages = HashSet::from([1]);
+        let failed_source_uuids = HashSet::from(["moved-but-damaged".to_owned()]);
+
+        let (operations, unchanged) = diff_strokes(
+            Vec::new(),
+            &baseline,
+            &incomplete_pages,
+            &failed_source_uuids,
+        );
+
+        assert!(operations.is_empty());
+        assert_eq!(unchanged, 0);
     }
 }

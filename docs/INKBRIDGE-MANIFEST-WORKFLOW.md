@@ -57,7 +57,10 @@ Grouped `/InkList` annotations are rejected because PDF provides no stable
 identity for each inner path; using the mutable array position would corrupt
 identity after insertion or deletion. If any supported annotation on a page
 cannot be extracted, deletion inference is disabled for that page so damaged
-PDF data cannot erase valid Supernote ink.
+PDF data cannot erase valid Supernote ink. When the damaged annotation still
+exposes a stable identity, that identity also remains active globally, covering
+the case where a stroke moved across pages before its destination data became
+unreadable.
 
 ## 4. Build the Supernote sync package
 
