@@ -30,6 +30,22 @@ For this proof the JSON is emitted to Android logcat as numbered `INKBRIDGE_EXPO
 
 The exported Supernote UUID is carried into the PDF annotation `/NM` identity. NeoReader preserved those values while editing imported `/Ink`, allowing the returned PDF to be matched back to the original Supernote elements.
 
+## Generic manifest application
+
+**Apply InkBridge Sync** applies a schema-1 InkBridge manifest to the native
+document. A manifest can contain new, moved/changed, and deleted strokes across
+multiple pages. Re-running it does not duplicate already-current ink.
+
+The normal CI artifact contains no document manifest. To build a package for an
+actual round trip:
+
+```bash
+supernote-poc/build.sh path/to/inkbridge-manifest.json
+```
+
+See [`../docs/INKBRIDGE-MANIFEST-WORKFLOW.md`](../docs/INKBRIDGE-MANIFEST-WORKFLOW.md)
+for the complete flow.
+
 ## Real-document BOOX → Supernote return
 
 Plugin **0.0.6** adds **Apply BOOX Return Test** for the first returned real document. The embedded fixture was extracted from the BOOX PDF after the user:

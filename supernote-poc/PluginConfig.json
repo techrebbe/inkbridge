@@ -3,9 +3,9 @@
   "pluginKey": "InkBridgePoc",
   "pluginID": "ibpoc20260724001",
   "iconPath": "assets/icon.png",
-  "desc": "InkBridge native-stroke interoperability proof",
-  "versionCode": "11",
-  "versionName": "0.0.11",
+  "desc": "Editable handwriting bridge for BOOX and Supernote",
+  "versionCode": "16",
+  "versionName": "0.1.4",
   "jsMainPath": "index",
   "author": "InkBridge"
 }

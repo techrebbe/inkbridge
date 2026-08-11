@@ -28,6 +28,9 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Test InkBridge manifest logic
+        run: npm test --prefix supernote-poc
+
       - name: Build .snplg
         run: |
           chmod +x supernote-poc/build.sh

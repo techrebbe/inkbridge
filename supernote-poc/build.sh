@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MANIFEST_PATH="${1:-}"
 WORK_ROOT="$(mktemp -d)"
 trap 'rm -rf "$WORK_ROOT"' EXIT
 
@@ -20,6 +21,13 @@ cp "$ROOT/overlay/booxReturnFixture.js" "$PROJECT/booxReturnFixture.js"
 cp "$ROOT/overlay/booxReturnFixtureV3.js" "$PROJECT/booxReturnFixtureV3.js"
 cp "$ROOT/overlay/booxReturnFixtureV4.js" "$PROJECT/booxReturnFixtureV4.js"
 cp "$ROOT/overlay/returnApplyV2.js" "$PROJECT/returnApplyV2.js"
+cp "$ROOT/overlay/manifestCore.js" "$PROJECT/manifestCore.js"
+cp "$ROOT/overlay/manifestApply.js" "$PROJECT/manifestApply.js"
+if [[ -n "$MANIFEST_PATH" ]]; then
+  node "$ROOT/embed-manifest.mjs" "$MANIFEST_PATH" "$PROJECT/generatedManifest.js"
+else
+  cp "$ROOT/overlay/generatedManifest.js" "$PROJECT/generatedManifest.js"
+fi
 cp "$ROOT/PluginConfig.json" "$PROJECT/PluginConfig.json"
 
 mkdir -p "$PROJECT/assets"
@@ -31,7 +39,10 @@ rm "$PROJECT/assets/icon.png.b64"
 
 pushd "$PROJECT" >/dev/null
 chmod +x buildPlugin.sh
-./buildPlugin.sh
+# Git Bash otherwise rewrites the package's root-relative icon path to a
+# Windows installation path. Exclude only that value so real temp paths still
+# reach the Windows-hosted Node/JQ tools correctly.
+MSYS2_ARG_CONV_EXCL='/icon.png' ./buildPlugin.sh
 popd >/dev/null
 
 mkdir -p "$ROOT/out"
