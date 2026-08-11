@@ -150,7 +150,7 @@ fn diff_strokes(
     }
 
     for before in baseline.values() {
-        if should_infer_deletion(before, &baseline_pages, &active_ids, &incomplete_pages) {
+        if should_infer_deletion(before, &baseline_pages, &active_ids, incomplete_pages) {
             operations.push(Operation::DeleteStroke {
                 source_uuid: before.source_uuid.clone(),
                 page_index: before.page_index,
