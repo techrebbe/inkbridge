@@ -1,13 +1,24 @@
 locals {
-  enabled = var.enable_deployment && var.deployment_acknowledgement == "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
-  required_apis = toset([
-    "billingbudgets.googleapis.com",
-    "eventarc.googleapis.com",
+  enabled         = var.enable_deployment && var.deployment_acknowledgement == "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
+  runtime_enabled = local.enabled && var.cloud_run_image != ""
+  bootstrap_required_apis = toset([
+    "artifactregistry.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
     "firestore.googleapis.com",
-    "pubsub.googleapis.com",
-    "run.googleapis.com",
+    "iam.googleapis.com",
+    "logging.googleapis.com",
     "storage.googleapis.com",
   ])
+  required_apis = setunion(
+    local.bootstrap_required_apis,
+    local.runtime_enabled ? toset([
+      "eventarc.googleapis.com",
+      "pubsub.googleapis.com",
+      "run.googleapis.com",
+    ]) : toset([]),
+    var.monthly_budget_usd > 0 ? toset(["billingbudgets.googleapis.com"]) : toset([]),
+  )
 }
 
 resource "terraform_data" "deployment_guard" {
@@ -17,6 +28,14 @@ resource "terraform_data" "deployment_guard" {
     precondition {
       condition     = !var.enable_deployment || local.enabled
       error_message = "Set deployment_acknowledgement exactly as documented before enabling billable resources."
+    }
+
+    precondition {
+      condition = (
+        !local.runtime_enabled ||
+        startswith(var.cloud_run_image, "${var.region}-docker.pkg.dev/${var.project_id}/${var.artifact_repository}/")
+      )
+      error_message = "cloud_run_image must come from the configured project, region, and Artifact Registry repository."
     }
   }
 }
@@ -45,6 +64,39 @@ resource "google_storage_bucket" "sync" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_artifact_registry_repository" "runtime" {
+  count = local.enabled ? 1 : 0
+
+  project       = var.project_id
+  location      = var.region
+  repository_id = var.artifact_repository
+  description   = "Immutable InkBridge Cloud Run images"
+  format        = "DOCKER"
+
+  cleanup_policy_dry_run = false
+
+  cleanup_policies {
+    id     = "delete-old-untagged"
+    action = "DELETE"
+
+    condition {
+      tag_state  = "UNTAGGED"
+      older_than = "604800s"
+    }
+  }
+
+  cleanup_policies {
+    id     = "keep-recent"
+    action = "KEEP"
+
+    most_recent_versions {
+      keep_count = 5
+    }
+  }
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_firestore_database" "canonical" {
   count = local.enabled ? 1 : 0
 
@@ -65,14 +117,28 @@ resource "google_service_account" "runtime" {
   project      = var.project_id
   account_id   = "inkbridge-runtime"
   display_name = "InkBridge Cloud Run broker"
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_service_account" "builder" {
+  count = local.enabled ? 1 : 0
+
+  project      = var.project_id
+  account_id   = "inkbridge-builder"
+  display_name = "InkBridge Cloud Build image builder"
+
+  depends_on = [google_project_service.required]
 }
 
 resource "google_service_account" "eventarc" {
-  count = local.enabled ? 1 : 0
+  count = local.runtime_enabled ? 1 : 0
 
   project      = var.project_id
   account_id   = "inkbridge-eventarc"
   display_name = "InkBridge Eventarc invoker"
+
+  depends_on = [google_project_service.required]
 }
 
 resource "google_storage_bucket_iam_member" "runtime_objects" {
@@ -81,6 +147,32 @@ resource "google_storage_bucket_iam_member" "runtime_objects" {
   bucket = google_storage_bucket.sync[0].name
   role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${google_service_account.runtime[0].email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "builder_writer" {
+  count = local.enabled ? 1 : 0
+
+  project    = var.project_id
+  location   = google_artifact_registry_repository.runtime[0].location
+  repository = google_artifact_registry_repository.runtime[0].repository_id
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.builder[0].email}"
+}
+
+resource "google_project_iam_member" "builder_logs" {
+  count = local.enabled ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.builder[0].email}"
+}
+
+resource "google_project_iam_member" "builder_source" {
+  count = local.enabled ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/storage.objectViewer"
+  member  = "serviceAccount:${google_service_account.builder[0].email}"
 }
 
 resource "google_project_iam_member" "runtime_firestore" {
@@ -92,7 +184,7 @@ resource "google_project_iam_member" "runtime_firestore" {
 }
 
 resource "google_project_iam_member" "eventarc_receiver" {
-  count = local.enabled ? 1 : 0
+  count = local.runtime_enabled ? 1 : 0
 
   project = var.project_id
   role    = "roles/eventarc.eventReceiver"
@@ -100,15 +192,17 @@ resource "google_project_iam_member" "eventarc_receiver" {
 }
 
 resource "google_project_iam_member" "storage_pubsub" {
-  count = local.enabled ? 1 : 0
+  count = local.runtime_enabled ? 1 : 0
 
   project = var.project_id
   role    = "roles/pubsub.publisher"
   member  = "serviceAccount:service-${var.project_number}@gs-project-accounts.iam.gserviceaccount.com"
+
+  depends_on = [google_project_service.required]
 }
 
 resource "google_cloud_run_v2_service" "runtime" {
-  count = local.enabled ? 1 : 0
+  count = local.runtime_enabled ? 1 : 0
 
   project             = var.project_id
   name                = "inkbridge-broker"
@@ -152,7 +246,7 @@ resource "google_cloud_run_v2_service" "runtime" {
 }
 
 resource "google_cloud_run_v2_service_iam_member" "eventarc_invoker" {
-  count = local.enabled ? 1 : 0
+  count = local.runtime_enabled ? 1 : 0
 
   project  = var.project_id
   location = google_cloud_run_v2_service.runtime[0].location
@@ -162,7 +256,7 @@ resource "google_cloud_run_v2_service_iam_member" "eventarc_invoker" {
 }
 
 resource "google_eventarc_trigger" "storage_finalized" {
-  count = local.enabled ? 1 : 0
+  count = local.runtime_enabled ? 1 : 0
 
   project         = var.project_id
   name            = "inkbridge-storage-finalized"

@@ -35,9 +35,28 @@ variable "bucket_name" {
 }
 
 variable "cloud_run_image" {
-  description = "Immutable linux/amd64 container image digest for the runtime."
+  description = "Immutable linux/amd64 Artifact Registry digest. Empty performs the bootstrap stage without Cloud Run or Eventarc."
   type        = string
-  default     = "us-docker.pkg.dev/cloudrun/container/hello"
+  default     = ""
+
+  validation {
+    condition = (
+      var.cloud_run_image == "" ||
+      can(regex("^[a-z0-9-]+-docker\\.pkg\\.dev/[^/]+/[^/]+/[^@]+@sha256:[0-9a-f]{64}$", var.cloud_run_image))
+    )
+    error_message = "cloud_run_image must be empty for bootstrap or an immutable Artifact Registry @sha256 digest."
+  }
+}
+
+variable "artifact_repository" {
+  description = "Regional Artifact Registry Docker repository used for InkBridge runtime images."
+  type        = string
+  default     = "inkbridge"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{2,62}$", var.artifact_repository))
+    error_message = "artifact_repository must be a lowercase Artifact Registry repository ID."
+  }
 }
 
 variable "firestore_database" {

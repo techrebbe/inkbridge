@@ -113,5 +113,13 @@ PORT                          # defaults to 8080
 ```
 
 The runtime container includes `inkbridge-convert` and `qpdf` and targets Linux
-`amd64`. `infra/gcp` is an opt-in blueprint and CI validates it without a plan,
-apply, credentials, or resource creation.
+`amd64`. `infra/gcp` is an opt-in deployment configuration. CI validates three
+credential-free, no-apply states: disabled, bootstrap, and runtime. Bootstrap
+creates the data plane and regional image repository while omitting Cloud Run
+and Eventarc. Runtime requires an immutable Artifact Registry `@sha256` image
+and adds those two resources. Real applies use the partial GCS backend so
+canonical infrastructure state is not left on one workstation.
+
+`cloudbuild.runtime.yaml` builds the existing runtime Dockerfile as Linux
+amd64. The reviewed operator flow tags a source commit, resolves that tag to a
+digest, and supplies only the immutable digest to Terraform.
