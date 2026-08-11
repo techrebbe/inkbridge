@@ -5,6 +5,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY inkbridge-convert ./inkbridge-convert
 COPY inkbridge-broker ./inkbridge-broker
+COPY inkbridge-cloud-runtime ./inkbridge-cloud-runtime
 
 # The workspace manifest references the remaining local crates even though this
 # image builds only the two broker crates, so copy their manifests and sources.
