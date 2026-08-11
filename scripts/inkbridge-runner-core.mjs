@@ -146,7 +146,7 @@ export function shellQuote(value) {
 
 export function toBashPath(value, platform = process.platform) {
   if (platform !== 'win32') return value;
-  const normalized = path.resolve(value).replaceAll('\\', '/');
+  const normalized = path.win32.resolve(value).replaceAll('\\', '/');
   const match = /^([A-Za-z]):\/(.*)$/u.exec(normalized);
   return match ? `/${match[1].toLowerCase()}/${match[2]}` : normalized;
 }
