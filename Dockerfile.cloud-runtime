@@ -7,8 +7,8 @@ COPY inkbridge-convert ./inkbridge-convert
 COPY inkbridge-broker ./inkbridge-broker
 COPY inkbridge-cloud-runtime ./inkbridge-cloud-runtime
 
-# The workspace manifest references the remaining local crates even though this
-# image builds only the two broker crates, so copy their manifests and sources.
+# Cargo resolves the whole workspace even though this image builds only the
+# cloud runtime and converter, so every local member must be present.
 COPY build-dict ./build-dict
 COPY device-eink ./device-eink
 COPY inkread-daily ./inkread-daily
@@ -20,16 +20,17 @@ COPY inkread-pdftext ./inkread-pdftext
 COPY inkread-update ./inkread-update
 COPY reader-core ./reader-core
 
-RUN cargo build --locked --release -p inkbridge-broker -p inkbridge-convert
+RUN cargo build --locked --release -p inkbridge-cloud-runtime -p inkbridge-convert
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates qpdf \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/target/release/inkbridge-broker /usr/local/bin/inkbridge-broker
+COPY --from=builder /src/target/release/inkbridge-cloud-runtime /usr/local/bin/inkbridge-cloud-runtime
 COPY --from=builder /src/target/release/inkbridge-convert /usr/local/bin/inkbridge-convert
 
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/inkbridge-broker"]
-CMD ["--help"]
+ENV PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/inkbridge-cloud-runtime"]

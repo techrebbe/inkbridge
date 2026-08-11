@@ -28,6 +28,11 @@ supernote/
 /target/
 **/*.rs.bk
 *.pdb
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
 # (this is an app, not a library → Cargo.lock IS committed)
 
 # ───────────────────────────────────────────────────────────────
