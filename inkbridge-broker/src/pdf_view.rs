@@ -617,4 +617,3 @@ mod tests {
         assert_eq!(object_string(&document, &reference), None);
     }
 }
-

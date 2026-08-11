@@ -821,4 +821,3 @@ mod tests {
         assert!((stroke.samples[1][1] - 0.3).abs() < 0.000_001);
     }
 }
-
