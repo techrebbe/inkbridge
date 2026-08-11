@@ -558,7 +558,7 @@ fn rectangle(document: &Document, object: &Object) -> Result<[f64; 4], String> {
         .as_array()
         .map_err(|_| "page box is not an array".to_owned())?
         .iter()
-        .map(number)
+        .map(|value| resolved_number(document, value))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| "page box contains non-numeric values".to_owned())?;
     if values.len() != 4 {
@@ -723,6 +723,25 @@ mod tests {
     }
 
     #[test]
+    fn page_geometry_resolves_indirect_page_box_coordinates() {
+        let mut document = Document::new();
+        let right_id = document.add_object(Object::Integer(612));
+        let top_id = document.add_object(Object::Integer(792));
+        let page_id = document.add_object(dictionary! {
+            "MediaBox" => vec![
+                0.into(),
+                0.into(),
+                Object::Reference(right_id),
+                Object::Reference(top_id),
+            ],
+        });
+
+        let geometry = page_geometry(&document, page_id).unwrap();
+        assert_eq!(geometry.width, 612.0);
+        assert_eq!(geometry.height, 792.0);
+    }
+
+    #[test]
     fn page_geometry_rejects_cyclic_parent_chain() {
         let mut document = Document::new();
         let page_id = document.new_object_id();
@@ -802,3 +821,4 @@ mod tests {
         assert!((stroke.samples[1][1] - 0.3).abs() < 0.000_001);
     }
 }
+
