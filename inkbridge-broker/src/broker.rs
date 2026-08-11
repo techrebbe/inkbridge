@@ -302,6 +302,17 @@ impl Broker {
         state
             .source_generations
             .insert(event.object_path.clone(), event.source_generation);
+        if let Some(consumed_view) = state.generated_views.get_mut(&event.object_path) {
+            // The device may edit its generated view in place. Once that input
+            // has been accepted, its bytes are the new known-safe destination
+            // baseline; only a subsequent, unconsumed change should trip the
+            // stale-destination guard.
+            consumed_view
+                .content_sha256
+                .clone_from(&event.content_sha256);
+            consumed_view.source_revisions = revisions;
+            consumed_view.event_id.clone_from(&event.event_id);
+        }
         state.processed_event_ids.insert(event.event_id.clone());
         state.state_revision += 1;
 

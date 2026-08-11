@@ -209,7 +209,7 @@ fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry,
         bottom,
         width: right - left,
         height: top - bottom,
-        rotation: rotation.unwrap_or(0.0).round() as i64 % 360,
+        rotation: (rotation.unwrap_or(0.0).round() as i64).rem_euclid(360),
     })
 }
 
@@ -270,5 +270,16 @@ mod tests {
             assert!((normalized.0 - 0.2).abs() < 0.000_001);
             assert!((normalized.1 - 0.3).abs() < 0.000_001);
         }
+    }
+
+    #[test]
+    fn page_geometry_normalizes_negative_rotation() {
+        let mut document = Document::new();
+        let page_id = document.add_object(dictionary! {
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Rotate" => -90,
+        });
+        let geometry = page_geometry(&document, page_id).unwrap();
+        assert_eq!(geometry.rotation, 270);
     }
 }

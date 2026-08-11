@@ -369,6 +369,75 @@ fn stale_destination_generation_does_not_overwrite_newer_content() {
 }
 
 #[test]
+fn accepted_in_place_boox_edit_becomes_the_next_destination_baseline() {
+    let mut harness = Harness::new();
+    let original = stroke("round-trip", 0.2, 0.3);
+    let supernote_first = harness.event(
+        "sn-1",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[original]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &supernote_first)
+        .unwrap();
+
+    let boox_path = boox_view_path(&harness.state());
+    let moved = stroke("round-trip", 0.35, 0.4);
+    let edited_pdf = write_boox_view(&harness.original, [moved.clone()]).unwrap();
+    let edited_hash = sha256_hex(&edited_pdf);
+    let edited_object = harness
+        .storage
+        .put_unchecked(&boox_path, edited_pdf, BTreeMap::new());
+    let boox_event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-in-place".to_owned(),
+        document_id: harness.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: boox_path.clone(),
+        source_generation: edited_object.generation,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: edited_hash.clone(),
+        broker_output: None,
+    };
+    harness
+        .broker
+        .process(&mut harness.storage, &boox_event)
+        .unwrap();
+    assert_eq!(
+        harness.state().generated_views[&boox_path].content_sha256,
+        edited_hash
+    );
+
+    let supernote_second = harness.event(
+        "sn-2",
+        DeviceSide::Supernote,
+        2,
+        RevisionPair {
+            boox: 1,
+            supernote: 1,
+        },
+        supernote_export(&[moved]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &supernote_second)
+            .unwrap(),
+        ProcessOutcome::Applied {
+            destination_path,
+            ..
+        } if destination_path == boox_path
+    ));
+}
+
+#[test]
 fn simultaneous_edits_preserve_incoming_input_as_conflict() {
     let mut harness = Harness::new();
     let initial = harness.event(
