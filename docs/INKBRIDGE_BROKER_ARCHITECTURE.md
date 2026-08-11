@@ -13,6 +13,9 @@ of its desktop coordination or polling logic is carried into this broker core.
 - The immutable original PDF is addressed by its SHA-256-derived document ID, not by a filename.
 - Canonical state owns revision history, stroke identity, tombstones, source generations, content
   hashes, processed event IDs, generated-output markers, and conflict records.
+- Every accepted device input is archived immutably with its revision and content hash in the same
+  conditional commit as the generated output and state update. Conflict evidence never depends on
+  rereading a mutable device-folder path.
 - A device event states the exact revision pair on which it was based. If canonical state has moved
   beyond that pair, the incoming bytes are preserved under `Conflicts/` and processing reports a
   conflict. There is no latest-file-wins path.
@@ -31,6 +34,8 @@ Originals/
 
 Canonical/
   <document-id>/state.json                      broker-owned canonical state
+  <document-id>/accepted/<side>/revision-<revision>-<hash>.<ext>
+                                                immutable accepted source revisions
 
 BOOX_Folder/
   <document-id>/<logical-name>.pdf              editable PDF /Ink view

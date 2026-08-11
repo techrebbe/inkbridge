@@ -385,12 +385,13 @@ fn accepted_in_place_boox_edit_becomes_the_next_destination_baseline() {
         .unwrap();
 
     let boox_path = boox_view_path(&harness.state());
+    let generated = harness.storage.object(&boox_path).unwrap().clone();
     let moved = stroke("round-trip", 0.35, 0.4);
     let edited_pdf = write_boox_view(&harness.original, [moved.clone()]).unwrap();
     let edited_hash = sha256_hex(&edited_pdf);
     let edited_object = harness
         .storage
-        .put_unchecked(&boox_path, edited_pdf, BTreeMap::new());
+        .put_unchecked(&boox_path, edited_pdf, generated.metadata);
     let boox_event = StorageEvent {
         schema_version: EVENT_SCHEMA_VERSION,
         event_id: "boox-in-place".to_owned(),
@@ -404,7 +405,15 @@ fn accepted_in_place_boox_edit_becomes_the_next_destination_baseline() {
             supernote: 1,
         },
         content_sha256: edited_hash.clone(),
-        broker_output: None,
+        broker_output: Some(BrokerOutputMarker {
+            producer: BROKER_PRODUCER.to_owned(),
+            event_id: "sn-1".to_owned(),
+            document_id: harness.document_id.clone(),
+            source_revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+        }),
     };
     harness
         .broker
@@ -482,6 +491,83 @@ fn simultaneous_edits_preserve_incoming_input_as_conflict() {
         .storage
         .object(&conflict.competing_preserved_paths[0])
         .is_some());
+}
+
+#[test]
+fn conflict_preserves_the_immutable_accepted_device_revision() {
+    let mut harness = Harness::new();
+    let initial = harness.event(
+        "sn-1",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("shared", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let boox_path = boox_view_path(&harness.state());
+    let accepted_boox = write_boox_view(&harness.original, [stroke("shared", 0.35, 0.3)]).unwrap();
+    let accepted_object =
+        harness
+            .storage
+            .put_unchecked(&boox_path, accepted_boox.clone(), BTreeMap::new());
+    let boox_event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-accepted".to_owned(),
+        document_id: harness.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: boox_path.clone(),
+        source_generation: accepted_object.generation,
+        source_revision: 1,
+        based_on: common,
+        content_sha256: sha256_hex(&accepted_boox),
+        broker_output: None,
+    };
+    harness
+        .broker
+        .process(&mut harness.storage, &boox_event)
+        .unwrap();
+    let accepted_path = harness.state().boox.accepted_object_path;
+    assert_eq!(
+        harness.storage.object(&accepted_path).unwrap().bytes,
+        accepted_boox
+    );
+
+    harness
+        .storage
+        .put_unchecked(&boox_path, b"later mutable bytes".to_vec(), BTreeMap::new());
+    let concurrent_supernote = harness.event(
+        "sn-concurrent",
+        DeviceSide::Supernote,
+        2,
+        common,
+        supernote_export(&[stroke("shared", 0.2, 0.45)]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &concurrent_supernote)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+    let state = harness.state();
+    let conflict = state.conflicts.last().unwrap();
+    assert_eq!(conflict.competing_preserved_paths.len(), 1);
+    assert_eq!(
+        harness
+            .storage
+            .object(&conflict.competing_preserved_paths[0])
+            .unwrap()
+            .bytes,
+        accepted_boox
+    );
 }
 
 #[test]

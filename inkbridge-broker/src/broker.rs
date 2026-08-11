@@ -13,6 +13,7 @@ const GENERATED_BY_KEY: &str = "inkbridge-generated-by";
 const GENERATED_EVENT_KEY: &str = "inkbridge-event-id";
 const GENERATED_DOCUMENT_KEY: &str = "inkbridge-document-id";
 const GENERATED_REVISIONS_KEY: &str = "inkbridge-source-revisions";
+const GENERATED_CONTENT_HASH_KEY: &str = "inkbridge-content-sha256";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerError {
@@ -165,7 +166,14 @@ impl Broker {
             .read(&event.object_path)
             .map_err(BrokerError::Storage)?
             .ok_or_else(|| BrokerError::MissingObject(event.object_path.clone()))?;
-        if is_broker_output(event, &source.metadata) {
+        let actual_hash = sha256_hex(&source.bytes);
+        if actual_hash != event.content_sha256 {
+            return Err(BrokerError::InvalidEvent(format!(
+                "source content hash mismatch: event={}, actual={actual_hash}",
+                event.content_sha256
+            )));
+        }
+        if is_broker_output(event, &source.metadata, &actual_hash) {
             mark_event_only(
                 storage,
                 &mut state,
@@ -197,14 +205,6 @@ impl Broker {
                 event.source_generation, source.generation
             )));
         }
-        let actual_hash = sha256_hex(&source.bytes);
-        if actual_hash != event.content_sha256 {
-            return Err(BrokerError::InvalidEvent(format!(
-                "source content hash mismatch: event={}, actual={actual_hash}",
-                event.content_sha256
-            )));
-        }
-
         let current = state.revisions();
         let source_state = state.device(event.source);
         if event.source_revision <= source_state.revision {
@@ -284,12 +284,14 @@ impl Broker {
             }
         };
 
+        let accepted_path = accepted_input_path(event);
         let revisions = {
             let device = state.device_mut(event.source);
             device.revision = event.source_revision;
             device.content_sha256.clone_from(&event.content_sha256);
             device.source_generation = event.source_generation;
             device.source_object_path.clone_from(&event.object_path);
+            device.accepted_object_path.clone_from(&accepted_path);
             if event.source == DeviceSide::Boox {
                 device.source_file_name = Path::new(&event.object_path)
                     .file_name()
@@ -343,6 +345,21 @@ impl Broker {
                 bytes: output_bytes,
                 metadata: output_metadata(&marker, &output_hash),
                 precondition: destination_precondition,
+            },
+            ConditionalWrite {
+                path: accepted_path,
+                bytes: source.bytes.clone(),
+                metadata: BTreeMap::from([
+                    ("inkbridge-kind".to_owned(), "accepted-source".to_owned()),
+                    (GENERATED_DOCUMENT_KEY.to_owned(), event.document_id.clone()),
+                    (GENERATED_EVENT_KEY.to_owned(), event.event_id.clone()),
+                    (GENERATED_CONTENT_HASH_KEY.to_owned(), actual_hash),
+                    (
+                        "inkbridge-source-generation".to_owned(),
+                        event.source_generation.to_string(),
+                    ),
+                ]),
+                precondition: GenerationPrecondition::DoesNotExist,
             },
             state_write(
                 &state_path,
@@ -416,11 +433,23 @@ impl Broker {
             if device.revision <= event.based_on.get(side) || device.source_object_path.is_empty() {
                 continue;
             }
+            let evidence_path = if device.accepted_object_path.is_empty() {
+                &device.source_object_path
+            } else {
+                &device.accepted_object_path
+            };
             let current_input = storage
-                .read(&device.source_object_path)
+                .read(evidence_path)
                 .map_err(BrokerError::Storage)?
-                .ok_or_else(|| BrokerError::MissingObject(device.source_object_path.clone()))?;
-            let current_extension = Path::new(&device.source_object_path)
+                .ok_or_else(|| BrokerError::MissingObject(evidence_path.clone()))?;
+            let evidence_hash = sha256_hex(&current_input.bytes);
+            if evidence_hash != device.content_sha256 {
+                return Err(BrokerError::CorruptState(format!(
+                    "accepted {side:?} source evidence hash changed: expected {}, found {evidence_hash}",
+                    device.content_sha256
+                )));
+            }
+            let current_extension = Path::new(evidence_path)
                 .extension()
                 .and_then(|value| value.to_str())
                 .unwrap_or("bin");
@@ -498,7 +527,11 @@ fn validate_event(event: &StorageEvent) -> Result<(), BrokerError> {
     Ok(())
 }
 
-fn is_broker_output(event: &StorageEvent, metadata: &BTreeMap<String, String>) -> bool {
+fn is_broker_output(
+    event: &StorageEvent,
+    metadata: &BTreeMap<String, String>,
+    content_sha256: &str,
+) -> bool {
     let envelope_matches = event.broker_output.as_ref().is_some_and(|marker| {
         marker.producer == BROKER_PRODUCER
             && marker.document_id == event.document_id
@@ -506,7 +539,8 @@ fn is_broker_output(event: &StorageEvent, metadata: &BTreeMap<String, String>) -
     });
     let metadata_matches = metadata.get(GENERATED_BY_KEY).map(String::as_str)
         == Some(BROKER_PRODUCER)
-        && metadata.get(GENERATED_DOCUMENT_KEY) == Some(&event.document_id);
+        && metadata.get(GENERATED_DOCUMENT_KEY) == Some(&event.document_id)
+        && metadata.get(GENERATED_CONTENT_HASH_KEY).map(String::as_str) == Some(content_sha256);
     metadata_matches && envelope_matches
 }
 
@@ -525,7 +559,7 @@ fn output_metadata(marker: &BrokerOutputMarker, hash: &str) -> BTreeMap<String, 
                 marker.source_revisions.boox, marker.source_revisions.supernote
             ),
         ),
-        ("inkbridge-content-sha256".to_owned(), hash.to_owned()),
+        (GENERATED_CONTENT_HASH_KEY.to_owned(), hash.to_owned()),
     ])
 }
 
@@ -824,6 +858,17 @@ pub fn original_path(document_id: &str) -> String {
 
 pub fn state_path(document_id: &str) -> String {
     format!("Canonical/{document_id}/state.json")
+}
+
+fn accepted_input_path(event: &StorageEvent) -> String {
+    let (side, extension) = match event.source {
+        DeviceSide::Boox => ("boox", "pdf"),
+        DeviceSide::Supernote => ("supernote", "json"),
+    };
+    format!(
+        "Canonical/{}/accepted/{side}/revision-{:020}-{}.{}",
+        event.document_id, event.source_revision, event.content_sha256, extension
+    )
 }
 
 pub fn supernote_manifest_path(document_id: &str, event_id: &str) -> String {

@@ -88,6 +88,8 @@ pub struct DeviceRevision {
     pub source_generation: u64,
     #[serde(default)]
     pub source_object_path: String,
+    #[serde(default)]
+    pub accepted_object_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_file_name: Option<String>,
 }
