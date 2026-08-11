@@ -1,8 +1,9 @@
 use inkbridge_convert::StrokeSnapshot;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_INDIRECT_DEPTH: usize = 32;
+const MAX_PAGE_TREE_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 struct PageGeometry {
@@ -314,7 +315,11 @@ fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry,
     let mut crop_box = None;
     let mut media_box = None;
     let mut rotation = None;
+    let mut visited = BTreeSet::new();
     loop {
+        if visited.len() >= MAX_PAGE_TREE_DEPTH || !visited.insert(current_id) {
+            return Err("PDF page has a cyclic or excessively deep Parent chain".to_owned());
+        }
         let dictionary = document
             .get_dictionary(current_id)
             .map_err(|error| format!("could not resolve page tree object: {error}"))?;
@@ -330,7 +335,12 @@ fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry,
                 .ok()
                 .and_then(|object| rectangle(document, object).ok())
         });
-        rotation = rotation.or_else(|| dictionary.get(b"Rotate").ok().and_then(number));
+        rotation = rotation.or_else(|| {
+            dictionary
+                .get(b"Rotate")
+                .ok()
+                .and_then(|object| resolved_number(document, object))
+        });
         let Some(parent) = dictionary
             .get(b"Parent")
             .ok()
@@ -379,6 +389,23 @@ fn number(object: &Object) -> Option<f64> {
         Object::Integer(value) => Some(*value as f64),
         Object::Real(value) => Some(f64::from(*value)),
         _ => None,
+    }
+}
+
+fn resolved_number(document: &Document, object: &Object) -> Option<f64> {
+    resolved_number_at_depth(document, object, 0)
+}
+
+fn resolved_number_at_depth(document: &Document, object: &Object, depth: usize) -> Option<f64> {
+    if depth >= MAX_INDIRECT_DEPTH {
+        return None;
+    }
+    match object {
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| resolved_number_at_depth(document, value, depth + 1)),
+        value => number(value),
     }
 }
 
@@ -518,6 +545,44 @@ mod tests {
         });
         let geometry = page_geometry(&document, page_id).unwrap();
         assert_eq!(geometry.rotation, 270);
+    }
+
+    #[test]
+    fn page_geometry_resolves_indirect_rotation() {
+        let mut document = Document::new();
+        let rotation_id = document.add_object(Object::Integer(-90));
+        let page_id = document.add_object(dictionary! {
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Rotate" => rotation_id,
+        });
+        let geometry = page_geometry(&document, page_id).unwrap();
+        assert_eq!(geometry.rotation, 270);
+    }
+
+    #[test]
+    fn page_geometry_rejects_cyclic_parent_chain() {
+        let mut document = Document::new();
+        let page_id = document.new_object_id();
+        let parent_id = document.new_object_id();
+        document.objects.insert(
+            page_id,
+            dictionary! {
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Parent" => parent_id,
+            }
+            .into(),
+        );
+        document.objects.insert(
+            parent_id,
+            dictionary! {
+                "Parent" => page_id,
+            }
+            .into(),
+        );
+
+        assert!(page_geometry(&document, page_id)
+            .unwrap_err()
+            .contains("cyclic or excessively deep"));
     }
 
     #[test]

@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::Command;
 
 const MAX_APPEARANCE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_IDENTITY_REFERENCE_DEPTH: usize = 32;
+const MAX_INDIRECT_REFERENCE_DEPTH: usize = 32;
+const MAX_PAGE_TREE_DEPTH: usize = 64;
 
 pub struct PdfStrokeExtraction {
     pub page_count: usize,
@@ -453,7 +454,7 @@ fn name(document: &Document, object: Option<&Object>) -> Option<String> {
 }
 
 fn name_with_depth(document: &Document, object: Option<&Object>, depth: usize) -> Option<String> {
-    if depth >= MAX_IDENTITY_REFERENCE_DEPTH {
+    if depth >= MAX_INDIRECT_REFERENCE_DEPTH {
         return None;
     }
     match object? {
@@ -475,7 +476,7 @@ fn pdf_string_with_depth(
     object: Option<&Object>,
     depth: usize,
 ) -> Option<String> {
-    if depth >= MAX_IDENTITY_REFERENCE_DEPTH {
+    if depth >= MAX_INDIRECT_REFERENCE_DEPTH {
         return None;
     }
     match object? {
@@ -497,8 +498,12 @@ fn page_geometry(document: &Document, page_id: lopdf::ObjectId) -> Result<PageGe
     let mut crop_box = None;
     let mut media_box = None;
     let mut rotation = None;
+    let mut visited = HashSet::new();
 
     loop {
+        if visited.len() >= MAX_PAGE_TREE_DEPTH || !visited.insert(current_id) {
+            return Err("PDF page has a cyclic or excessively deep Parent chain".to_owned());
+        }
         let dictionary = document.get_dictionary(current_id).map_err(|error| {
             format!("could not resolve page tree object {current_id:?}: {error}")
         })?;
@@ -518,7 +523,7 @@ fn page_geometry(document: &Document, page_id: lopdf::ObjectId) -> Result<PageGe
             rotation = dictionary
                 .get(b"Rotate")
                 .ok()
-                .and_then(number)
+                .and_then(|object| resolved_number(document, object))
                 .map(|value| value.round() as i64);
         }
         let Some(parent) = dictionary
@@ -560,6 +565,23 @@ fn rectangle(document: &Document, object: &Object) -> Result<[f64; 4], String> {
         return Err("page box does not contain four values".to_owned());
     }
     Ok([values[0], values[1], values[2], values[3]])
+}
+
+fn resolved_number(document: &Document, object: &Object) -> Option<f64> {
+    resolved_number_at_depth(document, object, 0)
+}
+
+fn resolved_number_at_depth(document: &Document, object: &Object, depth: usize) -> Option<f64> {
+    if depth >= MAX_INDIRECT_REFERENCE_DEPTH {
+        return None;
+    }
+    match object {
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| resolved_number_at_depth(document, value, depth + 1)),
+        value => number(value),
+    }
 }
 
 impl PageGeometry {
@@ -686,6 +708,44 @@ mod tests {
             pdf_string(&document, Some(&Object::Reference(cycle_id))),
             None
         );
+    }
+
+    #[test]
+    fn page_geometry_resolves_indirect_rotation() {
+        let mut document = Document::new();
+        let rotation_id = document.add_object(Object::Integer(-90));
+        let page_id = document.add_object(dictionary! {
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Rotate" => rotation_id,
+        });
+
+        assert_eq!(page_geometry(&document, page_id).unwrap().rotation, 270);
+    }
+
+    #[test]
+    fn page_geometry_rejects_cyclic_parent_chain() {
+        let mut document = Document::new();
+        let page_id = document.new_object_id();
+        let parent_id = document.new_object_id();
+        document.objects.insert(
+            page_id,
+            dictionary! {
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Parent" => parent_id,
+            }
+            .into(),
+        );
+        document.objects.insert(
+            parent_id,
+            dictionary! {
+                "Parent" => page_id,
+            }
+            .into(),
+        );
+
+        assert!(page_geometry(&document, page_id)
+            .unwrap_err()
+            .contains("cyclic or excessively deep"));
     }
 
     #[test]
