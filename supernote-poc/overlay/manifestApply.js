@@ -8,6 +8,7 @@ import {
   descriptorMatches,
   geometryFingerprint,
   parseUserData,
+  supernotePenColor,
   strokeDescriptor,
   validateManifest,
 } from './manifestCore';
@@ -108,10 +109,34 @@ function taggedMatch(described, sourceUuid) {
   );
 }
 
+function currentAfterMatch(described, operation) {
+  const fingerprint = operation.after?.geometryFingerprint;
+  return described.find(
+    item =>
+      (item.data?.inkBridgeOrigin === 'inkbridge-sync' &&
+        item.data?.sourceUuid === operation.sourceUuid &&
+        item.data?.contentHash === fingerprint) ||
+      (item.snapshot.geometryFingerprint === fingerprint &&
+        (item.element.uuid === operation.sourceUuid ||
+          item.data?.sourceUuid === operation.sourceUuid)),
+  );
+}
+
 function exactIdentityMatch(described, sourceUuid) {
   return described.find(
     item =>
       item.element.uuid === sourceUuid || item.data?.sourceUuid === sourceUuid,
+  );
+}
+
+function sameNativeElement(left, right) {
+  if (!left || !right) return false;
+  if (left.element.uuid && right.element.uuid) {
+    return left.element.uuid === right.element.uuid;
+  }
+  return (
+    Number.isInteger(left.element.numInPage) &&
+    left.element.numInPage === right.element.numInPage
   );
 }
 
@@ -132,9 +157,26 @@ function findTarget(described, operation) {
   );
 }
 
-async function createNativeStroke({
-  filePath,
-  pageIndex,
+function findSupersededTarget(described, operation, current, previousTarget) {
+  const candidates = current
+    ? described.filter(item => !sameNativeElement(item, current))
+    : described;
+  const exact = exactIdentityMatch(candidates, operation.sourceUuid);
+  if (exact) return exact;
+  const geometry = uniqueGeometryMatch(
+    candidates,
+    operation.before ?? previousTarget?.snapshot,
+  );
+  if (geometry) return geometry;
+  if (Number.isInteger(previousTarget?.element?.numInPage)) {
+    return candidates.find(
+      item => item.element.numInPage === previousTarget.element.numInPage,
+    );
+  }
+  return null;
+}
+
+async function prepareNativeStroke({
   pageSize,
   snapshot,
   yOffset,
@@ -150,11 +192,12 @@ async function createNativeStroke({
   const {nativeStyle} = snapshot;
   target.layerNum = nativeStyle.layerNum ?? 0;
   target.thickness = nativeStyle.thickness;
-  target.stroke.penColor = nativeStyle.penColor;
+  target.stroke.penColor = supernotePenColor(nativeStyle.penColor);
   target.stroke.penType = nativeStyle.penType;
   target.userData = JSON.stringify({
     inkBridgeOrigin: 'inkbridge-sync',
     sourceUuid: snapshot.sourceUuid,
+    sourcePenColor: nativeStyle.penColor,
     contentHash: snapshot.geometryFingerprint,
     manifestId,
   });
@@ -173,22 +216,154 @@ async function createNativeStroke({
     pressures,
   );
   if (!pressuresOk) throw new Error('Could not write native stroke pressures.');
+  return target;
+}
+
+async function insertTargets(filePath, pageIndex, targets) {
+  if (!targets.length) return;
   await requireResult(
-    PluginFileAPI.insertElements(filePath, pageIndex, [target]),
+    PluginFileAPI.insertElements(filePath, pageIndex, targets),
     'insertElements',
   );
 }
 
-async function deleteTarget(filePath, pageIndex, target, label) {
-  if (!Number.isInteger(target?.element?.numInPage)) {
-    throw new Error(`Could not resolve native element index for ${label}.`);
+async function deleteTargets(filePath, pageIndex, targets) {
+  if (!targets.length) return;
+  const indices = [];
+  for (const {target, label} of targets) {
+    if (!Number.isInteger(target?.element?.numInPage)) {
+      throw new Error(`Could not resolve native element index for ${label}.`);
+    }
+    if (!indices.includes(target.element.numInPage)) {
+      indices.push(target.element.numInPage);
+    }
   }
+  // Descending order is safe whether the host treats the indices as a set or
+  // removes them one by one while compacting the page element list.
+  indices.sort((left, right) => right - left);
   await requireResult(
-    PluginFileAPI.deleteElements(filePath, pageIndex, [
-      target.element.numInPage,
-    ]),
-    `deleteElements ${label}`,
+    PluginFileAPI.deleteElements(filePath, pageIndex, indices),
+    'deleteElements',
   );
+}
+
+function operationsByPage(operations) {
+  const pages = new Map();
+  operations.forEach((operation, index) => {
+    const page = pages.get(operation.pageIndex) ?? [];
+    page.push({operation, index});
+    pages.set(operation.pageIndex, page);
+  });
+  return pages;
+}
+
+async function applyPage({
+  filePath,
+  pageIndex,
+  indexedOperations,
+  operationCount,
+  yOffset,
+  manifestId,
+  counts,
+}) {
+  const pageSize = await requireResult(
+    PluginFileAPI.getPageSize(filePath, pageIndex),
+    `getPageSize page ${pageIndex + 1}`,
+  );
+  const elements =
+    (await requireResult(
+      PluginFileAPI.getElements(pageIndex, filePath),
+      `getElements page ${pageIndex + 1}`,
+    )) ?? [];
+  const described = await describeElements(elements, pageSize, pageIndex);
+  const insertions = [];
+  const deletions = [];
+  const outcomes = [];
+
+  console.log(
+    `INKBRIDGE_SYNC_PAGE page=${pageIndex + 1} operations=${indexedOperations.length} nativeStrokes=${described.length} stage=scanned`,
+  );
+
+  for (const {operation, index} of indexedOperations) {
+    const target = findTarget(described, operation);
+    if (operation.type === 'delete_stroke') {
+      if (!target) {
+        outcomes.push({index, operation, result: 'already-absent'});
+      } else {
+        deletions.push({target, label: operation.sourceUuid});
+        outcomes.push({index, operation, result: 'applied'});
+      }
+      continue;
+    }
+
+    const current = currentAfterMatch(described, operation);
+    if (current) {
+      const superseded = operation.before
+        ? findSupersededTarget(described, operation, current, null)
+        : null;
+      if (superseded) {
+        deletions.push({
+          target: superseded,
+          label: `superseded ${operation.sourceUuid}`,
+        });
+        outcomes.push({index, operation, result: 'repaired'});
+      } else {
+        outcomes.push({index, operation, result: 'already-current'});
+      }
+      continue;
+    }
+
+    insertions.push(
+      await prepareNativeStroke({
+        pageSize,
+        snapshot: operation.after,
+        yOffset,
+        manifestId,
+      }),
+    );
+    if (target) {
+      deletions.push({
+        target,
+        label: `superseded ${operation.sourceUuid}`,
+      });
+      outcomes.push({index, operation, result: 'updated'});
+    } else {
+      outcomes.push({index, operation, result: 'added'});
+    }
+  }
+
+  console.log(
+    `INKBRIDGE_SYNC_PAGE page=${pageIndex + 1} insert=${insertions.length} delete=${deletions.length} stage=planned`,
+  );
+  await insertTargets(filePath, pageIndex, insertions);
+  if (insertions.length) {
+    console.log(
+      `INKBRIDGE_SYNC_PAGE page=${pageIndex + 1} inserted=${insertions.length} stage=inserted`,
+    );
+  }
+  await deleteTargets(filePath, pageIndex, deletions);
+  if (deletions.length) {
+    console.log(
+      `INKBRIDGE_SYNC_PAGE page=${pageIndex + 1} deleted=${deletions.length} stage=deleted`,
+    );
+  }
+
+  for (const {index, operation, result} of outcomes) {
+    if (operation.type === 'delete_stroke') {
+      if (result === 'applied') counts.deleted += 1;
+      else counts.skipped += 1;
+      console.log(
+        `INKBRIDGE_SYNC_OP ${index + 1}/${operationCount} delete ${operation.sourceUuid} ${result}`,
+      );
+      continue;
+    }
+    if (result === 'added') counts.added += 1;
+    else if (result === 'updated' || result === 'repaired') counts.updated += 1;
+    else counts.skipped += 1;
+    console.log(
+      `INKBRIDGE_SYNC_OP ${index + 1}/${operationCount} upsert ${operation.sourceUuid} ${result}`,
+    );
+  }
 }
 
 export async function applyEmbeddedManifest() {
@@ -208,108 +383,18 @@ export async function applyEmbeddedManifest() {
     manifest.coordinateTransform?.pdfToSupernoteNormalizedYOffset ?? 0;
   const counts = {added: 0, updated: 0, deleted: 0, skipped: 0};
 
-  for (let index = 0; index < manifest.operations.length; index += 1) {
-    const operation = manifest.operations[index];
-    const pageSize = await requireResult(
-      PluginFileAPI.getPageSize(filePath, operation.pageIndex),
-      `getPageSize page ${operation.pageIndex + 1}`,
-    );
-    let elements =
-      (await requireResult(
-        PluginFileAPI.getElements(operation.pageIndex, filePath),
-        `getElements page ${operation.pageIndex + 1}`,
-      )) ?? [];
-    let described = await describeElements(
-      elements,
-      pageSize,
-      operation.pageIndex,
-    );
-    const target = findTarget(described, operation);
-
-    if (operation.type === 'delete_stroke') {
-      if (!target) {
-        counts.skipped += 1;
-        console.log(
-          `INKBRIDGE_SYNC_OP ${index + 1}/${manifest.operations.length} delete ${operation.sourceUuid} already-absent`,
-        );
-        continue;
-      }
-      await deleteTarget(
-        filePath,
-        operation.pageIndex,
-        target,
-        operation.sourceUuid,
-      );
-      counts.deleted += 1;
-      console.log(
-        `INKBRIDGE_SYNC_OP ${index + 1}/${manifest.operations.length} delete ${operation.sourceUuid} applied`,
-      );
-      continue;
-    }
-
-    const after = operation.after;
-    const tagged = taggedMatch(described, operation.sourceUuid);
-    const exactAfter =
-      tagged?.data?.contentHash === after.geometryFingerprint ||
-      described.some(
-        item =>
-          item.snapshot.geometryFingerprint === after.geometryFingerprint &&
-          (item.element.uuid === operation.sourceUuid ||
-            item.data?.sourceUuid === operation.sourceUuid),
-      );
-    if (exactAfter) {
-      counts.skipped += 1;
-      console.log(
-        `INKBRIDGE_SYNC_OP ${index + 1}/${manifest.operations.length} upsert ${operation.sourceUuid} already-current`,
-      );
-      continue;
-    }
-
-    await createNativeStroke({
+  for (const [pageIndex, indexedOperations] of operationsByPage(
+    manifest.operations,
+  )) {
+    await applyPage({
       filePath,
-      pageIndex: operation.pageIndex,
-      pageSize,
-      snapshot: after,
+      pageIndex,
+      indexedOperations,
+      operationCount: manifest.operations.length,
       yOffset,
       manifestId: manifest.manifestId,
+      counts,
     });
-
-    if (target) {
-      // Re-fetch after insertion: Supernote can renumber native elements.
-      elements =
-        (await requireResult(
-          PluginFileAPI.getElements(operation.pageIndex, filePath),
-          'getElements after replacement insert',
-        )) ?? [];
-      described = await describeElements(
-        elements,
-        pageSize,
-        operation.pageIndex,
-      );
-      const superseded =
-        described.find(item => item.element.uuid === target.element.uuid) ??
-        uniqueGeometryMatch(described, target.snapshot);
-      if (!superseded) {
-        throw new Error(
-          `Inserted ${operation.sourceUuid}, but could not locate its superseded native stroke.`,
-        );
-      }
-      await deleteTarget(
-        filePath,
-        operation.pageIndex,
-        superseded,
-        `superseded ${operation.sourceUuid}`,
-      );
-      counts.updated += 1;
-      console.log(
-        `INKBRIDGE_SYNC_OP ${index + 1}/${manifest.operations.length} upsert ${operation.sourceUuid} updated`,
-      );
-    } else {
-      counts.added += 1;
-      console.log(
-        `INKBRIDGE_SYNC_OP ${index + 1}/${manifest.operations.length} upsert ${operation.sourceUuid} added`,
-      );
-    }
   }
 
   await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');

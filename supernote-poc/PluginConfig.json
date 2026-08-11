@@ -4,8 +4,8 @@
   "pluginID": "ibpoc20260724001",
   "iconPath": "assets/icon.png",
   "desc": "Editable handwriting bridge for BOOX and Supernote",
-  "versionCode": "12",
-  "versionName": "0.1.0",
+  "versionCode": "16",
+  "versionName": "0.1.4",
   "jsMainPath": "index",
   "author": "InkBridge"
 }

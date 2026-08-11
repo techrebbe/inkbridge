@@ -7,6 +7,14 @@ export function parseUserData(userData) {
   }
 }
 
+const SUPPORTED_SUPERNOTE_PEN_COLORS = new Set([0x00, 0x9d]);
+
+export function supernotePenColor(sourcePenColor) {
+  return SUPPORTED_SUPERNOTE_PEN_COLORS.has(sourcePenColor)
+    ? sourcePenColor
+    : 0x9d;
+}
+
 function fnv1a32(text) {
   let hash = 0x811c9dc5;
   for (let index = 0; index < text.length; index += 1) {

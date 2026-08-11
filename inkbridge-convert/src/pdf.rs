@@ -2,7 +2,9 @@ use crate::model::{geometry_fingerprint, NativeStyle, Sample, StrokeSnapshot};
 use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object, Stream};
 use serde_json::Value;
+use std::ffi::OsString;
 use std::path::Path;
+use std::process::Command;
 
 const MAX_APPEARANCE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -55,8 +57,7 @@ impl Matrix {
 }
 
 pub fn extract_pdf_strokes(path: &Path) -> Result<(usize, Vec<StrokeSnapshot>, usize), String> {
-    let document = Document::load(path)
-        .map_err(|error| format!("could not load PDF {}: {error}", path.display()))?;
+    let document = load_neoreader_pdf(path)?;
     let pages = document.get_pages();
     let mut strokes = Vec::new();
     let mut skipped = 0usize;
@@ -83,6 +84,50 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<(usize, Vec<StrokeSnapshot>, u
         }
     }
     Ok((pages.len(), strokes, skipped))
+}
+
+fn load_neoreader_pdf(path: &Path) -> Result<Document, String> {
+    let initial_error = match Document::load(path) {
+        Ok(document) => return Ok(document),
+        Err(error) => error,
+    };
+
+    // NeoReader occasionally emits a readable PDF whose incremental xref stream
+    // has an incorrect length or omits its own entry. PDF viewers recover it,
+    // but lopdf correctly rejects the malformed table. qpdf provides the same
+    // lossless structural rewrite we previously had to perform manually.
+    let work = tempfile::tempdir().map_err(|error| {
+        format!(
+            "could not load PDF {}: {initial_error}; could not create repair directory: {error}",
+            path.display(),
+        )
+    })?;
+    let repaired = work.path().join("neoreader-repaired.pdf");
+    let qpdf: OsString =
+        std::env::var_os("INKBRIDGE_QPDF").unwrap_or_else(|| OsString::from("qpdf"));
+    let output = Command::new(&qpdf)
+        .arg("--warning-exit-0")
+        .arg(path)
+        .arg(&repaired)
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not load PDF {}: {initial_error}; qpdf recovery could not start ({error}). Install qpdf or set INKBRIDGE_QPDF.",
+                path.display(),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not load PDF {}: {initial_error}; qpdf recovery failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    eprintln!(
+        "warning: NeoReader PDF had an invalid cross-reference table; recovered it with qpdf"
+    );
+    Document::load(&repaired)
+        .map_err(|error| format!("could not load repaired PDF {}: {error}", path.display(),))
 }
 
 fn extract_annotation(

@@ -4,6 +4,7 @@ import {
   descriptorMatches,
   geometryFingerprint,
   strokeDescriptor,
+  supernotePenColor,
   validateManifest,
 } from '../overlay/manifestCore.js';
 
@@ -62,4 +63,10 @@ test('manifest validation accepts an upsert operation', () => {
       ],
     }),
   );
+});
+
+test('unsupported BOOX colors map to a valid native Supernote shade', () => {
+  assert.equal(supernotePenColor(0x00), 0x00);
+  assert.equal(supernotePenColor(0x9d), 0x9d);
+  assert.equal(supernotePenColor(130), 0x9d);
 });

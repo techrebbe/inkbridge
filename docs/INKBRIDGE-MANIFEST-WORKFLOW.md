@@ -35,6 +35,11 @@ cargo run -p inkbridge-convert -- extract \
   --output inkbridge-manifest.json
 ```
 
+NeoReader sometimes writes a malformed incremental cross-reference stream even
+though it can reopen the PDF itself. The converter now retries those files
+through `qpdf` automatically. Install `qpdf` or set `INKBRIDGE_QPDF` to its
+executable when the converter reports that recovery is unavailable.
+
 The result contains portable, page-normalized operations:
 
 - `upsert_stroke` for new or changed handwriting;
@@ -66,6 +71,17 @@ The plugin resolves an existing native stroke by:
 Updates insert the replacement before deleting the superseded native element,
 matching the behavior validated on the Nomad. Re-running the same package is
 idempotent and reports already-current or already-absent operations as skipped.
+The plugin scans each affected page once and batches its insertions and
+deletions, avoiding a full native-stroke rescan after every operation.
+
+An embedded manifest is a point-in-time, one-way change set. Do not reapply an
+old package after editing its imported strokes on Supernote: the package will
+correctly reassert the older BOOX state. Export and merge the newer Supernote
+state before generating the next return manifest.
+
+The Note Air 4C -> Nomad hardware proof completed 19 operations in about 1.25
+seconds after the page scan with the batched implementation. The imported BOOX
+stroke remained lassoable, movable, and erasable as native Supernote ink.
 
 ## Logs
 
