@@ -135,6 +135,7 @@ export function strokeDescriptor(snapshot) {
   }
   return {
     pointCount: samples.length,
+    samples: samples.map(([x, y, pressure]) => [x, y, pressure ?? 0]),
     minX,
     maxX,
     minY,
@@ -152,7 +153,18 @@ export function descriptorMatches(left, right, tolerance = 0.003) {
   if (left.nativeStyle.thickness !== right.nativeStyle.thickness) return false;
   if (left.nativeStyle.penColor !== right.nativeStyle.penColor) return false;
   if (left.nativeStyle.penType !== right.nativeStyle.penType) return false;
-  return ['minX', 'maxX', 'minY', 'maxY'].every(
-    key => Math.abs(left[key] - right[key]) <= tolerance,
+  if (
+    !['minX', 'maxX', 'minY', 'maxY'].every(
+      key => Math.abs(left[key] - right[key]) <= tolerance,
+    )
+  ) {
+    return false;
+  }
+  if (left.samples.length !== right.samples.length) return false;
+  return left.samples.every(
+    ([x, y, pressure], index) =>
+      Math.abs(x - right.samples[index][0]) <= tolerance &&
+      Math.abs(y - right.samples[index][1]) <= tolerance &&
+      Math.abs(pressure - right.samples[index][2]) <= 1,
   );
 }

@@ -53,14 +53,16 @@ impl Matrix {
         )
     }
 
-    fn then(self, next: Self) -> Self {
+    fn concatenate(self, operand: Self) -> Self {
+        // PDF's `cm` operator post-multiplies its operand onto the current
+        // transformation matrix in this column-vector representation.
         Self {
-            a: next.a * self.a + next.c * self.b,
-            b: next.b * self.a + next.d * self.b,
-            c: next.a * self.c + next.c * self.d,
-            d: next.b * self.c + next.d * self.d,
-            e: next.a * self.e + next.c * self.f + next.e,
-            f: next.b * self.e + next.d * self.f + next.f,
+            a: self.a * operand.a + self.c * operand.b,
+            b: self.b * operand.a + self.d * operand.b,
+            c: self.a * operand.c + self.c * operand.d,
+            d: self.b * operand.c + self.d * operand.d,
+            e: self.a * operand.e + self.c * operand.f + self.e,
+            f: self.b * operand.e + self.d * operand.f + self.f,
         }
     }
 }
@@ -289,7 +291,7 @@ fn extract_onyx_stroke(
                     .map(number)
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| "BOOX appearance has a non-numeric cm matrix".to_owned())?;
-                matrix = matrix.then(Matrix {
+                matrix = matrix.concatenate(Matrix {
                     a: values[0],
                     b: values[1],
                     c: values[2],
@@ -643,6 +645,32 @@ mod tests {
         assert_eq!(stroke.source_uuid, "boox-stroke");
         assert_eq!(stroke.samples.len(), 2);
         assert_eq!(stroke.samples[0][2], 790.0);
+        assert!((stroke.samples[1][0] - 0.2).abs() < 0.000_001);
+        assert!((stroke.samples[1][1] - 0.3).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn concatenates_appearance_matrices_in_pdf_ctm_order() {
+        let mut document = Document::new();
+        let appearance = Stream::new(
+            dictionary! {
+                "Matrix" => vec![1.into(), 0.into(), 0.into(), 1.into(), 60.into(), 600.into()]
+            },
+            b".795 w 2 0 0 2 0 0 cm 0 0 m 30 -20 l S".to_vec(),
+        );
+        let appearance_id = document.add_object(appearance);
+        let annotation = dictionary! {
+            "Subtype" => "Stamp",
+            "Name" => "#ONYX-STROKE",
+            "onyxtag" => Object::string_literal(
+                r#"{"id":"transformed-boox-stroke","type":"BrushStroke"}"#
+            ),
+            "AP" => dictionary! {"N" => appearance_id},
+        };
+
+        let stroke = extract_onyx_stroke(&document, &annotation, 0, test_geometry()).unwrap();
+        assert!((stroke.samples[0][0] - 0.1).abs() < 0.000_001);
+        assert!((stroke.samples[0][1] - 0.25).abs() < 0.000_001);
         assert!((stroke.samples[1][0] - 0.2).abs() < 0.000_001);
         assert!((stroke.samples[1][1] - 0.3).abs() < 0.000_001);
     }

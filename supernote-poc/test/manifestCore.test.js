@@ -50,6 +50,26 @@ test('descriptor fallback does not match ink from another native layer', () => {
   assert.equal(descriptorMatches(original, otherLayer), false);
 });
 
+test('descriptor fallback compares the complete stroke path', () => {
+  const original = strokeDescriptor({
+    nativeStyle: style,
+    samples: [
+      [0.1, 0.2, 1000],
+      [0.15, 0.25, 1050],
+      [0.2, 0.3, 1100],
+    ],
+  });
+  const sameBoundsDifferentPath = strokeDescriptor({
+    nativeStyle: style,
+    samples: [
+      [0.1, 0.2, 1000],
+      [0.18, 0.22, 1050],
+      [0.2, 0.3, 1100],
+    ],
+  });
+  assert.equal(descriptorMatches(original, sameBoundsDifferentPath), false);
+});
+
 test('manifest validation rejects an unconfigured plugin', () => {
   assert.throws(() => validateManifest(null), /no InkBridge manifest/);
 });
