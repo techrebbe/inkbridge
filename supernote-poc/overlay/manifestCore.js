@@ -30,6 +30,7 @@ export function liveSnapshotMatches(
   const sourceStyle = sourceSnapshot.nativeStyle;
   if (!liveStyle || !sourceStyle) return false;
   if (
+    liveStyle.layerNum !== (sourceStyle.layerNum ?? 0) ||
     liveStyle.thickness !== sourceStyle.thickness ||
     liveStyle.penColor !== supernotePenColor(sourceStyle.penColor) ||
     liveStyle.penType !== sourceStyle.penType
@@ -65,7 +66,7 @@ function fnv1a32(text) {
 
 export function geometryFingerprint(nativeStyle, samples) {
   const prefix =
-    `${nativeStyle.thickness}|${nativeStyle.penColor}|${nativeStyle.penType}|`;
+    `${nativeStyle.layerNum ?? 0}|${nativeStyle.thickness}|${nativeStyle.penColor}|${nativeStyle.penType}|`;
   const canonical = samples
     .map(
       ([x, y, pressure]) =>
@@ -75,6 +76,14 @@ export function geometryFingerprint(nativeStyle, samples) {
   return `fnv1a32:${fnv1a32(prefix + canonical)
     .toString(16)
     .padStart(8, '0')}`;
+}
+
+export function operationSafetyPhases(operations) {
+  const indexed = operations.map((operation, index) => ({operation, index}));
+  return [
+    indexed.filter(({operation}) => operation.type === 'upsert_stroke'),
+    indexed.filter(({operation}) => operation.type === 'delete_stroke'),
+  ].filter(phase => phase.length > 0);
 }
 
 export function validateManifest(manifest) {

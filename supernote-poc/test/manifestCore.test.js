@@ -4,6 +4,7 @@ import {
   descriptorMatches,
   geometryFingerprint,
   liveSnapshotMatches,
+  operationSafetyPhases,
   strokeDescriptor,
   supernotePenColor,
   validateManifest,
@@ -21,7 +22,11 @@ const samples = [
 ];
 
 test('geometry fingerprint is stable across Rust and JavaScript', () => {
-  assert.equal(geometryFingerprint(style, samples), 'fnv1a32:ab10185f');
+  assert.equal(geometryFingerprint(style, samples), 'fnv1a32:c1d82be3');
+  assert.notEqual(
+    geometryFingerprint(style, samples),
+    geometryFingerprint({...style, layerNum: 1}, samples),
+  );
 });
 
 test('descriptor matching tolerates tiny native coordinate round trips', () => {
@@ -95,4 +100,30 @@ test('tagged stroke must retain its transformed live geometry', () => {
     ]),
   };
   assert.equal(liveSnapshotMatches(moved, source, -0.0008), false);
+
+  const movedLayer = {
+    ...current,
+    nativeStyle: {...current.nativeStyle, layerNum: 1},
+  };
+  assert.equal(liveSnapshotMatches(movedLayer, source, -0.0008), false);
+});
+
+test('cross-page destinations are scheduled before explicit source deletions', () => {
+  const phases = operationSafetyPhases([
+    {type: 'delete_stroke', sourceUuid: 'moved', pageIndex: 0},
+    {type: 'upsert_stroke', sourceUuid: 'moved', pageIndex: 1},
+    {type: 'upsert_stroke', sourceUuid: 'added', pageIndex: 0},
+  ]);
+
+  assert.deepEqual(
+    phases.map(phase => phase.map(({operation}) => operation.type)),
+    [
+      ['upsert_stroke', 'upsert_stroke'],
+      ['delete_stroke'],
+    ],
+  );
+  assert.deepEqual(
+    phases.flat().map(({index}) => index),
+    [1, 2, 0],
+  );
 });

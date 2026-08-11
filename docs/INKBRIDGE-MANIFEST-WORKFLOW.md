@@ -48,7 +48,7 @@ The result contains portable, page-normalized operations:
 - `delete_stroke` for a baseline stroke no longer present in the embedded PDF;
 - stable source identities;
 - native Supernote style and pressure data where the baseline supplies them;
-- a deterministic geometry fingerprint for safe repeated application.
+- a deterministic geometry/style/layer fingerprint for safe repeated application.
 
 Native BOOX `#ONYX-STROKE` geometry comes from NeoReader's vector `/AP`
 appearance stream, which the Note Air 4C hardware proof established as the
@@ -85,8 +85,10 @@ An InkBridge tag alone is not treated as proof that a stroke is current: the
 plugin also verifies the live native geometry after applying the Supernote
 color and coordinate transforms, so lasso edits are not hidden by stale tag
 metadata.
-The plugin scans each affected page once and batches its insertions and
-deletions, avoiding a full native-stroke rescan after every operation.
+The plugin applies all upserts before any explicit deletes so an interrupted
+cross-page move cannot remove the only native copy. It scans each affected page
+at most once per safety phase and batches the phase's changes, avoiding a full
+native-stroke rescan after every operation.
 
 An embedded manifest is a point-in-time, one-way change set. Do not reapply an
 old package after editing its imported strokes on Supernote: the package will

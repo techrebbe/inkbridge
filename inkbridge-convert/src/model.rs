@@ -94,8 +94,8 @@ pub struct Manifest {
 
 pub fn geometry_fingerprint(style: &NativeStyle, samples: &[Sample]) -> String {
     let mut canonical = format!(
-        "{}|{}|{}|",
-        style.thickness, style.pen_color, style.pen_type
+        "{}|{}|{}|{}|",
+        style.layer_num, style.thickness, style.pen_color, style.pen_type
     );
     for [x, y, pressure] in samples {
         canonical.push_str(&format!(
@@ -127,7 +127,15 @@ mod tests {
         let first = geometry_fingerprint(&style, &[[0.1, 0.2, 1000.0]]);
         let same = geometry_fingerprint(&style, &[[0.100_000_01, 0.2, 1000.0]]);
         let changed = geometry_fingerprint(&style, &[[0.11, 0.2, 1000.0]]);
+        let changed_layer = geometry_fingerprint(
+            &NativeStyle {
+                layer_num: 1,
+                ..style.clone()
+            },
+            &[[0.1, 0.2, 1000.0]],
+        );
         assert_eq!(first, same);
         assert_ne!(first, changed);
+        assert_ne!(first, changed_layer);
     }
 }

@@ -8,6 +8,7 @@ import {
   descriptorMatches,
   geometryFingerprint,
   liveSnapshotMatches,
+  operationSafetyPhases,
   parseUserData,
   supernotePenColor,
   strokeDescriptor,
@@ -249,9 +250,9 @@ async function deleteTargets(filePath, pageIndex, targets) {
   );
 }
 
-function operationsByPage(operations) {
+function operationsByPage(indexedOperations) {
   const pages = new Map();
-  operations.forEach((operation, index) => {
+  indexedOperations.forEach(({operation, index}) => {
     const page = pages.get(operation.pageIndex) ?? [];
     page.push({operation, index});
     pages.set(operation.pageIndex, page);
@@ -385,18 +386,21 @@ export async function applyEmbeddedManifest() {
     manifest.coordinateTransform?.pdfToSupernoteNormalizedYOffset ?? 0;
   const counts = {added: 0, updated: 0, deleted: 0, skipped: 0};
 
-  for (const [pageIndex, indexedOperations] of operationsByPage(
-    manifest.operations,
-  )) {
-    await applyPage({
-      filePath,
-      pageIndex,
-      indexedOperations,
-      operationCount: manifest.operations.length,
-      yOffset,
-      manifestId: manifest.manifestId,
-      counts,
-    });
+  // Complete every destination insertion before processing explicit source
+  // deletions. If a cross-page move is interrupted, this ordering can leave a
+  // repairable duplicate but never removes the only native copy.
+  for (const phase of operationSafetyPhases(manifest.operations)) {
+    for (const [pageIndex, indexedOperations] of operationsByPage(phase)) {
+      await applyPage({
+        filePath,
+        pageIndex,
+        indexedOperations,
+        operationCount: manifest.operations.length,
+        yOffset,
+        manifestId: manifest.manifestId,
+        counts,
+      });
+    }
   }
 
   await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
