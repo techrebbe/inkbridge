@@ -33,6 +33,9 @@ pub fn write_boox_view(
     let mut document = Document::load_mem(original_pdf)
         .map_err(|error| format!("could not load immutable original PDF: {error}"))?;
     let pages = document.get_pages();
+    for page_id in pages.values() {
+        strip_supported_ink_annotations(&mut document, *page_id)?;
+    }
     let mut by_page = BTreeMap::<u32, Vec<StrokeSnapshot>>::new();
     for stroke in strokes {
         if stroke.samples.len() >= 2 {
@@ -59,6 +62,84 @@ pub fn write_boox_view(
         .save_to(&mut output)
         .map_err(|error| format!("could not serialize BOOX PDF view: {error}"))?;
     Ok(output)
+}
+
+fn strip_supported_ink_annotations(
+    document: &mut Document,
+    page_id: ObjectId,
+) -> Result<(), String> {
+    let annots = document
+        .get_dictionary(page_id)
+        .map_err(|error| format!("could not read page annotations: {error}"))?
+        .get(b"Annots")
+        .ok()
+        .cloned();
+    let Some(annots) = annots else {
+        return Ok(());
+    };
+    let (array_id, entries) = match annots {
+        Object::Reference(id) => (
+            Some(id),
+            document
+                .get_object(id)
+                .map_err(|error| format!("could not resolve page annotation array: {error}"))?
+                .as_array()
+                .map_err(|_| "page /Annots reference is not an array".to_owned())?
+                .clone(),
+        ),
+        Object::Array(entries) => (None, entries),
+        _ => return Err("page /Annots is not an array".to_owned()),
+    };
+    let retained = entries
+        .into_iter()
+        .filter(|annotation| !is_supported_ink_annotation(document, annotation))
+        .collect::<Vec<_>>();
+    if let Some(array_id) = array_id {
+        *document
+            .get_object_mut(array_id)
+            .map_err(|error| format!("could not update page annotation array: {error}"))?
+            .as_array_mut()
+            .map_err(|_| "page /Annots reference is not an array".to_owned())? = retained;
+    } else {
+        document
+            .get_dictionary_mut(page_id)
+            .map_err(|error| format!("could not update page annotations: {error}"))?
+            .set("Annots", retained);
+    }
+    Ok(())
+}
+
+fn is_supported_ink_annotation(document: &Document, annotation: &Object) -> bool {
+    let dictionary = match annotation {
+        Object::Reference(id) => document.get_dictionary(*id).ok(),
+        Object::Dictionary(dictionary) => Some(dictionary),
+        _ => None,
+    };
+    let Some(dictionary) = dictionary else {
+        return false;
+    };
+    if dictionary
+        .get(b"Subtype")
+        .is_ok_and(|value| object_name_is(document, value, b"Ink"))
+    {
+        return true;
+    }
+    dictionary
+        .get(b"Subtype")
+        .is_ok_and(|value| object_name_is(document, value, b"Stamp"))
+        && dictionary
+            .get(b"Name")
+            .is_ok_and(|value| object_name_is(document, value, b"#ONYX-STROKE"))
+}
+
+fn object_name_is(document: &Document, object: &Object, expected: &[u8]) -> bool {
+    match object {
+        Object::Name(name) => name == expected,
+        Object::Reference(id) => document
+            .get_object(*id)
+            .is_ok_and(|value| object_name_is(document, value, expected)),
+        _ => false,
+    }
 }
 
 fn make_ink_annotation(
@@ -247,6 +328,83 @@ fn real(value: f64) -> Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn original_with_ink_and_highlight() -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let ink_id = document.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("original-ink"),
+            "InkList" => vec![Object::Array(vec![10.into(), 10.into(), 20.into(), 20.into()])],
+        });
+        let highlight_id = document.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Highlight",
+            "NM" => Object::string_literal("keep-highlight"),
+            "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+        });
+        let annots_id =
+            document.add_object(Object::Array(vec![ink_id.into(), highlight_id.into()]));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {},
+            "Annots" => annots_id,
+        });
+        document.objects.insert(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }
+            .into(),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn annotation_subtypes(bytes: &[u8]) -> Vec<String> {
+        let document = Document::load_mem(bytes).unwrap();
+        let page_id = *document.get_pages().get(&1).unwrap();
+        document
+            .get_page_annotations(page_id)
+            .unwrap()
+            .into_iter()
+            .map(|annotation| {
+                String::from_utf8_lossy(annotation.get(b"Subtype").unwrap().as_name().unwrap())
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generated_view_replaces_original_ink_but_preserves_other_annotations() {
+        let original = original_with_ink_and_highlight();
+        let without_canonical = write_boox_view(&original, []).unwrap();
+        assert_eq!(annotation_subtypes(&without_canonical), ["Highlight"]);
+
+        let style = inkbridge_convert::NativeStyle::default();
+        let samples = vec![[0.2, 0.3, 900.0], [0.3, 0.4, 1000.0]];
+        let canonical = StrokeSnapshot {
+            source_uuid: "original-ink".to_owned(),
+            origin: "canonical".to_owned(),
+            page_index: 0,
+            geometry_fingerprint: inkbridge_convert::geometry_fingerprint(&style, &samples),
+            native_style: style,
+            samples,
+        };
+        let with_canonical = write_boox_view(&original, [canonical]).unwrap();
+        assert_eq!(annotation_subtypes(&with_canonical), ["Highlight", "Ink"]);
+    }
 
     #[test]
     fn rotated_geometry_round_trips_display_coordinates() {
