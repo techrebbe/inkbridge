@@ -167,6 +167,12 @@ fn extract_standard_ink(
     if paths.is_empty() {
         return Err("standard /Ink annotation has an empty /InkList".to_owned());
     }
+    if paths.len() > 1 {
+        return Err(
+            "standard /Ink annotation groups multiple paths without stable per-path identities"
+                .to_owned(),
+        );
+    }
 
     let width = annotation
         .get(b"BS")
@@ -183,43 +189,28 @@ fn extract_standard_ink(
         pen_type: 10,
     };
     let pressure = width_to_pressure(width);
-    paths
-        .iter()
-        .enumerate()
-        .map(|(path_index, path)| {
-            let coordinates = resolve(document, path)?
-                .as_array()
-                .map_err(|_| format!("standard /Ink path {path_index} is not an array"))?;
-            if coordinates.len() < 4 || coordinates.len() % 2 != 0 {
-                return Err(format!(
-                    "standard /Ink path {path_index} contains invalid coordinate pairs"
-                ));
-            }
-            let mut samples = Vec::with_capacity(coordinates.len() / 2);
-            for pair in coordinates.chunks_exact(2) {
-                let x = number(&pair[0])
-                    .ok_or_else(|| format!("non-numeric /Ink x coordinate in path {path_index}"))?;
-                let y = number(&pair[1])
-                    .ok_or_else(|| format!("non-numeric /Ink y coordinate in path {path_index}"))?;
-                let (normalized_x, normalized_y) = geometry.normalize(x, y);
-                samples.push([normalized_x, normalized_y, pressure]);
-            }
-            let source_uuid = if path_index == 0 {
-                base_source_uuid.clone()
-            } else {
-                format!("{base_source_uuid}#ink-path-{path_index}")
-            };
-            let geometry_fingerprint = geometry_fingerprint(&style, &samples);
-            Ok(StrokeSnapshot {
-                source_uuid,
-                origin: "pdf-ink".to_owned(),
-                page_index,
-                native_style: style.clone(),
-                samples,
-                geometry_fingerprint,
-            })
-        })
-        .collect()
+    let coordinates = resolve(document, &paths[0])?
+        .as_array()
+        .map_err(|_| "standard /Ink path is not an array".to_owned())?;
+    if coordinates.len() < 4 || coordinates.len() % 2 != 0 {
+        return Err("standard /Ink path contains invalid coordinate pairs".to_owned());
+    }
+    let mut samples = Vec::with_capacity(coordinates.len() / 2);
+    for pair in coordinates.chunks_exact(2) {
+        let x = number(&pair[0]).ok_or_else(|| "non-numeric /Ink x coordinate".to_owned())?;
+        let y = number(&pair[1]).ok_or_else(|| "non-numeric /Ink y coordinate".to_owned())?;
+        let (normalized_x, normalized_y) = geometry.normalize(x, y);
+        samples.push([normalized_x, normalized_y, pressure]);
+    }
+    let geometry_fingerprint = geometry_fingerprint(&style, &samples);
+    Ok(vec![StrokeSnapshot {
+        source_uuid: base_source_uuid,
+        origin: "pdf-ink".to_owned(),
+        page_index,
+        native_style: style,
+        samples,
+        geometry_fingerprint,
+    }])
 }
 
 fn extract_onyx_stroke(
@@ -571,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_every_standard_ink_path_with_stable_ids() {
+    fn rejects_grouped_standard_ink_without_per_path_ids() {
         let document = Document::new();
         let annotation = dictionary! {
             "Subtype" => "Ink",
@@ -583,12 +574,9 @@ mod tests {
             "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
             "C" => vec![0.into(), 0.into(), 0.into()],
         };
-        let strokes = extract_standard_ink(&document, &annotation, 0, test_geometry()).unwrap();
-        assert_eq!(strokes.len(), 2);
-        assert_eq!(strokes[0].source_uuid, "grouped-ink");
-        assert_eq!(strokes[1].source_uuid, "grouped-ink#ink-path-1");
-        assert!((strokes[0].samples[0][0] - 0.1).abs() < 0.000_001);
-        assert!((strokes[1].samples[0][0] - 0.3).abs() < 0.000_001);
+        let error = extract_standard_ink(&document, &annotation, 0, test_geometry())
+            .expect_err("grouped paths cannot be tracked safely by mutable array position");
+        assert!(error.contains("without stable per-path identities"));
     }
 
     #[test]

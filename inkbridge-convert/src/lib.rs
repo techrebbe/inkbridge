@@ -36,48 +36,9 @@ pub fn build_manifest(
         }
         baseline_strokes.extend(export.strokes);
     }
+    validate_baseline_pages(&baseline_strokes, page_count)?;
     let baseline = index_baseline(baseline_strokes);
-    let baseline_pages = baseline
-        .values()
-        .map(|stroke| stroke.page_index)
-        .collect::<HashSet<_>>();
-    let mut active_ids = HashSet::new();
-    let mut operations = Vec::new();
-    let mut unchanged = 0usize;
-
-    for mut after in extracted {
-        active_ids.insert(after.source_uuid.clone());
-        let before = baseline.get(&after.source_uuid).cloned();
-        if let Some(before) = &before {
-            if after.origin == "pdf-ink" {
-                after.native_style = before.native_style.clone();
-                preserve_pressure_profile(&before.samples, &mut after.samples);
-                after.geometry_fingerprint =
-                    geometry_fingerprint(&after.native_style, &after.samples);
-            }
-            if after.geometry_fingerprint == before.geometry_fingerprint {
-                unchanged += 1;
-                continue;
-            }
-        }
-        operations.push(Operation::UpsertStroke {
-            source_uuid: after.source_uuid.clone(),
-            page_index: after.page_index,
-            before,
-            after,
-        });
-    }
-
-    for before in baseline.values() {
-        if should_infer_deletion(before, &baseline_pages, &active_ids, &incomplete_pages) {
-            operations.push(Operation::DeleteStroke {
-                source_uuid: before.source_uuid.clone(),
-                page_index: before.page_index,
-                before: before.clone(),
-            });
-        }
-    }
-    operations.sort_by(|left, right| operation_key(left).cmp(&operation_key(right)));
+    let (operations, unchanged) = diff_strokes(extracted, &baseline, &incomplete_pages);
 
     let upserted = operations
         .iter()
@@ -122,6 +83,83 @@ pub fn build_manifest(
             skipped,
         },
     })
+}
+
+fn validate_baseline_pages(strokes: &[StrokeSnapshot], page_count: usize) -> Result<(), String> {
+    if let Some(stroke) = strokes
+        .iter()
+        .find(|stroke| stroke.page_index as usize >= page_count)
+    {
+        return Err(format!(
+            "baseline stroke {} references page {}, but the returned PDF has only {page_count} pages",
+            stroke.source_uuid,
+            stroke.page_index + 1
+        ));
+    }
+    Ok(())
+}
+
+fn diff_strokes(
+    extracted: Vec<StrokeSnapshot>,
+    baseline: &HashMap<String, StrokeSnapshot>,
+    incomplete_pages: &HashSet<u32>,
+) -> (Vec<Operation>, usize) {
+    let baseline_pages = baseline
+        .values()
+        .map(|stroke| stroke.page_index)
+        .collect::<HashSet<_>>();
+    let mut active_ids = HashSet::new();
+    let mut operations = Vec::new();
+    let mut unchanged = 0usize;
+
+    for mut after in extracted {
+        active_ids.insert(after.source_uuid.clone());
+        let before = baseline.get(&after.source_uuid).cloned();
+        if let Some(before) = &before {
+            if after.origin == "pdf-ink" {
+                after.native_style = before.native_style.clone();
+                preserve_pressure_profile(&before.samples, &mut after.samples);
+                after.geometry_fingerprint =
+                    geometry_fingerprint(&after.native_style, &after.samples);
+            }
+            if after.page_index != before.page_index {
+                operations.push(Operation::DeleteStroke {
+                    source_uuid: before.source_uuid.clone(),
+                    page_index: before.page_index,
+                    before: before.clone(),
+                });
+                operations.push(Operation::UpsertStroke {
+                    source_uuid: after.source_uuid.clone(),
+                    page_index: after.page_index,
+                    before: None,
+                    after,
+                });
+                continue;
+            }
+            if after.geometry_fingerprint == before.geometry_fingerprint {
+                unchanged += 1;
+                continue;
+            }
+        }
+        operations.push(Operation::UpsertStroke {
+            source_uuid: after.source_uuid.clone(),
+            page_index: after.page_index,
+            before,
+            after,
+        });
+    }
+
+    for before in baseline.values() {
+        if should_infer_deletion(before, &baseline_pages, &active_ids, &incomplete_pages) {
+            operations.push(Operation::DeleteStroke {
+                source_uuid: before.source_uuid.clone(),
+                page_index: before.page_index,
+                before: before.clone(),
+            });
+        }
+    }
+    operations.sort_by(|left, right| operation_key(left).cmp(&operation_key(right)));
+    (operations, unchanged)
 }
 
 fn should_infer_deletion(
@@ -176,6 +214,20 @@ pub fn baseline_by_id(
 mod tests {
     use super::*;
 
+    fn test_stroke(source_uuid: &str, page_index: u32) -> StrokeSnapshot {
+        let native_style = NativeStyle::default();
+        let samples = vec![[0.1, 0.2, 1000.0], [0.2, 0.3, 1100.0]];
+        let geometry_fingerprint = geometry_fingerprint(&native_style, &samples);
+        StrokeSnapshot {
+            source_uuid: source_uuid.to_owned(),
+            origin: "supernote-native".to_owned(),
+            page_index,
+            native_style,
+            samples,
+            geometry_fingerprint,
+        }
+    }
+
     #[test]
     fn pressure_profile_resamples_without_losing_endpoints() {
         let before = vec![[0.0, 0.0, 100.0], [0.0, 0.0, 200.0], [0.0, 0.0, 300.0]];
@@ -206,5 +258,45 @@ mod tests {
             })
             .count();
         assert_eq!(deletions, 0);
+    }
+
+    #[test]
+    fn cross_page_stroke_is_deleted_from_source_and_inserted_on_destination() {
+        let before = test_stroke("moved-stroke", 0);
+        let mut after = before.clone();
+        after.page_index = 1;
+        let baseline = HashMap::from([(before.source_uuid.clone(), before.clone())]);
+
+        let (operations, unchanged) = diff_strokes(vec![after.clone()], &baseline, &HashSet::new());
+
+        assert_eq!(unchanged, 0);
+        assert_eq!(operations.len(), 2);
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            Operation::DeleteStroke {
+                source_uuid,
+                page_index: 0,
+                before: deleted,
+            } if source_uuid == "moved-stroke" && deleted == &before
+        )));
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            Operation::UpsertStroke {
+                source_uuid,
+                page_index: 1,
+                before: None,
+                after: inserted,
+            } if source_uuid == "moved-stroke" && inserted == &after
+        )));
+    }
+
+    #[test]
+    fn baseline_page_must_exist_in_returned_pdf() {
+        let baseline = vec![test_stroke("out-of-range", 2)];
+        let error = validate_baseline_pages(&baseline, 2)
+            .expect_err("a zero-based page index equal to page count is invalid");
+        assert!(error.contains("out-of-range"));
+        assert!(error.contains("page 3"));
+        assert!(error.contains("2 pages"));
     }
 }
