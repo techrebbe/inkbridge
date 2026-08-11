@@ -148,7 +148,7 @@ impl FirestoreCanonicalStateStore {
         let response = self.transport.execute(HttpRequest {
             method: "POST".to_owned(),
             url: format!(
-                "{}/projects/{}/databases/{}:commit",
+                "{}/projects/{}/databases/{}/documents:commit",
                 self.api_base,
                 encode(&self.project_id),
                 encode(&self.database_id)
@@ -392,6 +392,8 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0]["currentDocument"]["exists"], false);
         assert_eq!(writes[1]["currentDocument"]["exists"], false);
-        assert!(requests[1].url.ends_with("databases/%28default%29:commit"));
+        assert!(requests[1]
+            .url
+            .ends_with("databases/%28default%29/documents:commit"));
     }
 }

@@ -3,6 +3,7 @@ use inkbridge_broker::{
     StoredObject,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -472,7 +473,7 @@ impl BrokerStorage for CloudBrokerStorage {
                 });
             }
         }
-        let commit_id = commit_id(&document_id, &state_write, &object_writes)?;
+        let commit_id = commit_id(&document_id, &state_write, &object_writes);
         let staged_state =
             self.stage_payload(&document_id, &commit_id, state_index, &state_write, true)?;
         let staged_objects = object_writes
@@ -533,10 +534,41 @@ fn commit_id(
     document_id: &str,
     state_write: &ConditionalWrite,
     object_writes: &[ConditionalWrite],
-) -> Result<String, CommitError> {
-    let bytes = serde_json::to_vec(&(document_id, state_write, object_writes))
-        .map_err(|error| CommitError::Other(error.to_string()))?;
-    Ok(format!("commit-{}", sha256_hex(&bytes)))
+) -> String {
+    let mut digest = Sha256::new();
+    hash_field(&mut digest, document_id.as_bytes());
+    hash_write(&mut digest, state_write);
+    digest.update((object_writes.len() as u64).to_be_bytes());
+    for write in object_writes {
+        hash_write(&mut digest, write);
+    }
+    let hash = digest.finalize();
+    format!("commit-{hash:x}")
+}
+
+fn hash_write(digest: &mut Sha256, write: &ConditionalWrite) {
+    hash_field(digest, write.path.as_bytes());
+    match write.precondition {
+        GenerationPrecondition::DoesNotExist => digest.update([0]),
+        GenerationPrecondition::Match(generation) => {
+            digest.update([1]);
+            digest.update(generation.to_be_bytes());
+        }
+    }
+    digest.update((write.metadata.len() as u64).to_be_bytes());
+    for (key, value) in &write.metadata {
+        hash_field(digest, key.as_bytes());
+        hash_field(digest, value.as_bytes());
+    }
+    // Hash the binary payload directly. Serializing Vec<u8> as JSON expands
+    // every byte into a decimal array element and can multiply peak memory for
+    // a normal multi-megabyte PDF.
+    hash_field(digest, &write.bytes);
+}
+
+fn hash_field(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
 }
 
 fn document_id_from_state_path(path: &str) -> Option<&str> {
@@ -627,5 +659,22 @@ mod tests {
         let record = states.record("doc").unwrap_or_default();
         assert!(record.active.is_none());
         assert!(record.pending.is_none());
+    }
+
+    #[test]
+    fn commit_id_hashes_binary_payloads_and_every_generation_guard() {
+        let writes = writes();
+        let state = writes.last().unwrap();
+        let objects = &writes[..writes.len() - 1];
+        let original = commit_id("doc", state, objects);
+        assert_eq!(original, commit_id("doc", state, objects));
+
+        let mut changed_bytes = objects.to_vec();
+        changed_bytes[0].bytes.push(0);
+        assert_ne!(original, commit_id("doc", state, &changed_bytes));
+
+        let mut changed_guard = objects.to_vec();
+        changed_guard[0].precondition = GenerationPrecondition::Match(7);
+        assert_ne!(original, commit_id("doc", state, &changed_guard));
     }
 }
