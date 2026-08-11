@@ -61,5 +61,21 @@ fn required_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result
 }
 
 fn usage() -> String {
-    "Usage:\n  inkbridge-convert extract --pdf <NeoReader-embedded.pdf> \\\n+    --baseline <Supernote-page-export.log|json> [--baseline ...] \\\n+    --output <inkbridge-manifest.json> [--y-offset -0.0008]".to_owned()
+    "Usage:\n  inkbridge-convert extract --pdf <NeoReader-embedded.pdf> \\\n    --baseline <Supernote-page-export.log|json> [--baseline ...] \\\n    --output <inkbridge-manifest.json> [--y-offset -0.0008]".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_continuation_lines_are_copyable_shell_arguments() {
+        let text = usage();
+        assert!(text
+            .lines()
+            .skip(1)
+            .all(|line| !line.trim().starts_with('+')));
+        assert!(text.contains("\n    --baseline"));
+        assert!(text.contains("\n    --output"));
+    }
 }
