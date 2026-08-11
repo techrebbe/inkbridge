@@ -51,6 +51,10 @@ The result contains portable, page-normalized operations:
 Native BOOX `#ONYX-STROKE` geometry comes from NeoReader's vector `/AP`
 appearance stream, which the Note Air 4C hardware proof established as the
 rendered source of truth. Standard PDF `/Ink` geometry comes from `/InkList`.
+Every path in a grouped `/InkList` is retained with a stable path-derived
+identity. If any supported annotation on a page cannot be extracted, deletion
+inference is disabled for that page so damaged PDF data cannot erase valid
+Supernote ink.
 
 ## 4. Build the Supernote sync package
 

@@ -2,6 +2,7 @@ use crate::model::{geometry_fingerprint, NativeStyle, Sample, StrokeSnapshot};
 use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object, Stream};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
@@ -56,11 +57,14 @@ impl Matrix {
     }
 }
 
-pub fn extract_pdf_strokes(path: &Path) -> Result<(usize, Vec<StrokeSnapshot>, usize), String> {
+pub fn extract_pdf_strokes(
+    path: &Path,
+) -> Result<(usize, Vec<StrokeSnapshot>, usize, HashSet<u32>), String> {
     let document = load_neoreader_pdf(path)?;
     let pages = document.get_pages();
     let mut strokes = Vec::new();
     let mut skipped = 0usize;
+    let mut incomplete_pages = HashSet::new();
 
     for (page_number, page_id) in &pages {
         let page_index = page_number.saturating_sub(1);
@@ -74,16 +78,16 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<(usize, Vec<StrokeSnapshot>, u
 
         for annotation in annotations {
             match extract_annotation(&document, annotation, page_index, geometry) {
-                Ok(Some(stroke)) => strokes.push(stroke),
-                Ok(None) => {}
+                Ok(extracted) => strokes.extend(extracted),
                 Err(error) => {
                     eprintln!("warning: skipped annotation on page {page_number}: {error}");
                     skipped += 1;
+                    incomplete_pages.insert(page_index);
                 }
             }
         }
     }
-    Ok((pages.len(), strokes, skipped))
+    Ok((pages.len(), strokes, skipped, incomplete_pages))
 }
 
 fn load_neoreader_pdf(path: &Path) -> Result<Document, String> {
@@ -135,14 +139,15 @@ fn extract_annotation(
     annotation: &Dictionary,
     page_index: u32,
     geometry: PageGeometry,
-) -> Result<Option<StrokeSnapshot>, String> {
+) -> Result<Vec<StrokeSnapshot>, String> {
     let subtype = name(annotation.get(b"Subtype").ok());
     match subtype.as_deref() {
-        Some("Ink") => extract_standard_ink(document, annotation, page_index, geometry).map(Some),
+        Some("Ink") => extract_standard_ink(document, annotation, page_index, geometry),
         Some("Stamp") if name(annotation.get(b"Name").ok()).as_deref() == Some("#ONYX-STROKE") => {
-            extract_onyx_stroke(document, annotation, page_index, geometry).map(Some)
+            extract_onyx_stroke(document, annotation, page_index, geometry)
+                .map(|stroke| vec![stroke])
         }
-        _ => Ok(None),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -151,22 +156,16 @@ fn extract_standard_ink(
     annotation: &Dictionary,
     page_index: u32,
     geometry: PageGeometry,
-) -> Result<StrokeSnapshot, String> {
-    let source_uuid = pdf_string(annotation.get(b"NM").ok())
+) -> Result<Vec<StrokeSnapshot>, String> {
+    let base_source_uuid = pdf_string(annotation.get(b"NM").ok())
         .or_else(|| onyx_tag_id(annotation))
         .ok_or_else(|| "standard /Ink annotation has no /NM or Onyx id".to_owned())?;
     let ink_list = resolve(document, annotation.get(b"InkList").map_err(display_error)?)?;
     let paths = ink_list
         .as_array()
         .map_err(|_| "standard /Ink annotation has an invalid /InkList".to_owned())?;
-    let first_path = paths
-        .first()
-        .ok_or_else(|| "standard /Ink annotation has an empty /InkList".to_owned())?;
-    let coordinates = resolve(document, first_path)?
-        .as_array()
-        .map_err(|_| "standard /Ink path is not an array".to_owned())?;
-    if coordinates.len() < 4 || coordinates.len() % 2 != 0 {
-        return Err("standard /Ink path contains invalid coordinate pairs".to_owned());
+    if paths.is_empty() {
+        return Err("standard /Ink annotation has an empty /InkList".to_owned());
     }
 
     let width = annotation
@@ -184,23 +183,43 @@ fn extract_standard_ink(
         pen_type: 10,
     };
     let pressure = width_to_pressure(width);
-    let mut samples = Vec::with_capacity(coordinates.len() / 2);
-    for pair in coordinates.chunks_exact(2) {
-        let x = number(&pair[0]).ok_or_else(|| "non-numeric /Ink x coordinate".to_owned())?;
-        let y = number(&pair[1]).ok_or_else(|| "non-numeric /Ink y coordinate".to_owned())?;
-        let (normalized_x, normalized_y) = geometry.normalize(x, y);
-        samples.push([normalized_x, normalized_y, pressure]);
-    }
-
-    let geometry_fingerprint = geometry_fingerprint(&style, &samples);
-    Ok(StrokeSnapshot {
-        source_uuid,
-        origin: "pdf-ink".to_owned(),
-        page_index,
-        native_style: style,
-        samples,
-        geometry_fingerprint,
-    })
+    paths
+        .iter()
+        .enumerate()
+        .map(|(path_index, path)| {
+            let coordinates = resolve(document, path)?
+                .as_array()
+                .map_err(|_| format!("standard /Ink path {path_index} is not an array"))?;
+            if coordinates.len() < 4 || coordinates.len() % 2 != 0 {
+                return Err(format!(
+                    "standard /Ink path {path_index} contains invalid coordinate pairs"
+                ));
+            }
+            let mut samples = Vec::with_capacity(coordinates.len() / 2);
+            for pair in coordinates.chunks_exact(2) {
+                let x = number(&pair[0])
+                    .ok_or_else(|| format!("non-numeric /Ink x coordinate in path {path_index}"))?;
+                let y = number(&pair[1])
+                    .ok_or_else(|| format!("non-numeric /Ink y coordinate in path {path_index}"))?;
+                let (normalized_x, normalized_y) = geometry.normalize(x, y);
+                samples.push([normalized_x, normalized_y, pressure]);
+            }
+            let source_uuid = if path_index == 0 {
+                base_source_uuid.clone()
+            } else {
+                format!("{base_source_uuid}#ink-path-{path_index}")
+            };
+            let geometry_fingerprint = geometry_fingerprint(&style, &samples);
+            Ok(StrokeSnapshot {
+                source_uuid,
+                origin: "pdf-ink".to_owned(),
+                page_index,
+                native_style: style.clone(),
+                samples,
+                geometry_fingerprint,
+            })
+        })
+        .collect()
 }
 
 fn extract_onyx_stroke(
@@ -542,11 +561,34 @@ mod tests {
             "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
             "C" => vec![0.into(), 0.into(), 0.into()],
         };
-        let stroke = extract_standard_ink(&document, &annotation, 0, test_geometry()).unwrap();
+        let strokes = extract_standard_ink(&document, &annotation, 0, test_geometry()).unwrap();
+        assert_eq!(strokes.len(), 1);
+        let stroke = &strokes[0];
         assert_eq!(stroke.source_uuid, "supernote-stroke");
         assert_eq!(stroke.samples.len(), 2);
         assert!((stroke.samples[0][0] - 0.1).abs() < 0.000_001);
         assert!((stroke.samples[0][1] - 0.25).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn preserves_every_standard_ink_path_with_stable_ids() {
+        let document = Document::new();
+        let annotation = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("grouped-ink"),
+            "InkList" => vec![
+                Object::Array(vec![60.into(), 600.into(), 120.into(), 560.into()]),
+                Object::Array(vec![180.into(), 520.into(), 240.into(), 480.into()]),
+            ],
+            "BS" => dictionary! {"W" => Object::Real(1.168_064_48)},
+            "C" => vec![0.into(), 0.into(), 0.into()],
+        };
+        let strokes = extract_standard_ink(&document, &annotation, 0, test_geometry()).unwrap();
+        assert_eq!(strokes.len(), 2);
+        assert_eq!(strokes[0].source_uuid, "grouped-ink");
+        assert_eq!(strokes[1].source_uuid, "grouped-ink#ink-path-1");
+        assert!((strokes[0].samples[0][0] - 0.1).abs() < 0.000_001);
+        assert!((strokes[1].samples[0][0] - 0.3).abs() < 0.000_001);
     }
 
     #[test]

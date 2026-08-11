@@ -22,7 +22,7 @@ pub fn build_manifest(
     let pdf_bytes = fs::read(pdf_path)
         .map_err(|error| format!("could not read PDF {}: {error}", pdf_path.display()))?;
     let pdf_sha256 = format!("{:x}", Sha256::digest(&pdf_bytes));
-    let (page_count, extracted, mut skipped) = extract_pdf_strokes(pdf_path)?;
+    let (page_count, extracted, mut skipped, incomplete_pages) = extract_pdf_strokes(pdf_path)?;
 
     let mut baseline_strokes = Vec::new();
     let mut target_file_names = Vec::new();
@@ -69,8 +69,7 @@ pub fn build_manifest(
     }
 
     for before in baseline.values() {
-        if baseline_pages.contains(&before.page_index) && !active_ids.contains(&before.source_uuid)
-        {
+        if should_infer_deletion(before, &baseline_pages, &active_ids, &incomplete_pages) {
             operations.push(Operation::DeleteStroke {
                 source_uuid: before.source_uuid.clone(),
                 page_index: before.page_index,
@@ -125,6 +124,17 @@ pub fn build_manifest(
     })
 }
 
+fn should_infer_deletion(
+    before: &StrokeSnapshot,
+    baseline_pages: &HashSet<u32>,
+    active_ids: &HashSet<String>,
+    incomplete_pages: &HashSet<u32>,
+) -> bool {
+    baseline_pages.contains(&before.page_index)
+        && !incomplete_pages.contains(&before.page_index)
+        && !active_ids.contains(&before.source_uuid)
+}
+
 fn preserve_pressure_profile(before: &[[f64; 3]], after: &mut [[f64; 3]]) {
     if before.is_empty() || after.is_empty() {
         return;
@@ -173,5 +183,28 @@ mod tests {
         preserve_pressure_profile(&before, &mut after);
         assert_eq!(after[0][2], 100.0);
         assert_eq!(after[4][2], 300.0);
+    }
+
+    #[test]
+    fn extraction_failure_page_is_excluded_from_deletion_inference() {
+        let before = StrokeSnapshot {
+            source_uuid: "stroke-on-incomplete-page".to_owned(),
+            origin: "supernote-native".to_owned(),
+            page_index: 2,
+            native_style: NativeStyle::default(),
+            samples: vec![[0.1, 0.2, 1000.0], [0.2, 0.3, 1000.0]],
+            geometry_fingerprint: "fingerprint".to_owned(),
+        };
+        let baseline = HashMap::from([(before.source_uuid.clone(), before)]);
+        let baseline_pages = HashSet::from([2]);
+        let active_ids = HashSet::new();
+        let incomplete_pages = HashSet::from([2]);
+        let deletions = baseline
+            .values()
+            .filter(|stroke| {
+                should_infer_deletion(stroke, &baseline_pages, &active_ids, &incomplete_pages)
+            })
+            .count();
+        assert_eq!(deletions, 0);
     }
 }
