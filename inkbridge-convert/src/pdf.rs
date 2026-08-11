@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::Command;
 
 const MAX_APPEARANCE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_IDENTITY_REFERENCE_DEPTH: usize = 32;
 
 pub struct PdfStrokeExtraction {
     pub page_count: usize,
@@ -448,23 +449,41 @@ fn number(object: &Object) -> Option<f64> {
 }
 
 fn name(document: &Document, object: Option<&Object>) -> Option<String> {
+    name_with_depth(document, object, 0)
+}
+
+fn name_with_depth(document: &Document, object: Option<&Object>, depth: usize) -> Option<String> {
+    if depth >= MAX_IDENTITY_REFERENCE_DEPTH {
+        return None;
+    }
     match object? {
         Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
         Object::Reference(id) => document
             .get_object(*id)
             .ok()
-            .and_then(|value| name(document, Some(value))),
+            .and_then(|value| name_with_depth(document, Some(value), depth + 1)),
         _ => None,
     }
 }
 
 fn pdf_string(document: &Document, object: Option<&Object>) -> Option<String> {
+    pdf_string_with_depth(document, object, 0)
+}
+
+fn pdf_string_with_depth(
+    document: &Document,
+    object: Option<&Object>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= MAX_IDENTITY_REFERENCE_DEPTH {
+        return None;
+    }
     match object? {
         Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
         Object::Reference(id) => document
             .get_object(*id)
             .ok()
-            .and_then(|value| pdf_string(document, Some(value))),
+            .and_then(|value| pdf_string_with_depth(document, Some(value), depth + 1)),
         _ => None,
     }
 }
@@ -652,6 +671,20 @@ mod tests {
             extract_standard_ink(&document, &annotation, 0, test_geometry())
                 .expect_err("geometry remains deliberately malformed")
                 .contains("invalid /InkList")
+        );
+    }
+
+    #[test]
+    fn cyclic_identity_references_are_rejected_without_recursing_forever() {
+        let mut document = Document::new();
+        let cycle_id = document.new_object_id();
+        document
+            .objects
+            .insert(cycle_id, Object::Reference(cycle_id));
+        assert_eq!(name(&document, Some(&Object::Reference(cycle_id))), None);
+        assert_eq!(
+            pdf_string(&document, Some(&Object::Reference(cycle_id))),
+            None
         );
     }
 
