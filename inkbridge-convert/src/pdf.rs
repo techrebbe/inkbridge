@@ -217,7 +217,7 @@ fn extract_standard_ink(
         .and_then(|value| resolve(document, value).ok())
         .and_then(|value| value.as_dict().ok())
         .and_then(|dict| dict.get(b"W").ok())
-        .and_then(number)
+        .and_then(|value| resolved_number(document, value))
         .unwrap_or(1.168_064_48);
     let style = NativeStyle {
         layer_num: 0,
@@ -234,8 +234,10 @@ fn extract_standard_ink(
     }
     let mut samples = Vec::with_capacity(coordinates.len() / 2);
     for pair in coordinates.chunks_exact(2) {
-        let x = number(&pair[0]).ok_or_else(|| "non-numeric /Ink x coordinate".to_owned())?;
-        let y = number(&pair[1]).ok_or_else(|| "non-numeric /Ink y coordinate".to_owned())?;
+        let x = resolved_number(document, &pair[0])
+            .ok_or_else(|| "non-numeric /Ink x coordinate".to_owned())?;
+        let y = resolved_number(document, &pair[1])
+            .ok_or_else(|| "non-numeric /Ink y coordinate".to_owned())?;
         let (normalized_x, normalized_y) = geometry.normalize(x, y);
         samples.push([normalized_x, normalized_y, pressure]);
     }
@@ -278,7 +280,7 @@ fn extract_onyx_stroke(
         .and_then(|value| resolve(document, value).ok())
         .and_then(|value| value.as_dict().ok())
         .and_then(|dict| dict.get(b"W").ok())
-        .and_then(number)
+        .and_then(|value| resolved_number(document, value))
         .unwrap_or(1.168_064_48);
     let mut matrix = stream_matrix;
     let mut stack = Vec::new();
@@ -339,7 +341,7 @@ fn extract_onyx_stroke(
             .and_then(|value| resolve(document, value).ok())
             .and_then(|value| value.as_dict().ok())
             .and_then(|dict| dict.get(b"W").ok())
-            .and_then(number)
+            .and_then(|value| resolved_number(document, value))
             .map(width_to_supernote_thickness)
             .unwrap_or(400),
         pen_color: annotation_luminance(document, annotation),
@@ -373,7 +375,7 @@ fn matrix_from_object(document: &Document, object: &Object) -> Result<Matrix, St
         .as_array()
         .map_err(|_| "appearance /Matrix is not an array".to_owned())?
         .iter()
-        .map(number)
+        .map(|value| resolved_number(document, value))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| "appearance /Matrix contains non-numeric values".to_owned())?;
     if values.len() != 6 {
@@ -409,7 +411,10 @@ fn annotation_luminance(document: &Document, annotation: &Dictionary) -> i64 {
     else {
         return 0;
     };
-    let channels = color.iter().filter_map(number).collect::<Vec<_>>();
+    let channels = color
+        .iter()
+        .filter_map(|value| resolved_number(document, value))
+        .collect::<Vec<_>>();
     let luminance = match channels.as_slice() {
         [gray] => *gray,
         [red, green, blue, ..] => 0.2126 * red + 0.7152 * green + 0.0722 * blue,
@@ -643,6 +648,31 @@ mod tests {
         assert_eq!(stroke.samples.len(), 2);
         assert!((stroke.samples[0][0] - 0.1).abs() < 0.000_001);
         assert!((stroke.samples[0][1] - 0.25).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn reads_standard_ink_with_indirect_coordinates() {
+        let mut document = Document::new();
+        let x1 = document.add_object(Object::Integer(60));
+        let y1 = document.add_object(Object::Integer(600));
+        let x2 = document.add_object(Object::Integer(120));
+        let y2 = document.add_object(Object::Integer(560));
+        let annotation = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("indirect-coordinate-stroke"),
+            "InkList" => vec![Object::Array(vec![
+                Object::Reference(x1),
+                Object::Reference(y1),
+                Object::Reference(x2),
+                Object::Reference(y2),
+            ])],
+        };
+
+        let strokes = extract_standard_ink(&document, &annotation, 0, test_geometry()).unwrap();
+        assert_eq!(strokes.len(), 1);
+        assert_eq!(strokes[0].samples.len(), 2);
+        assert!((strokes[0].samples[0][0] - 0.1).abs() < 0.000_001);
+        assert!((strokes[0].samples[0][1] - 0.25).abs() < 0.000_001);
     }
 
     #[test]
