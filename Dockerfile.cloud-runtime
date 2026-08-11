@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.90-bookworm AS builder
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY inkbridge-convert ./inkbridge-convert
+COPY inkbridge-broker ./inkbridge-broker
+COPY inkbridge-cloud-runtime ./inkbridge-cloud-runtime
+
+# Cargo resolves the whole workspace even though this image builds only the
+# cloud runtime and converter, so every local member must be present.
+COPY build-dict ./build-dict
+COPY device-eink ./device-eink
+COPY inkread-daily ./inkread-daily
+COPY inkread-dict ./inkread-dict
+COPY inkread-epub ./inkread-epub
+COPY inkread-ink ./inkread-ink
+COPY inkread-lua ./inkread-lua
+COPY inkread-pdftext ./inkread-pdftext
+COPY inkread-update ./inkread-update
+COPY reader-core ./reader-core
+
+RUN cargo build --locked --release -p inkbridge-cloud-runtime -p inkbridge-convert
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates qpdf \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/inkbridge-cloud-runtime /usr/local/bin/inkbridge-cloud-runtime
+COPY --from=builder /src/target/release/inkbridge-convert /usr/local/bin/inkbridge-convert
+
+USER 65532:65532
+ENV PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/inkbridge-cloud-runtime"]

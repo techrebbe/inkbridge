@@ -1,0 +1,83 @@
+name: InkBridge cloud runtime
+
+on:
+  push:
+    branches: [master, "agent/inkbridge-cloud-runtime", "feat/**"]
+    paths:
+      - "inkbridge-cloud-runtime/**"
+      - "inkbridge-broker/**"
+      - "inkbridge-convert/**"
+      - "infra/gcp/**"
+      - "docs/INKBRIDGE_CLOUD_RUNTIME.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.cloud-runtime"
+      - ".dockerignore"
+      - ".github/workflows/inkbridge-cloud-runtime.yml"
+  pull_request:
+    paths:
+      - "inkbridge-cloud-runtime/**"
+      - "inkbridge-broker/**"
+      - "inkbridge-convert/**"
+      - "infra/gcp/**"
+      - "docs/INKBRIDGE_CLOUD_RUNTIME.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.cloud-runtime"
+      - ".dockerignore"
+      - ".github/workflows/inkbridge-cloud-runtime.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  runtime-core:
+    name: cloud runtime fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install qpdf recovery dependency
+        run: sudo apt-get update && sudo apt-get install -y qpdf
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint cloud runtime, broker, and converter
+        run: cargo clippy -p inkbridge-cloud-runtime -p inkbridge-broker -p inkbridge-convert --all-targets -- -D warnings
+      - name: Test cloud runtime, broker, and converter
+        run: cargo test -p inkbridge-cloud-runtime -p inkbridge-broker -p inkbridge-convert
+
+  linux-amd64-image:
+    name: Linux amd64 Cloud Run image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image without publishing
+        run: docker build --platform linux/amd64 -f Dockerfile.cloud-runtime -t inkbridge-cloud-runtime:test .
+      - name: Verify runtime, converter, and qpdf are packaged
+        run: |
+          docker run --rm --entrypoint /bin/sh inkbridge-cloud-runtime:test -c '
+            test -x /usr/local/bin/inkbridge-cloud-runtime
+            inkbridge-convert 2>&1 | grep -q "Usage:"
+            qpdf --version
+          '
+
+  terraform-static:
+    name: Terraform no-apply validation
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/gcp
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+      - name: Initialize providers without a backend
+        run: terraform init -backend=false
+      - name: Validate configuration only
+        run: terraform validate
+      - name: Verify deployment is opt-in
+        run: grep -q 'default *= *false' variables.tf
