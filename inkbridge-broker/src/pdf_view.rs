@@ -2,6 +2,8 @@ use inkbridge_convert::StrokeSnapshot;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::BTreeMap;
 
+const MAX_INDIRECT_DEPTH: usize = 32;
+
 #[derive(Clone, Copy, Debug)]
 struct PageGeometry {
     left: f64,
@@ -162,22 +164,41 @@ fn annotation_stable_id(document: &Document, annotation: &Object) -> Option<Stri
 }
 
 fn object_name_is(document: &Document, object: &Object, expected: &[u8]) -> bool {
+    object_name_is_at_depth(document, object, expected, 0)
+}
+
+fn object_name_is_at_depth(
+    document: &Document,
+    object: &Object,
+    expected: &[u8],
+    depth: usize,
+) -> bool {
+    if depth >= MAX_INDIRECT_DEPTH {
+        return false;
+    }
     match object {
         Object::Name(name) => name == expected,
         Object::Reference(id) => document
             .get_object(*id)
-            .is_ok_and(|value| object_name_is(document, value, expected)),
+            .is_ok_and(|value| object_name_is_at_depth(document, value, expected, depth + 1)),
         _ => false,
     }
 }
 
 fn object_string(document: &Document, object: &Object) -> Option<String> {
+    object_string_at_depth(document, object, 0)
+}
+
+fn object_string_at_depth(document: &Document, object: &Object, depth: usize) -> Option<String> {
+    if depth >= MAX_INDIRECT_DEPTH {
+        return None;
+    }
     match object {
         Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
         Object::Reference(id) => document
             .get_object(*id)
             .ok()
-            .and_then(|value| object_string(document, value)),
+            .and_then(|value| object_string_at_depth(document, value, depth + 1)),
         _ => None,
     }
 }
@@ -497,5 +518,18 @@ mod tests {
         });
         let geometry = page_geometry(&document, page_id).unwrap();
         assert_eq!(geometry.rotation, 270);
+    }
+
+    #[test]
+    fn cyclic_renderer_identity_references_are_rejected_without_recursing_forever() {
+        let mut document = Document::new();
+        let cycle_id = document.new_object_id();
+        document
+            .objects
+            .insert(cycle_id, Object::Reference(cycle_id));
+        let reference = Object::Reference(cycle_id);
+
+        assert!(!object_name_is(&document, &reference, b"Ink"));
+        assert_eq!(object_string(&document, &reference), None);
     }
 }
