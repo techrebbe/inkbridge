@@ -55,8 +55,20 @@ fn run() -> Result<(), String> {
     let mut state = TransportState::load(&config.state_path)?;
     loop {
         for document in &config.documents {
-            let report = transport.sync_document(document, &mut state, SystemTime::now())?;
-            state.save(&config.state_path)?;
+            let report = match transport.sync_document(document, &mut state, SystemTime::now()) {
+                Ok(report) => report,
+                Err(error) => {
+                    retry_or_fail(
+                        &command,
+                        format!("{} scan failed: {error}", document.document_id),
+                    )?;
+                    continue;
+                }
+            };
+            if let Err(error) = state.save(&config.state_path) {
+                retry_or_fail(&command, format!("could not save transport state: {error}"))?;
+                continue;
+            }
             for action in report.actions {
                 print_action(action);
             }
@@ -66,6 +78,14 @@ fn run() -> Result<(), String> {
         }
         thread::sleep(Duration::from_secs(config.poll_seconds));
     }
+}
+
+fn retry_or_fail(command: &str, message: String) -> Result<(), String> {
+    if command == "once" {
+        return Err(message);
+    }
+    eprintln!("{message}; watch mode will retry");
+    Ok(())
 }
 
 struct ProcessLock {
@@ -132,4 +152,22 @@ fn print_action(action: TransportAction) {
 
 fn usage() -> String {
     "Usage:\n  inkbridge-folder-transport once --config <transport.json>\n  inkbridge-folder-transport watch --config <transport.json>\n  inkbridge-folder-transport status --config <transport.json>".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_mode_tolerates_transient_scan_failures() {
+        assert!(retry_or_fail("watch", "temporary cloud failure".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn once_mode_remains_fail_fast() {
+        assert_eq!(
+            retry_or_fail("once", "temporary cloud failure".to_owned()).unwrap_err(),
+            "temporary cloud failure"
+        );
+    }
 }

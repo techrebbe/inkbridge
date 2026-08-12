@@ -361,22 +361,26 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             .observations
             .get(&local_key)
             .and_then(|observation| observation.content_sha256.clone());
-        if cached_source_hash.is_some() {
+        if let Some(cached_source_hash) = cached_source_hash {
             // Size and mtime establish that a file has settled, but they are not
             // a content identity: sync tools can replace a file while preserving
             // both. Verify the bytes before suppressing a potentially large BOOX
             // conversion as already delivered or uploaded.
             let source_hash = sha256_file(&document.boox_pdf)?;
-            state
-                .observations
-                .get_mut(&local_key)
-                .ok_or_else(|| {
-                    format!(
-                        "settled observation disappeared for {}",
-                        document.boox_pdf.display()
-                    )
-                })?
-                .content_sha256 = Some(source_hash.clone());
+            if source_hash != cached_source_hash {
+                remember_content_change(
+                    &document.boox_pdf,
+                    state,
+                    SystemTime::now(),
+                    &source_hash,
+                )?;
+                report.actions.push(TransportAction::Deferred {
+                    side: DeviceSide::Boox,
+                    reason: "the settled BOOX PDF content changed without new filesystem metadata"
+                        .to_owned(),
+                });
+                return Ok(());
+            }
             let side = &state.document_mut(&document.document_id).boox;
             if side.delivered_content_sha256.as_deref() == Some(source_hash.as_str())
                 || side
@@ -535,6 +539,11 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             if !file_is_settled(&export, state, now, self.settle)? {
                 continue;
             }
+            let local_key = canonical_path_key(&export);
+            let observed_hash = state
+                .observations
+                .get(&local_key)
+                .and_then(|observation| observation.content_sha256.clone());
             let (bytes, content_hash, post_read_hash) =
                 read_snapshot_and_current_hash(&export, |path| {
                     fs::read(path)
@@ -554,6 +563,25 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 });
                 return Ok(());
             }
+            if observed_hash
+                .as_deref()
+                .is_some_and(|observed| observed != content_hash)
+            {
+                remember_content_change(&export, state, SystemTime::now(), &post_read_hash)?;
+                report.actions.push(TransportAction::Deferred {
+                    side: DeviceSide::Supernote,
+                    reason: format!(
+                        "settled Supernote export {} changed without new filesystem metadata",
+                        export.display()
+                    ),
+                });
+                return Ok(());
+            }
+            state
+                .observations
+                .get_mut(&local_key)
+                .ok_or_else(|| format!("settled observation disappeared for {}", export.display()))?
+                .content_sha256 = Some(content_hash.clone());
             let parsed = parse_baseline_bytes(&bytes, &export.to_string_lossy())?;
             if parsed.source_file_name.as_deref() != Some(document.original_file_name.as_str()) {
                 return Err(format!(
@@ -563,7 +591,6 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     document.original_file_name
                 ));
             }
-            let local_key = canonical_path_key(&export);
             if state
                 .document_mut(&document.document_id)
                 .supernote

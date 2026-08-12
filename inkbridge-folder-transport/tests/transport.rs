@@ -398,11 +398,27 @@ fn boox_skip_rehashes_a_settled_file_when_size_and_mtime_look_unchanged() {
     let builder = HashingBuilder;
     let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
 
-    let report = transport
+    let first = transport
         .sync_document(&document, &mut state, SystemTime::now())
         .unwrap();
 
-    assert!(report.actions.iter().any(|action| matches!(
+    assert!(first.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("without new filesystem metadata")
+    )));
+    assert!(!cloud.objects.lock().unwrap().iter().any(|(object, _)| {
+        object
+            .path
+            .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
+    }));
+
+    let second = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(second.actions.iter().any(|action| matches!(
         action,
         TransportAction::Uploaded {
             side: DeviceSide::Boox,
@@ -416,6 +432,56 @@ fn boox_skip_rehashes_a_settled_file_when_size_and_mtime_look_unchanged() {
             .uploaded_local_hashes[&path_key(&document.boox_pdf)],
         new_hash
     );
+}
+
+#[test]
+fn supernote_same_metadata_replacement_restarts_settling_before_upload() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let export = document.supernote_export_directory.join("page.json");
+    let old_bytes = native_export();
+    let new_bytes = String::from_utf8(old_bytes.clone())
+        .unwrap()
+        .replace("s1", "s2")
+        .into_bytes();
+    assert_eq!(old_bytes.len(), new_bytes.len());
+    fs::write(&export, &new_bytes).unwrap();
+    let metadata = fs::metadata(&export).unwrap();
+    let export_key = path_key(&export);
+    let mut state = TransportState::empty();
+    state.observations.insert(
+        export_key.clone(),
+        FileObservation {
+            size: metadata.len(),
+            modified_unix_millis: metadata
+                .modified()
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            first_seen_unix_millis: 1,
+            content_sha256: Some(sha256_hex(&old_bytes)),
+        },
+    );
+    let cloud = FakeCloud::default();
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let scan_now = SystemTime::UNIX_EPOCH + Duration::from_secs(34_567);
+
+    let report = transport
+        .sync_document(&document, &mut state, scan_now)
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Supernote,
+            reason,
+        } if reason.contains("without new filesystem metadata")
+    )));
+    assert!(cloud.objects.lock().unwrap().is_empty());
+    assert!(state.observations[&export_key].first_seen_unix_millis > 34_567_000);
 }
 
 #[test]
