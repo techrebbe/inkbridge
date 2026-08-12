@@ -1,7 +1,7 @@
 use inkbridge_broker::{DeviceSide, RevisionPair};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const TRANSPORT_STATE_SCHEMA_VERSION: u32 = 1;
@@ -74,6 +74,7 @@ impl TransportConfig {
         }
         let mut ids = BTreeSet::new();
         let mut boox_paths = BTreeSet::new();
+        let mut supernote_paths = BTreeSet::new();
         for document in &self.documents {
             if !document.document_id.starts_with("inkbridge-doc-v1-")
                 || document.document_id.contains(['/', '\\'])
@@ -105,6 +106,18 @@ impl TransportConfig {
                     document.document_id
                 ));
             }
+            for (direction, directory) in [
+                ("outgoing", &document.supernote_export_directory),
+                ("incoming", &document.supernote_incoming_directory),
+            ] {
+                let key = normalized_path_key(directory);
+                if !supernote_paths.insert(key) {
+                    return Err(format!(
+                        "Supernote {direction} directory {} is shared by multiple mappings or directions",
+                        directory.display()
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -117,16 +130,33 @@ fn resolve_path(base: &Path, value: &mut PathBuf) {
 }
 
 fn normalized_path_key(path: &Path) -> String {
-    let value = path
+    let resolved = path
         .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/");
+        .unwrap_or_else(|_| lexical_normalize(path));
+    let value = resolved.to_string_lossy().replace('\\', "/");
     if cfg!(windows) {
         value.to_lowercase()
     } else {
         value
     }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::ParentDir) | None if !path.has_root() => normalized.push(".."),
+                _ => {}
+            },
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn default_gcloud() -> PathBuf {
@@ -165,9 +195,9 @@ impl TransportState {
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
+        if !regular_file_exists(path)? {
             let previous = path.with_extension("json.previous");
-            if previous.exists() {
+            if regular_file_exists(&previous)? {
                 return Self::load(&previous);
             }
             return Ok(Self::empty());
@@ -194,11 +224,9 @@ impl TransportState {
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
         std::fs::write(&next, [bytes.as_slice(), b"\n"].concat())
             .map_err(|error| format!("could not write {}: {error}", next.display()))?;
-        if previous.exists() {
-            std::fs::remove_file(&previous)
-                .map_err(|error| format!("could not remove {}: {error}", previous.display()))?;
-        }
-        if path.exists() {
+        remove_file_if_exists(&previous)?;
+        let had_current = regular_file_exists(path)?;
+        if had_current {
             std::fs::rename(path, &previous).map_err(|error| {
                 format!(
                     "could not stage existing state {} as {}: {error}",
@@ -208,13 +236,13 @@ impl TransportState {
             })?;
         }
         if let Err(error) = std::fs::rename(&next, path) {
-            if previous.exists() {
+            if had_current {
                 let _ = std::fs::rename(&previous, path);
             }
             return Err(format!("could not publish {}: {error}", path.display()));
         }
-        if previous.exists() {
-            std::fs::remove_file(previous)
+        if had_current {
+            remove_file_if_exists(&previous)
                 .map_err(|error| format!("could not retire previous state: {error}"))?;
         }
         Ok(())
@@ -222,6 +250,23 @@ impl TransportState {
 
     pub fn document_mut(&mut self, id: &str) -> &mut DocumentTransportState {
         self.documents.entry(id.to_owned()).or_default()
+    }
+}
+
+fn regular_file_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!("{} is not a regular file", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("could not inspect {}: {error}", path.display())),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
     }
 }
 
@@ -410,5 +455,65 @@ mod tests {
         };
 
         assert!(config.validate().unwrap_err().contains("duplicate booxPdf"));
+    }
+
+    #[test]
+    fn configuration_rejects_lexical_aliases_for_an_absent_boox_path() {
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::new(),
+            documents: vec![
+                DocumentFolders {
+                    document_id: "inkbridge-doc-v1-first".to_owned(),
+                    original_file_name: "first.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("missing/book.pdf"),
+                    supernote_export_directory: PathBuf::from("first/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("first/incoming"),
+                },
+                DocumentFolders {
+                    document_id: "inkbridge-doc-v1-second".to_owned(),
+                    original_file_name: "second.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("missing/../missing/book.pdf"),
+                    supernote_export_directory: PathBuf::from("second/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("second/incoming"),
+                },
+            ],
+        };
+
+        assert!(config.validate().unwrap_err().contains("duplicate booxPdf"));
+    }
+
+    #[test]
+    fn configuration_rejects_shared_supernote_directories_across_documents() {
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::new(),
+            documents: vec![
+                DocumentFolders {
+                    document_id: "inkbridge-doc-v1-first".to_owned(),
+                    original_file_name: "book.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("first/book.pdf"),
+                    supernote_export_directory: PathBuf::from("shared/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("first/incoming"),
+                },
+                DocumentFolders {
+                    document_id: "inkbridge-doc-v1-second".to_owned(),
+                    original_file_name: "book.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("second/book.pdf"),
+                    supernote_export_directory: PathBuf::from("second/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("shared/outgoing"),
+                },
+            ],
+        };
+
+        assert!(config.validate().unwrap_err().contains("is shared"));
     }
 }

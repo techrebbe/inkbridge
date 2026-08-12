@@ -285,7 +285,8 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 ),
             };
             let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
-            let already_installed = local_path.is_file()
+            let already_installed = metadata_if_exists(&local_path)?
+                .is_some_and(|metadata| metadata.is_file())
                 && sha256_file(&local_path).is_ok_and(|hash| hash == expected_hash);
             if side == DeviceSide::Boox
                 && !already_installed
@@ -342,8 +343,15 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         now: SystemTime,
         report: &mut SyncReport,
     ) -> Result<(), String> {
-        if !document.boox_pdf.is_file() {
-            return Ok(());
+        match metadata_if_exists(&document.boox_pdf)? {
+            None => return Ok(()),
+            Some(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "configured BOOX path {} is not a regular file",
+                    document.boox_pdf.display()
+                ));
+            }
+            Some(_) => {}
         }
         if state
             .document_mut(&document.document_id)
@@ -709,8 +717,15 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         if document_state.boox.pending.is_some() {
             return Ok(true);
         }
-        if !document.boox_pdf.is_file() {
-            return Ok(false);
+        match metadata_if_exists(&document.boox_pdf)? {
+            None => return Ok(false),
+            Some(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "configured BOOX path {} is not a regular file",
+                    document.boox_pdf.display()
+                ));
+            }
+            Some(_) => {}
         }
         let hash = sha256_file(&document.boox_pdf)?;
         if format!("inkbridge-doc-v1-{hash}") == document.document_id {
@@ -735,10 +750,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
         let temporary = sibling_temporary(destination, &format!("g{}", object.generation));
-        if temporary.exists() {
-            fs::remove_file(&temporary)
-                .map_err(|error| format!("could not remove {}: {error}", temporary.display()))?;
-        }
+        remove_file_if_exists(&temporary)?;
         self.cloud.download(object, &temporary)?;
         let expected_hash = required_metadata(object, CONTENT_SHA256)?;
         let actual_hash = sha256_file(&temporary)?;
@@ -786,8 +798,15 @@ fn dominates(candidate: RevisionPair, current: RevisionPair) -> bool {
 }
 
 fn supernote_export_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
-    if !directory.exists() {
-        return Ok(Vec::new());
+    match metadata_if_exists(directory)? {
+        None => return Ok(Vec::new()),
+        Some(metadata) if !metadata.is_dir() => {
+            return Err(format!(
+                "configured Supernote export path {} is not a directory",
+                directory.display()
+            ));
+        }
+        Some(_) => {}
     }
     let entries = fs::read_dir(directory)
         .map_err(|error| format!("could not read {}: {error}", directory.display()))?;
@@ -960,6 +979,22 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("could not inspect {}: {error}", path.display())),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+    }
+}
+
 fn read_snapshot_and_current_hash<F>(
     path: &Path,
     read: F,
@@ -982,20 +1017,26 @@ fn sibling_temporary(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
-    if !destination.exists() {
-        return fs::rename(source, destination).map_err(|error| {
-            format!(
-                "could not publish {} as {}: {error}",
-                source.display(),
+    match metadata_if_exists(destination)? {
+        None => {
+            return fs::rename(source, destination).map_err(|error| {
+                format!(
+                    "could not publish {} as {}: {error}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        }
+        Some(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "refusing to replace non-file destination {}",
                 destination.display()
-            )
-        });
+            ));
+        }
+        Some(_) => {}
     }
     let backup = sibling_temporary(destination, "previous");
-    if backup.exists() {
-        fs::remove_file(&backup)
-            .map_err(|error| format!("could not remove {}: {error}", backup.display()))?;
-    }
+    remove_file_if_exists(&backup)?;
     fs::rename(destination, &backup).map_err(|error| {
         format!(
             "could not stage {} as {}: {error}",
