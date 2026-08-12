@@ -125,21 +125,13 @@ impl RuntimeService {
     ) -> Result<RuntimeOutcome, String> {
         let original = self
             .objects
-            .read(&registration.object_path)?
+            .read_generation(&registration.object_path, registration.source_generation)?
             .ok_or_else(|| {
                 format!(
-                    "registration source {} does not exist",
-                    registration.object_path
+                    "registration source {} generation {} does not exist",
+                    registration.object_path, registration.source_generation
                 )
             })?;
-        if original.generation != registration.source_generation {
-            return Ok(RuntimeOutcome::Rejected {
-                reason: format!(
-                    "registration source generation changed: expected {}, found {}",
-                    registration.source_generation, original.generation
-                ),
-            });
-        }
         let mut storage = CloudBrokerStorage::new(self.objects.clone(), self.states.clone());
         match Broker::default().register_document(
             &mut storage,
@@ -439,7 +431,7 @@ mod tests {
         let objects = Arc::new(MemoryObjectStore::default());
         let states = Arc::new(MemoryCanonicalStateStore::default());
         let original = objects.put("Staging/upload.pdf", original_pdf());
-        let service = RuntimeService::new("sync-bucket", objects, states);
+        let service = RuntimeService::new("sync-bucket", objects.clone(), states);
         let body = serde_json::to_vec(&json!({
             "bucket": "sync-bucket",
             "name": "Staging/upload.pdf",
@@ -450,6 +442,9 @@ mod tests {
             }
         }))
         .unwrap();
+        // A delayed delivery must still register the finalized generation even when a newer
+        // staging upload now occupies the same object path.
+        objects.put("Staging/upload.pdf", b"newer, unrelated upload".to_vec());
 
         let first = service
             .handle_storage_event(&headers("register-event"), &body)
