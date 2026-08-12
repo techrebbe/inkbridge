@@ -486,10 +486,7 @@ fn boox_upload_is_deferred_when_post_conversion_hash_does_not_match_source() {
         .boox
         .pending
         .is_none());
-    assert_eq!(
-        state.observations[&boox_key].first_seen_unix_millis,
-        12_345_000
-    );
+    assert!(state.observations[&boox_key].first_seen_unix_millis > 12_345_000);
 }
 
 #[test]
@@ -544,10 +541,7 @@ fn boox_upload_is_deferred_when_an_accepted_baseline_changes_during_conversion()
         .boox
         .pending
         .is_none());
-    assert_eq!(
-        state.observations[&export_key].first_seen_unix_millis,
-        23_456_000
-    );
+    assert!(state.observations[&export_key].first_seen_unix_millis > 23_456_000);
 }
 
 #[test]

@@ -426,7 +426,12 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         }
         let post_build_hash = sha256_file(&document.boox_pdf)?;
         if post_build_hash != built.source_pdf_sha256 {
-            remember_content_change(&document.boox_pdf, state, now, &post_build_hash)?;
+            remember_content_change(
+                &document.boox_pdf,
+                state,
+                SystemTime::now(),
+                &post_build_hash,
+            )?;
             report.actions.push(TransportAction::Deferred {
                 side: DeviceSide::Boox,
                 reason: "the BOOX PDF content changed while its compact manifest was being built"
@@ -447,7 +452,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         for (baseline, accepted_hash) in baseline_hashes {
             let current_hash = sha256_file(&baseline)?;
             if current_hash != accepted_hash {
-                remember_content_change(&baseline, state, now, &current_hash)?;
+                remember_content_change(&baseline, state, SystemTime::now(), &current_hash)?;
                 report.actions.push(TransportAction::Deferred {
                     side: DeviceSide::Boox,
                     reason: format!(
