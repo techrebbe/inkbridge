@@ -28,6 +28,12 @@ pub struct BuiltBooxManifest {
     pub source_pdf_sha256: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FileIdentity {
+    Missing,
+    Sha256(String),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeBooxManifestBuilder;
 
@@ -285,12 +291,24 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 ),
             };
             let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
-            let already_installed = metadata_if_exists(&local_path)?
-                .is_some_and(|metadata| metadata.is_file())
-                && sha256_file(&local_path).is_ok_and(|hash| hash == expected_hash);
+            let boox_destination_identity = (side == DeviceSide::Boox)
+                .then(|| file_identity(&local_path))
+                .transpose()?;
+            let already_installed = if let Some(identity) = &boox_destination_identity {
+                identity == &FileIdentity::Sha256(expected_hash.clone())
+            } else {
+                metadata_if_exists(&local_path)?.is_some_and(|metadata| metadata.is_file())
+                    && sha256_file(&local_path).is_ok_and(|hash| hash == expected_hash)
+            };
             if side == DeviceSide::Boox
                 && !already_installed
-                && self.boox_has_unpublished_local_edit(document, state)?
+                && self.boox_has_unpublished_local_edit(
+                    document,
+                    state,
+                    boox_destination_identity
+                        .as_ref()
+                        .expect("BOOX destinations are inspected above"),
+                )?
             {
                 report.actions.push(TransportAction::Deferred {
                     side,
@@ -303,7 +321,31 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
 
             if !already_installed {
-                self.download_verified(&object, &local_path)?;
+                if !self.download_verified(
+                    &object,
+                    &local_path,
+                    boox_destination_identity.as_ref(),
+                )? {
+                    report.actions.push(TransportAction::Deferred {
+                        side,
+                        reason: format!(
+                            "broker view {} was not installed because the local BOOX PDF changed while it was downloading",
+                            object.path
+                        ),
+                    });
+                    continue;
+                }
+            } else if side == DeviceSide::Boox
+                && file_identity(&local_path)? != FileIdentity::Sha256(expected_hash.clone())
+            {
+                report.actions.push(TransportAction::Deferred {
+                    side,
+                    reason: format!(
+                        "broker view {} was not acknowledged because the local BOOX PDF changed during inspection",
+                        object.path
+                    ),
+                });
+                continue;
             }
             remember_file_hash(&local_path, state, SystemTime::now(), &expected_hash)?;
             let document_state = state.document_mut(&document.document_id);
@@ -712,22 +754,15 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         &self,
         document: &DocumentFolders,
         state: &mut TransportState,
+        identity: &FileIdentity,
     ) -> Result<bool, String> {
         let document_state = state.document_mut(&document.document_id);
         if document_state.boox.pending.is_some() {
             return Ok(true);
         }
-        match metadata_if_exists(&document.boox_pdf)? {
-            None => return Ok(false),
-            Some(metadata) if !metadata.is_file() => {
-                return Err(format!(
-                    "configured BOOX path {} is not a regular file",
-                    document.boox_pdf.display()
-                ));
-            }
-            Some(_) => {}
-        }
-        let hash = sha256_file(&document.boox_pdf)?;
+        let FileIdentity::Sha256(hash) = identity else {
+            return Ok(false);
+        };
         if format!("inkbridge-doc-v1-{hash}") == document.document_id {
             // A pristine immutable-original copy is a safe first destination.
             // Without this identity check an existing unknown PDF is never
@@ -741,11 +776,16 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .boox
                     .uploaded_local_hashes
                     .get(&key)
-                    .is_none_or(|uploaded| uploaded != &hash),
+                    .is_none_or(|uploaded| uploaded != hash),
         )
     }
 
-    fn download_verified(&self, object: &CloudObject, destination: &Path) -> Result<(), String> {
+    fn download_verified(
+        &self,
+        object: &CloudObject,
+        destination: &Path,
+        expected_destination: Option<&FileIdentity>,
+    ) -> Result<bool, String> {
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
@@ -761,7 +801,15 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 object.path
             ));
         }
-        replace_file(&temporary, destination)
+        if let Some(expected_destination) = expected_destination {
+            let current_destination = file_identity(destination)?;
+            if &current_destination != expected_destination {
+                remove_file_if_exists(&temporary)?;
+                return Ok(false);
+            }
+        }
+        replace_file(&temporary, destination)?;
+        Ok(true)
     }
 }
 
@@ -977,6 +1025,17 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         digest.update(&buffer[..count]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn file_identity(path: &Path) -> Result<FileIdentity, String> {
+    match metadata_if_exists(path)? {
+        None => Ok(FileIdentity::Missing),
+        Some(metadata) if !metadata.is_file() => Err(format!(
+            "configured BOOX path {} is not a regular file",
+            path.display()
+        )),
+        Some(_) => sha256_file(path).map(FileIdentity::Sha256),
+    }
 }
 
 fn metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>, String> {

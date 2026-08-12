@@ -176,10 +176,7 @@ fn normalized_path_key(path: &Path) -> Result<String, String> {
 }
 
 fn key_contains_path(directory: &str, candidate: &str) -> bool {
-    candidate == directory
-        || candidate
-            .strip_prefix(directory)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    Path::new(candidate).starts_with(Path::new(directory))
 }
 
 fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
@@ -676,6 +673,29 @@ mod tests {
                 boox_pdf: PathBuf::from("boox/book.pdf"),
                 supernote_export_directory: PathBuf::from("supernote/outgoing"),
                 supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+        };
+
+        assert!(config.validate().unwrap_err().contains("must be outside"));
+    }
+
+    #[test]
+    fn configuration_rejects_state_below_a_filesystem_root_mapping() {
+        let current = std::env::current_dir().unwrap();
+        let root = current.ancestors().last().unwrap();
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: root.join("inkbridge-state.json"),
+            documents: vec![DocumentFolders {
+                document_id: "inkbridge-doc-v1-test".to_owned(),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: root.join("inkbridge-boox-book.pdf"),
+                supernote_export_directory: root.to_path_buf(),
+                supernote_incoming_directory: root.join("inkbridge-supernote-incoming"),
             }],
         };
 

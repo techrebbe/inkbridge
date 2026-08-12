@@ -86,6 +86,32 @@ impl CloudFolder for FakeCloud {
     }
 }
 
+struct MutatingDownloadCloud {
+    inner: FakeCloud,
+    boox_pdf: PathBuf,
+    replacement: Vec<u8>,
+}
+
+impl CloudFolder for MutatingDownloadCloud {
+    fn list(&self, prefix: &str) -> Result<Vec<CloudObject>, String> {
+        self.inner.list(prefix)
+    }
+
+    fn upload_create(
+        &self,
+        local_path: &Path,
+        object_path: &str,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<CloudObject, String> {
+        self.inner.upload_create(local_path, object_path, metadata)
+    }
+
+    fn download(&self, object: &CloudObject, destination: &Path) -> Result<(), String> {
+        self.inner.download(object, destination)?;
+        fs::write(&self.boox_pdf, &self.replacement).map_err(|error| error.to_string())
+    }
+}
+
 struct FakeBuilder;
 
 impl BooxManifestBuilder for FakeBuilder {
@@ -638,6 +664,66 @@ fn generated_boox_view_never_overwrites_an_unpublished_local_edit() {
         }
     )));
     assert_eq!(fs::read(&document.boox_pdf).unwrap(), b"local edit");
+}
+
+#[test]
+fn generated_boox_view_never_overwrites_an_edit_created_during_download() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    let installed = b"previous broker view".to_vec();
+    fs::write(&document.boox_pdf, &installed).unwrap();
+    let generated = b"next broker view".to_vec();
+    let cloud = MutatingDownloadCloud {
+        inner: FakeCloud::default(),
+        boox_pdf: document.boox_pdf.clone(),
+        replacement: b"local edit created during download".to_vec(),
+    };
+    cloud.inner.put(
+        &format!("BOOX_Folder/{}/book.pdf", document.document_id),
+        generated.clone(),
+        generated_metadata(&document.document_id, "0:1", &generated),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::from_secs(60));
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            boox: SideTransportState {
+                delivered_content_sha256: Some(sha256_hex(&installed)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("changed while it was downloading")
+    )));
+    assert!(!report
+        .actions
+        .iter()
+        .any(|action| matches!(action, TransportAction::Delivered { .. })));
+    assert_eq!(
+        fs::read(&document.boox_pdf).unwrap(),
+        b"local edit created during download"
+    );
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair::default()
+    );
+    assert!(state.documents[&document.document_id]
+        .delivered_generations
+        .is_empty());
 }
 
 #[test]
