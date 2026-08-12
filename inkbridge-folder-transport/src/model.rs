@@ -186,10 +186,16 @@ fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
                 return Ok(lexical_normalize(&resolved));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = ancestor.file_name().ok_or_else(|| {
+                let component = ancestor.components().next_back().ok_or_else(|| {
                     format!("could not find an existing ancestor for {}", path.display())
                 })?;
-                missing.push(component.to_os_string());
+                if matches!(component, Component::RootDir | Component::Prefix(_)) {
+                    return Err(format!(
+                        "could not find an existing ancestor for {}",
+                        path.display()
+                    ));
+                }
+                missing.push(component.as_os_str().to_os_string());
                 ancestor = ancestor.parent().ok_or_else(|| {
                     format!("could not find an existing ancestor for {}", path.display())
                 })?;
