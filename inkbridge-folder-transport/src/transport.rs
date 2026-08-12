@@ -535,10 +535,24 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             if !file_is_settled(&export, state, now, self.settle)? {
                 continue;
             }
-            let bytes = fs::read(&export)
-                .map_err(|error| format!("could not read {}: {error}", export.display()))?;
+            let (bytes, content_hash, post_read_hash) =
+                read_snapshot_and_current_hash(&export, |path| {
+                    fs::read(path)
+                        .map_err(|error| format!("could not read {}: {error}", path.display()))
+                })?;
             if !file_is_settled(&export, state, now, self.settle)? {
                 continue;
+            }
+            if post_read_hash != content_hash {
+                remember_content_change(&export, state, SystemTime::now(), &post_read_hash)?;
+                report.actions.push(TransportAction::Deferred {
+                    side: DeviceSide::Supernote,
+                    reason: format!(
+                        "Supernote export {} changed while its upload snapshot was being read",
+                        export.display()
+                    ),
+                });
+                return Ok(());
             }
             let parsed = parse_baseline_bytes(&bytes, &export.to_string_lossy())?;
             if parsed.source_file_name.as_deref() != Some(document.original_file_name.as_str()) {
@@ -550,7 +564,6 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 ));
             }
             let local_key = canonical_path_key(&export);
-            let content_hash = sha256_hex(&bytes);
             if state
                 .document_mut(&document.document_id)
                 .supernote
@@ -902,6 +915,19 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn read_snapshot_and_current_hash<F>(
+    path: &Path,
+    read: F,
+) -> Result<(Vec<u8>, String, String), String>
+where
+    F: FnOnce(&Path) -> Result<Vec<u8>, String>,
+{
+    let bytes = read(path)?;
+    let content_hash = sha256_hex(&bytes);
+    let current_hash = sha256_file(path)?;
+    Ok((bytes, content_hash, current_hash))
+}
+
 fn sibling_temporary(path: &Path, suffix: &str) -> PathBuf {
     let name = path
         .file_name()
@@ -941,4 +967,28 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
         ));
     }
     fs::remove_file(backup).map_err(|error| format!("could not retire old file: {error}"))
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn snapshot_hash_detects_same_length_replacement_after_read() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("page.json");
+        fs::write(&path, b"first-export").unwrap();
+
+        let (bytes, content_hash, current_hash) = read_snapshot_and_current_hash(&path, |path| {
+            let bytes = fs::read(path).map_err(|error| error.to_string())?;
+            fs::write(path, b"later-export").map_err(|error| error.to_string())?;
+            Ok(bytes)
+        })
+        .unwrap();
+
+        assert_eq!(bytes, b"first-export");
+        assert_ne!(content_hash, current_hash);
+        assert_eq!(current_hash, sha256_hex(b"later-export"));
+    }
 }
