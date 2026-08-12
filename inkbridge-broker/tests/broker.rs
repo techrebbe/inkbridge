@@ -461,6 +461,37 @@ fn compact_manifest_requires_identity_and_verified_fingerprints() {
 }
 
 #[test]
+fn compact_manifest_rejects_samples_the_supernote_would_clamp() {
+    let mut harness = Harness::new();
+    let mut out_of_range = stroke("out-of-range", 0.2, 0.3);
+    out_of_range.samples[0] = [1.01, -0.01, 4097.0];
+    out_of_range.geometry_fingerprint =
+        geometry_fingerprint(&out_of_range.native_style, &out_of_range.samples);
+    let mut event = harness.event(
+        "boox-compact-out-of-range",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: out_of_range.source_uuid.clone(),
+                page_index: out_of_range.page_index,
+                before: None,
+                after: out_of_range,
+            }],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert!(!harness.state().strokes.contains_key("out-of-range"));
+}
+
+#[test]
 fn compact_manifest_uses_the_broker_coordinate_calibration() {
     let mut harness = Harness::new();
     let snapshot = stroke("calibrated-stroke", 0.2, 0.3);

@@ -499,11 +499,14 @@ impl Broker {
                     .ok()
                     .is_none_or(|page| page >= manifest.document.page_count)
                 || snapshot.samples.len() < 2
-                || snapshot
-                    .samples
-                    .iter()
-                    .flatten()
-                    .any(|value| !value.is_finite())
+                || snapshot.samples.iter().any(|[x, y, pressure]| {
+                    !x.is_finite()
+                        || !y.is_finite()
+                        || !pressure.is_finite()
+                        || !(0.0..=1.0).contains(x)
+                        || !(0.0..=1.0).contains(y)
+                        || !(0.0..=4096.0).contains(pressure)
+                })
                 || snapshot.geometry_fingerprint
                     != geometry_fingerprint(&snapshot.native_style, &snapshot.samples)
             {
