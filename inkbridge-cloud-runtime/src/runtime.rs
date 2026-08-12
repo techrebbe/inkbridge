@@ -1,6 +1,6 @@
 use crate::{
-    hydrate_content_hash, translate_storage_finalized_event, CanonicalStateStore,
-    CloudBrokerStorage, EventTranslation, ObjectStore, RegistrationEvent,
+    translate_storage_finalized_event, CanonicalStateStore, CloudBrokerStorage, EventTranslation,
+    ObjectStore, RegistrationEvent,
 };
 use axum::body::Bytes;
 use axum::extract::State;
@@ -68,7 +68,7 @@ impl RuntimeService {
         headers: &BTreeMap<String, String>,
         body: &[u8],
     ) -> Result<RuntimeOutcome, String> {
-        let mut event = match translate_storage_finalized_event(&self.bucket, headers, body) {
+        let event = match translate_storage_finalized_event(&self.bucket, headers, body) {
             Err(reason) => return Ok(RuntimeOutcome::Rejected { reason }),
             Ok(EventTranslation::Process(event)) => event,
             Ok(EventTranslation::Register(registration)) => {
@@ -80,26 +80,14 @@ impl RuntimeService {
         };
         let storage = CloudBrokerStorage::new(self.objects.clone(), self.states.clone());
         storage.recover(&event.document_id)?;
-        let source = self
-            .objects
-            .read(&event.object_path)?
-            .ok_or_else(|| format!("source object {} does not exist", event.object_path))?;
-        if source.generation != event.source_generation {
-            // Let the broker record an older finalized event as stale. For a
-            // supposedly newer generation, do not fabricate content bytes.
-            if source.generation < event.source_generation {
-                return Err(format!(
-                    "event generation {} is newer than object generation {}",
-                    event.source_generation, source.generation
-                ));
-            }
-        } else if let Err(reason) = hydrate_content_hash(&mut event, &source.bytes) {
-            return Ok(RuntimeOutcome::Rejected { reason });
-        }
         let mut storage = storage;
-        let outcome = Broker::default()
-            .process(&mut storage, &event)
-            .map_err(|error| error.to_string())?;
+        let outcome = match Broker::default().process(&mut storage, &event) {
+            Ok(outcome) => outcome,
+            Err(BrokerError::InvalidEvent(reason)) => {
+                return Ok(RuntimeOutcome::Rejected { reason });
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         Ok(RuntimeOutcome::Processed { outcome })
     }
 
@@ -337,6 +325,7 @@ mod tests {
                 "inkbridge-source-revision": "1",
                 "inkbridge-based-on-boox": "0",
                 "inkbridge-based-on-supernote": "0",
+                "inkbridge-sync-ready": "true",
                 "inkbridge-content-sha256": sha256_hex(&export)
             }
         }))
@@ -350,6 +339,11 @@ mod tests {
                 outcome: ProcessOutcome::Applied { .. }
             }
         ));
+        assert_eq!(
+            objects.read_count(&path),
+            1,
+            "device payload was downloaded more than once"
+        );
         let active = states_record(&service, &state.document_id);
         let pdf_path = boox_view_path(&active);
         let generated = objects.read(&pdf_path).unwrap().unwrap();
@@ -392,13 +386,21 @@ mod tests {
     fn malformed_device_metadata_and_false_hash_are_acknowledged_as_rejected() {
         let objects = Arc::new(MemoryObjectStore::default());
         let states = Arc::new(MemoryCanonicalStateStore::default());
+        let original = objects.put("Staging/original.pdf", original_pdf());
         let service = RuntimeService::new("sync-bucket", objects.clone(), states);
-        let path = "BOOX_Folder/doc/view.pdf";
-        let object = objects.put(path, b"pdf".to_vec());
+        let state = service
+            .register_document(&RegisterDocumentRequest {
+                original_object_path: "Staging/original.pdf".to_owned(),
+                original_file_name: "document.pdf".to_owned(),
+                source_generation: Some(original.generation),
+            })
+            .unwrap();
+        let path = format!("BOOX_Folder/{}/view.pdf", state.document_id);
+        let object = objects.put(&path, b"pdf".to_vec());
 
         let missing_metadata = serde_json::to_vec(&json!({
             "bucket": "sync-bucket",
-            "name": path,
+            "name": path.clone(),
             "generation": object.generation.to_string(),
             "metadata": {}
         }))
@@ -415,10 +417,11 @@ mod tests {
             "name": path,
             "generation": object.generation.to_string(),
             "metadata": {
-                "inkbridge-document-id": "doc",
+                "inkbridge-document-id": state.document_id,
                 "inkbridge-source-revision": "1",
                 "inkbridge-based-on-boox": "0",
                 "inkbridge-based-on-supernote": "0",
+                "inkbridge-sync-ready": "true",
                 "inkbridge-content-sha256": "not-the-object-hash"
             }
         }))

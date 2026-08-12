@@ -1,6 +1,6 @@
 use inkbridge_broker::*;
 use inkbridge_convert::{geometry_fingerprint, Manifest, NativeStyle, Operation, StrokeSnapshot};
-use lopdf::{dictionary, Document, Object};
+use lopdf::{dictionary, Document, Object, Stream};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -70,6 +70,27 @@ fn original_pdf_with_pages(page_count: usize) -> Vec<u8> {
         "Pages" => pages_id,
     });
     document.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn original_pdf_with_padding(payload_mib: usize) -> Vec<u8> {
+    let mut document = Document::load_mem(&original_pdf()).unwrap();
+    let padding = document.add_object(Stream::new(
+        dictionary! {},
+        vec![0x5a; payload_mib * 1024 * 1024],
+    ));
+    let catalog_id = document
+        .trailer
+        .get(b"Root")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    document
+        .get_dictionary_mut(catalog_id)
+        .unwrap()
+        .set("InkBridgeLargeDocumentFixture", padding);
     let mut bytes = Vec::new();
     document.save_to(&mut bytes).unwrap();
     bytes
@@ -170,6 +191,7 @@ impl Harness {
             source_revision: revision,
             based_on,
             content_sha256,
+            payload_kind: DevicePayloadKind::DeviceView,
             broker_output: None,
         }
     }
@@ -222,14 +244,94 @@ fn boox_only_update_emits_supernote_manifest() {
         &manifest.operations[0],
         Operation::UpsertStroke { source_uuid, .. } if source_uuid == "boox-a"
     ));
+    assert!(harness
+        .storage
+        .paths()
+        .all(|path| !path.contains("/accepted/")));
     assert_eq!(
         harness
             .storage
             .object(&original_path(&harness.document_id))
             .unwrap()
-            .bytes,
-        harness.original
+            .bytes
+            .as_ref(),
+        harness.original.as_slice()
     );
+}
+
+#[test]
+fn compact_boox_manifest_produces_the_same_supernote_operations() {
+    let mut full = Harness::new();
+    let pdf = write_boox_view(&full.original, [stroke("boox-a", 0.1, 0.2)]).unwrap();
+    let full_event = full.event(
+        "boox-full",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        pdf,
+    );
+    full.broker.process(&mut full.storage, &full_event).unwrap();
+    let full_manifest_bytes = full
+        .storage
+        .object(&supernote_manifest_path(&full.document_id, "boox-full"))
+        .unwrap()
+        .bytes
+        .to_vec();
+    let expected: Manifest = serde_json::from_slice(&full_manifest_bytes).unwrap();
+
+    let mut compact = Harness::new();
+    let mut compact_event = compact.event(
+        "boox-compact",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        full_manifest_bytes,
+    );
+    compact_event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    compact
+        .broker
+        .process(&mut compact.storage, &compact_event)
+        .unwrap();
+    let actual: Manifest = serde_json::from_slice(
+        &compact
+            .storage
+            .object(&supernote_manifest_path(
+                &compact.document_id,
+                "boox-compact",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+#[ignore = "large-memory validation; set INKBRIDGE_LARGE_DOCUMENT_MIB (default 300)"]
+fn large_document_round_trip_does_not_create_an_accepted_pdf_copy() {
+    let size_mib = std::env::var("INKBRIDGE_LARGE_DOCUMENT_MIB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300);
+    let mut harness = Harness::with_original(original_pdf_with_padding(size_mib));
+    let event = harness.event(
+        "large-supernote-update",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("large-doc-stroke", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+    let state = harness.state();
+    let generated = harness.storage.object(&boox_view_path(&state)).unwrap();
+    assert!(generated.bytes.len() >= size_mib * 1024 * 1024);
+    assert!(harness
+        .storage
+        .paths()
+        .all(|path| !path.contains("/accepted/")));
 }
 
 #[test]
@@ -394,7 +496,7 @@ fn repeated_event_is_idempotent() {
 }
 
 #[test]
-fn out_of_order_event_for_overwritten_path_is_ignored_as_stale() {
+fn out_of_order_event_reads_its_exact_immutable_generation() {
     let mut harness = Harness::new();
     let stale = harness.event(
         "sn-stale-generation",
@@ -414,10 +516,11 @@ fn out_of_order_event_for_overwritten_path_is_ignored_as_stale() {
             .broker
             .process(&mut harness.storage, &stale)
             .unwrap(),
-        ProcessOutcome::IgnoredStaleSource { .. }
+        ProcessOutcome::Applied { .. }
     ));
     let state = harness.state();
-    assert_eq!(state.supernote.revision, 0);
+    assert_eq!(state.supernote.revision, 1);
+    assert!(state.strokes.contains_key("old"));
     assert!(state.processed_event_ids.contains("sn-stale-generation"));
 }
 
@@ -454,6 +557,7 @@ fn broker_generated_output_event_is_ignored() {
         source_revision: 1,
         based_on: revisions,
         content_sha256: sha256_hex(&output.bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: Some(BrokerOutputMarker {
             producer: BROKER_PRODUCER.to_owned(),
             event_id: "sn-source".to_owned(),
@@ -504,7 +608,10 @@ fn stale_destination_generation_does_not_overwrite_newer_content() {
         .process(&mut harness.storage, &second)
         .unwrap_err();
     assert!(matches!(error, BrokerError::StaleDestination { .. }));
-    assert_eq!(harness.storage.object(&path).unwrap().bytes, external);
+    assert_eq!(
+        harness.storage.object(&path).unwrap().bytes.as_ref(),
+        external
+    );
     assert_eq!(harness.state().supernote.revision, 1);
 }
 
@@ -545,6 +652,7 @@ fn accepted_in_place_boox_edit_becomes_the_next_destination_baseline() {
             supernote: 1,
         },
         content_sha256: edited_hash.clone(),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: Some(BrokerOutputMarker {
             producer: BROKER_PRODUCER.to_owned(),
             event_id: "sn-1".to_owned(),
@@ -668,15 +776,23 @@ fn conflict_preserves_the_immutable_accepted_device_revision() {
         source_revision: 1,
         based_on: common,
         content_sha256: sha256_hex(&accepted_boox),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: None,
     };
     harness
         .broker
         .process(&mut harness.storage, &boox_event)
         .unwrap();
-    let accepted_path = harness.state().boox.accepted_object_path;
+    let accepted_state = harness.state();
+    assert!(accepted_state.boox.accepted_object_path.is_empty());
     assert_eq!(
-        harness.storage.object(&accepted_path).unwrap().bytes,
+        harness
+            .storage
+            .read_generation(&boox_path, accepted_object.generation)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
         accepted_boox
     );
 
@@ -705,7 +821,8 @@ fn conflict_preserves_the_immutable_accepted_device_revision() {
             .storage
             .object(&conflict.competing_preserved_paths[0])
             .unwrap()
-            .bytes,
+            .bytes
+            .as_ref(),
         accepted_boox
     );
 }
@@ -933,6 +1050,7 @@ fn real_device_manifest_is_byte_identical_to_proven_converter_output() {
         source_revision: 1,
         based_on: RevisionPair::default(),
         content_sha256: sha256_hex(&baseline),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: None,
     };
     broker.process(&mut storage, &sn_event).unwrap();
@@ -971,6 +1089,7 @@ fn real_device_manifest_is_byte_identical_to_proven_converter_output() {
             supernote: 1,
         },
         content_sha256: sha256_hex(&boox),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: None,
     };
     broker.process(&mut storage, &boox_event).unwrap();
@@ -981,5 +1100,5 @@ fn real_device_manifest_is_byte_identical_to_proven_converter_output() {
         ))
         .unwrap()
         .bytes;
-    assert_eq!(actual, &expected);
+    assert_eq!(actual.as_ref(), expected.as_slice());
 }

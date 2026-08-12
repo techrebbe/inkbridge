@@ -1,5 +1,5 @@
-use crate::{bearer_headers, HttpRequest, HttpTransport, ObjectStore, TokenProvider};
-use inkbridge_broker::{CommitError, ConditionalWrite, GenerationPrecondition, StoredObject};
+use crate::{bearer_headers, HttpBody, HttpRequest, HttpTransport, ObjectStore, TokenProvider};
+use inkbridge_broker::{blob, CommitError, ConditionalWrite, GenerationPrecondition, StoredObject};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use serde::Deserialize;
 use serde_json::json;
@@ -58,24 +58,20 @@ impl GoogleCloudStorage {
         )
     }
 
-    fn authorized_headers(&self) -> Result<BTreeMap<String, String>, String> {
-        self.tokens
-            .access_token()
-            .map(|token| bearer_headers(&token))
-    }
-
-    fn parse_metadata(&self, body: &[u8]) -> Result<ObjectMetadata, String> {
-        serde_json::from_slice(body).map_err(|error| error.to_string())
-    }
-}
-
-impl ObjectStore for GoogleCloudStorage {
-    fn read(&self, path: &str) -> Result<Option<StoredObject>, String> {
+    fn read_at(
+        &self,
+        path: &str,
+        requested_generation: Option<u64>,
+    ) -> Result<Option<StoredObject>, String> {
+        let metadata_url = match requested_generation {
+            Some(generation) => format!("{}?generation={generation}", self.metadata_url(path)),
+            None => self.metadata_url(path),
+        };
         let metadata_response = self.transport.execute(HttpRequest {
             method: "GET".to_owned(),
-            url: self.metadata_url(path),
+            url: metadata_url,
             headers: self.authorized_headers()?,
-            body: Vec::new(),
+            body: HttpBody::empty(),
         })?;
         if metadata_response.status == 404 {
             return Ok(None);
@@ -91,6 +87,9 @@ impl ObjectStore for GoogleCloudStorage {
             .generation
             .parse::<u64>()
             .map_err(|error| error.to_string())?;
+        if requested_generation.is_some_and(|requested| requested != generation) {
+            return Ok(None);
+        }
         let media_response = self.transport.execute(HttpRequest {
             method: "GET".to_owned(),
             url: format!(
@@ -98,8 +97,11 @@ impl ObjectStore for GoogleCloudStorage {
                 self.metadata_url(path)
             ),
             headers: self.authorized_headers()?,
-            body: Vec::new(),
+            body: HttpBody::empty(),
         })?;
+        if media_response.status == 404 {
+            return Ok(None);
+        }
         if media_response.status != 200 {
             return Err(format!(
                 "Cloud Storage media read for {path}@{generation} returned HTTP {}",
@@ -107,10 +109,53 @@ impl ObjectStore for GoogleCloudStorage {
             ));
         }
         Ok(Some(StoredObject {
-            bytes: media_response.body,
+            bytes: blob(media_response.body),
             generation,
             metadata: metadata.metadata,
         }))
+    }
+
+    fn authorized_headers(&self) -> Result<BTreeMap<String, String>, String> {
+        self.tokens
+            .access_token()
+            .map(|token| bearer_headers(&token))
+    }
+
+    fn parse_metadata(&self, body: &[u8]) -> Result<ObjectMetadata, String> {
+        serde_json::from_slice(body).map_err(|error| error.to_string())
+    }
+
+    fn current_generation(&self, path: &str) -> Result<Option<u64>, String> {
+        let response = self.transport.execute(HttpRequest {
+            method: "GET".to_owned(),
+            url: self.metadata_url(path),
+            headers: self.authorized_headers()?,
+            body: HttpBody::empty(),
+        })?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if response.status != 200 {
+            return Err(format!(
+                "Cloud Storage metadata read for {path} returned HTTP {}",
+                response.status
+            ));
+        }
+        self.parse_metadata(&response.body)?
+            .generation
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl ObjectStore for GoogleCloudStorage {
+    fn read(&self, path: &str) -> Result<Option<StoredObject>, String> {
+        self.read_at(path, None)
+    }
+
+    fn read_generation(&self, path: &str, generation: u64) -> Result<Option<StoredObject>, String> {
+        self.read_at(path, Some(generation))
     }
 
     fn conditional_write(&self, write: &ConditionalWrite) -> Result<StoredObject, CommitError> {
@@ -118,57 +163,87 @@ impl ObjectStore for GoogleCloudStorage {
             GenerationPrecondition::DoesNotExist => 0,
             GenerationPrecondition::Match(generation) => generation,
         };
-        let boundary = format!(
-            "inkbridge-{}",
-            inkbridge_broker::sha256_hex(write.path.as_bytes())
-        );
         let object_metadata = serde_json::to_vec(&json!({
             "name": write.path,
             "metadata": write.metadata,
         }))
         .map_err(|error| CommitError::Other(error.to_string()))?;
-        let mut body = Vec::new();
-        body.extend_from_slice(
-            format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n")
-                .as_bytes(),
-        );
-        body.extend_from_slice(&object_metadata);
-        body.extend_from_slice(
-            format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n")
-                .as_bytes(),
-        );
-        body.extend_from_slice(&write.bytes);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let mut headers = self.authorized_headers().map_err(CommitError::Other)?;
         headers.insert(
             "Content-Type".to_owned(),
-            format!("multipart/related; boundary={boundary}"),
+            "application/json; charset=UTF-8".to_owned(),
         );
-        let response = self
+        headers.insert(
+            "X-Upload-Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        );
+        headers.insert(
+            "X-Upload-Content-Length".to_owned(),
+            write.bytes.len().to_string(),
+        );
+        let session = self
             .transport
             .execute(HttpRequest {
                 method: "POST".to_owned(),
                 url: format!(
-                    "{}/b/{}/o?uploadType=multipart&ifGenerationMatch={expected_generation}",
+                    "{}/b/{}/o?uploadType=resumable&ifGenerationMatch={expected_generation}",
                     self.upload_base,
                     Self::encoded(&self.bucket)
                 ),
                 headers,
-                body,
+                body: HttpBody::bytes(object_metadata),
             })
             .map_err(CommitError::Other)?;
-        if response.status == 412 {
+        if session.status == 412 {
             let actual = self
-                .read(&write.path)
-                .map_err(CommitError::Other)?
-                .map(|object| object.generation);
+                .current_generation(&write.path)
+                .map_err(CommitError::Other)?;
             return Err(CommitError::PreconditionFailed {
                 path: write.path.clone(),
                 expected: write.precondition,
                 actual,
             });
         }
-        if response.status != 200 {
+        if !matches!(session.status, 200 | 201) {
+            return Err(CommitError::Other(format!(
+                "Cloud Storage resumable upload session for {} returned HTTP {}",
+                write.path, session.status
+            )));
+        }
+        let upload_url = session
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| {
+                CommitError::Other(format!(
+                    "Cloud Storage resumable upload session for {} returned no Location header",
+                    write.path
+                ))
+            })?;
+        let response = self
+            .transport
+            .execute(HttpRequest {
+                method: "PUT".to_owned(),
+                url: upload_url,
+                headers: BTreeMap::from([
+                    (
+                        "Content-Type".to_owned(),
+                        "application/octet-stream".to_owned(),
+                    ),
+                    ("Content-Length".to_owned(), write.bytes.len().to_string()),
+                ]),
+                body: HttpBody::shared(write.bytes.clone()),
+            })
+            .map_err(CommitError::Other)?;
+        if response.status == 412 {
+            return Err(CommitError::PreconditionFailed {
+                path: write.path.clone(),
+                expected: write.precondition,
+                actual: None,
+            });
+        }
+        if !matches!(response.status, 200 | 201) {
             return Err(CommitError::Other(format!(
                 "Cloud Storage write for {} returned HTTP {}",
                 write.path, response.status
@@ -210,11 +285,21 @@ mod tests {
     #[test]
     fn create_uses_zero_generation_precondition_and_custom_metadata() {
         let transport = Arc::new(RecordingTransport::default());
-        transport.responses.lock().unwrap().push(HttpResponse {
-            status: 200,
-            headers: BTreeMap::new(),
-            body: br#"{"generation":"41","metadata":{"kind":"generated"}}"#.to_vec(),
-        });
+        transport.responses.lock().unwrap().extend([
+            HttpResponse {
+                status: 200,
+                headers: BTreeMap::from([(
+                    "Location".to_owned(),
+                    "https://upload.example/session".to_owned(),
+                )]),
+                body: Vec::new(),
+            },
+            HttpResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: br#"{"generation":"41","metadata":{"kind":"generated"}}"#.to_vec(),
+            },
+        ]);
         let storage = GoogleCloudStorage::new(
             "private bucket",
             transport.clone(),
@@ -223,15 +308,50 @@ mod tests {
         let object = storage
             .conditional_write(&ConditionalWrite {
                 path: "BOOX_Folder/doc/view.pdf".to_owned(),
-                bytes: b"pdf".to_vec(),
+                bytes: blob(b"pdf".to_vec()),
                 metadata: BTreeMap::from([("kind".to_owned(), "generated".to_owned())]),
                 precondition: GenerationPrecondition::DoesNotExist,
             })
             .unwrap();
         assert_eq!(object.generation, 41);
         let requests = transport.requests.lock().unwrap();
+        assert!(requests[0].url.contains("uploadType=resumable"));
         assert!(requests[0].url.contains("ifGenerationMatch=0"));
         assert!(requests[0].url.contains("private%20bucket"));
-        assert!(String::from_utf8_lossy(&requests[0].body).contains("BOOX_Folder/doc/view.pdf"));
+        assert!(
+            String::from_utf8_lossy(requests[0].body.as_ref()).contains("BOOX_Folder/doc/view.pdf")
+        );
+        assert_eq!(requests[1].url, "https://upload.example/session");
+        assert!(matches!(requests[1].body, HttpBody::Shared(_)));
+    }
+
+    #[test]
+    fn exact_generation_read_never_falls_forward_to_latest() {
+        let transport = Arc::new(RecordingTransport::default());
+        transport.responses.lock().unwrap().extend([
+            HttpResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: br#"{"generation":"17","metadata":{}}"#.to_vec(),
+            },
+            HttpResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: b"old immutable generation".to_vec(),
+            },
+        ]);
+        let storage = GoogleCloudStorage::new(
+            "private-bucket",
+            transport.clone(),
+            Arc::new(StaticTokenProvider("token".to_owned())),
+        );
+        let object = storage
+            .read_generation("BOOX_Folder/doc/view.pdf", 17)
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.bytes.as_ref(), b"old immutable generation");
+        let requests = transport.requests.lock().unwrap();
+        assert!(requests[0].url.ends_with("?generation=17"));
+        assert!(requests[1].url.contains("alt=media&generation=17"));
     }
 }

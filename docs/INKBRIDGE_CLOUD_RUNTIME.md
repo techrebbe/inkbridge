@@ -21,6 +21,8 @@ inkbridge-source-revision
 inkbridge-based-on-boox
 inkbridge-based-on-supernote
 inkbridge-content-sha256        # optional; runtime verifies or computes it
+inkbridge-sync-ready=true       # explicit finalized/closed-file signal
+inkbridge-payload-kind          # device_view (default) or boox_operation_manifest
 ```
 
 Broker outputs already carry the producer, source event, document ID, source
@@ -91,7 +93,6 @@ Staging/                                  # registration input only
 Originals/<documentId>/original.pdf       # immutable source
 BOOX_Folder/<documentId>/<name>.pdf       # generated/editable BOOX view
 Supernote_Folder/<documentId>/incoming/   # native-operation manifests
-Canonical/<documentId>/accepted/          # immutable accepted input evidence
 Canonical/<documentId>/states/            # immutable canonical-state blobs
 BrokerOutbox/<documentId>/<commitId>/      # immutable staged output payloads
 Conflicts/<documentId>/<event>/           # both sides preserved
@@ -99,6 +100,32 @@ Conflicts/<documentId>/<event>/           # both sides preserved
 
 Canonical active state and the durable outbox live in Firestore. Device folder
 objects remain generated views; the original is never rewritten.
+
+## Large-document behavior
+
+Full-PDF device views remain supported, but the broker reads the exact finalized
+Cloud Storage generation once and records that immutable generation as revision
+evidence. It no longer creates a second `Canonical/accepted` copy of every
+300–500 MB BOOX update. Binary payload handles are reference counted inside one
+request, converter hashing is streamed in 1 MiB chunks, and the original input
+buffer is released after PDF parsing before serialization begins.
+
+The intended BOOX folder adapter should run `inkbridge-convert` locally and
+upload the usually small JSON result with
+`inkbridge-payload-kind=boox_operation_manifest`. That path produces the same
+Supernote operations as uploading the complete NeoReader PDF, while avoiding a
+full document upload and Cloud Run parse for ink-only changes. Until that
+adapter ships, a BOOX full-PDF edit still transfers the whole object because
+Cloud Storage finalized events contain whole immutable objects, not byte diffs.
+Generated objects use Cloud Storage resumable uploads, so the runtime streams a
+shared payload buffer instead of constructing a second full multipart body.
+
+The deployment reserves 2 vCPU and 8 GiB only while a request is active, uses
+concurrency one, allows up to 15 minutes for unusually large PDFs, and still
+scales to zero. Live `Staging/` objects expire after one day and live
+`BrokerOutbox/` payloads after seven days; archived versions of those transient
+prefixes expire after one day. Originals, device generations that may still be
+canonical evidence, and conflicts are intentionally not auto-deleted.
 
 ## Authentication and local validation
 
@@ -128,3 +155,10 @@ The reviewed operator flow tags a source commit, resolves that tag to a digest,
 adds the protected `deployed-current` tag, and supplies only the immutable
 digest to Terraform. Cleanup expires old `build-` tags while the protected
 deployed tag prevents the Cloud Run digest from being removed.
+
+The opt-in local large-document gate used for this milestone is:
+
+```text
+INKBRIDGE_LARGE_DOCUMENT_MIB=300 cargo test -p inkbridge-broker \
+  large_document_round_trip_does_not_create_an_accepted_pdf_copy -- --ignored --exact
+```

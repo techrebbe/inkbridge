@@ -1,6 +1,6 @@
 use inkbridge_broker::{
-    sha256_hex, state_path, BrokerStorage, CommitError, ConditionalWrite, GenerationPrecondition,
-    StoredObject,
+    blob, sha256_hex, state_path, Blob, BrokerStorage, CommitError, ConditionalWrite,
+    GenerationPrecondition, StoredObject,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -62,6 +62,10 @@ pub trait CanonicalStateStore: Send + Sync {
 
 pub trait ObjectStore: Send + Sync {
     fn read(&self, path: &str) -> Result<Option<StoredObject>, String>;
+    fn read_generation(&self, path: &str, generation: u64) -> Result<Option<StoredObject>, String> {
+        self.read(path)
+            .map(|object| object.filter(|candidate| candidate.generation == generation))
+    }
     fn conditional_write(&self, write: &ConditionalWrite) -> Result<StoredObject, CommitError>;
 }
 
@@ -185,6 +189,8 @@ pub struct MemoryObjectStore {
 #[derive(Default)]
 struct MemoryObjectState {
     objects: BTreeMap<String, StoredObject>,
+    versions: BTreeMap<(String, u64), StoredObject>,
+    reads: BTreeMap<String, usize>,
     next_generation: u64,
     fail_after_writes: Option<usize>,
     successful_writes: usize,
@@ -194,12 +200,16 @@ impl MemoryObjectStore {
     pub fn put(&self, path: impl Into<String>, bytes: Vec<u8>) -> StoredObject {
         let mut inner = self.inner.lock().unwrap();
         inner.next_generation += 1;
+        let path = path.into();
         let object = StoredObject {
-            bytes,
+            bytes: blob(bytes),
             generation: inner.next_generation,
             metadata: BTreeMap::new(),
         };
-        inner.objects.insert(path.into(), object.clone());
+        inner.objects.insert(path.clone(), object.clone());
+        inner
+            .versions
+            .insert((path, object.generation), object.clone());
         object
     }
 
@@ -212,11 +222,29 @@ impl MemoryObjectStore {
     pub fn clear_failure(&self) {
         self.inner.lock().unwrap().fail_after_writes = None;
     }
+
+    pub fn read_count(&self, path: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .reads
+            .get(path)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 impl ObjectStore for MemoryObjectStore {
     fn read(&self, path: &str) -> Result<Option<StoredObject>, String> {
-        Ok(self.inner.lock().unwrap().objects.get(path).cloned())
+        let mut inner = self.inner.lock().unwrap();
+        *inner.reads.entry(path.to_owned()).or_default() += 1;
+        Ok(inner.objects.get(path).cloned())
+    }
+
+    fn read_generation(&self, path: &str, generation: u64) -> Result<Option<StoredObject>, String> {
+        let mut inner = self.inner.lock().unwrap();
+        *inner.reads.entry(path.to_owned()).or_default() += 1;
+        Ok(inner.versions.get(&(path.to_owned(), generation)).cloned())
     }
 
     fn conditional_write(&self, write: &ConditionalWrite) -> Result<StoredObject, CommitError> {
@@ -255,6 +283,9 @@ impl ObjectStore for MemoryObjectStore {
             metadata: write.metadata.clone(),
         };
         inner.objects.insert(write.path.clone(), object.clone());
+        inner
+            .versions
+            .insert((write.path.clone(), object.generation), object.clone());
         Ok(object)
     }
 }
@@ -332,10 +363,10 @@ impl CloudBrokerStorage {
         Ok(delivered_objects)
     }
 
-    fn read_payload(&self, payload: &PayloadRef) -> Result<Vec<u8>, CommitError> {
+    fn read_payload(&self, payload: &PayloadRef) -> Result<Blob, CommitError> {
         let object = self
             .objects
-            .read(&payload.path)
+            .read_generation(&payload.path, payload.generation)
             .map_err(CommitError::Other)?
             .ok_or_else(|| {
                 CommitError::Other(format!("outbox payload {} disappeared", payload.path))
@@ -428,6 +459,15 @@ impl BrokerStorage for CloudBrokerStorage {
                 .transpose();
         }
         self.objects.read(path)
+    }
+
+    fn read_generation(&self, path: &str, generation: u64) -> Result<Option<StoredObject>, String> {
+        if document_id_from_state_path(path).is_some() {
+            return self
+                .read(path)
+                .map(|object| object.filter(|candidate| candidate.generation == generation));
+        }
+        self.objects.read_generation(path, generation)
     }
 
     fn commit(&mut self, writes: Vec<ConditionalWrite>) -> Result<Vec<StoredObject>, CommitError> {
@@ -577,7 +617,7 @@ fn document_id_from_state_path(path: &str) -> Option<&str> {
         .filter(|document_id| !document_id.is_empty() && state_path(document_id) == path)
 }
 
-fn materialize_write(write: &OutboxWrite, bytes: Vec<u8>) -> ConditionalWrite {
+fn materialize_write(write: &OutboxWrite, bytes: Blob) -> ConditionalWrite {
     ConditionalWrite {
         path: write.path.clone(),
         bytes,
@@ -594,19 +634,19 @@ mod tests {
         vec![
             ConditionalWrite {
                 path: "BOOX_Folder/doc/view.pdf".to_owned(),
-                bytes: b"view".to_vec(),
+                bytes: blob(b"view".to_vec()),
                 metadata: BTreeMap::from([("source".to_owned(), "broker".to_owned())]),
                 precondition: GenerationPrecondition::DoesNotExist,
             },
             ConditionalWrite {
                 path: "Canonical/doc/accepted/input.json".to_owned(),
-                bytes: b"accepted".to_vec(),
+                bytes: blob(b"accepted".to_vec()),
                 metadata: BTreeMap::new(),
                 precondition: GenerationPrecondition::DoesNotExist,
             },
             ConditionalWrite {
                 path: state_path("doc"),
-                bytes: b"state".to_vec(),
+                bytes: blob(b"state".to_vec()),
                 metadata: BTreeMap::new(),
                 precondition: GenerationPrecondition::DoesNotExist,
             },
@@ -642,7 +682,12 @@ mod tests {
             first_generation
         );
         assert_eq!(
-            storage.read(&state_path("doc")).unwrap().unwrap().bytes,
+            storage
+                .read(&state_path("doc"))
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
             b"state"
         );
         assert!(states.record("doc").unwrap().pending.is_none());
@@ -670,7 +715,9 @@ mod tests {
         assert_eq!(original, commit_id("doc", state, objects));
 
         let mut changed_bytes = objects.to_vec();
-        changed_bytes[0].bytes.push(0);
+        let mut payload = changed_bytes[0].bytes.to_vec();
+        payload.push(0);
+        changed_bytes[0].bytes = blob(payload);
         assert_ne!(original, commit_id("doc", state, &changed_bytes));
 
         let mut changed_guard = objects.to_vec();

@@ -1,3 +1,4 @@
+use inkbridge_broker::Blob;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -6,11 +7,40 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HttpBody {
+    Bytes(Vec<u8>),
+    Shared(Blob),
+}
+
+impl HttpBody {
+    pub fn empty() -> Self {
+        Self::Bytes(Vec::new())
+    }
+
+    pub fn bytes(bytes: Vec<u8>) -> Self {
+        Self::Bytes(bytes)
+    }
+
+    pub fn shared(bytes: Blob) -> Self {
+        Self::Shared(bytes)
+    }
+}
+
+impl AsRef<[u8]> for HttpBody {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
     pub headers: BTreeMap<String, String>,
-    pub body: Vec<u8>,
+    pub body: HttpBody,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,8 +77,15 @@ impl HttpTransport for ReqwestTransport {
         for (name, value) in request.headers {
             builder = builder.header(name, value);
         }
+        let body = match request.body {
+            HttpBody::Bytes(bytes) => reqwest::blocking::Body::from(bytes),
+            HttpBody::Shared(bytes) => {
+                let length = bytes.len() as u64;
+                reqwest::blocking::Body::sized(std::io::Cursor::new(bytes), length)
+            }
+        };
         let response = builder
-            .body(request.body)
+            .body(body)
             .send()
             .map_err(|error| error.to_string())?;
         let status = response.status().as_u16();
@@ -125,7 +162,7 @@ impl TokenProvider for GoogleTokenProvider {
             method: "GET".to_owned(),
             url: "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token".to_owned(),
             headers: BTreeMap::from([("Metadata-Flavor".to_owned(), "Google".to_owned())]),
-            body: Vec::new(),
+            body: HttpBody::empty(),
         })?;
         if response.status != 200 {
             return Err(format!(
