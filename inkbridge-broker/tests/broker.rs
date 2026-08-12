@@ -257,6 +257,41 @@ fn re_registering_legacy_document_persists_original_page_count() {
 }
 
 #[test]
+fn compact_processing_backfills_legacy_document_page_count() {
+    let mut harness = Harness::new();
+    let mut legacy = harness.state();
+    legacy.original_page_count = 0;
+    harness.storage.put_unchecked(
+        state_path(&harness.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+    let snapshot = stroke("legacy-compact", 0.2, 0.3);
+    let mut event = harness.event(
+        "boox-legacy-compact",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: snapshot.source_uuid.clone(),
+                page_index: snapshot.page_index,
+                before: None,
+                after: snapshot,
+            }],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+    assert_eq!(harness.state().original_page_count, 1);
+}
+
+#[test]
 fn boox_only_update_emits_supernote_manifest() {
     let mut harness = Harness::new();
     let pdf = write_boox_view(&harness.original, [stroke("boox-a", 0.1, 0.2)]).unwrap();

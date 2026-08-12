@@ -269,6 +269,25 @@ impl Broker {
                 &source.bytes,
             );
         }
+        if event.payload_kind == DevicePayloadKind::BooxOperationManifest
+            && state.original_page_count == 0
+        {
+            let original = storage
+                .read(&state.original_object_path)
+                .map_err(BrokerError::Storage)?
+                .ok_or_else(|| BrokerError::MissingObject(state.original_object_path.clone()))?;
+            if sha256_hex(&original.bytes) != state.original_pdf_sha256 {
+                return Err(BrokerError::CorruptState(
+                    "immutable original PDF hash changed".to_owned(),
+                ));
+            }
+            let document = lopdf::Document::load_mem(&original.bytes).map_err(|error| {
+                BrokerError::CorruptState(format!(
+                    "immutable original is not a readable PDF: {error}"
+                ))
+            })?;
+            state.original_page_count = document.get_pages().len();
+        }
 
         let source_bytes = source.bytes;
         let (destination_path, output_bytes, boox_source_file_name) = match event.source {
