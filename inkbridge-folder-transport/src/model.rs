@@ -117,14 +117,14 @@ impl TransportConfig {
         let mut ids = BTreeSet::new();
         let mut boox_paths = BTreeSet::<String>::new();
         let mut supernote_paths = BTreeSet::<String>::new();
-        let state_paths = if self.state_path.as_os_str().is_empty() {
-            Vec::new()
-        } else {
-            state_reserved_paths(&self.state_path)
-                .into_iter()
-                .map(|path| normalized_path_key(&path).map(|key| (path, key)))
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        let mut state_paths = Vec::<(PathBuf, String)>::new();
+        if !self.state_path.as_os_str().is_empty() {
+            for path in state_reserved_paths(&self.state_path) {
+                for key in path_key_variants(&path)? {
+                    state_paths.push((path.clone(), key));
+                }
+            }
+        }
         for document in &self.documents {
             if !is_stable_document_id(&document.document_id) {
                 return Err(format!(
@@ -135,36 +135,39 @@ impl TransportConfig {
             if !ids.insert(&document.document_id) {
                 return Err(format!("duplicate documentId {}", document.document_id));
             }
-            let boox_path = normalized_path_key(&document.boox_pdf)?;
-            if boox_paths
-                .iter()
-                .any(|existing| boox_paths_conflict(existing, &boox_path))
-            {
+            let document_boox_paths = path_key_variants(&document.boox_pdf)?;
+            if document_boox_paths.iter().any(|boox_path| {
+                boox_paths
+                    .iter()
+                    .any(|existing| boox_paths_conflict(existing, boox_path))
+            }) {
                 return Err(format!(
                     "booxPdf mapping {} collides with another BOOX file or reserved temporary path",
                     document.boox_pdf.display()
                 ));
             }
-            boox_paths.insert(boox_path.clone());
-            if supernote_paths
-                .iter()
-                .any(|directory| boox_mapping_overlaps_path(&boox_path, directory))
-            {
+            if document_boox_paths.iter().any(|boox_path| {
+                supernote_paths
+                    .iter()
+                    .any(|directory| boox_mapping_overlaps_path(boox_path, directory))
+            }) {
                 return Err(format!(
                     "BOOX file {} overlaps a mapped Supernote directory",
                     document.boox_pdf.display()
                 ));
             }
-            if let Some((reserved_path, _)) = state_paths
-                .iter()
-                .find(|(_, state)| boox_mapping_overlaps_path(&boox_path, state))
-            {
+            if let Some((reserved_path, _)) = state_paths.iter().find(|(_, state)| {
+                document_boox_paths
+                    .iter()
+                    .any(|boox_path| boox_mapping_overlaps_path(boox_path, state))
+            }) {
                 return Err(format!(
                     "statePath or companion {} collides with BOOX file {}",
                     reserved_path.display(),
                     document.boox_pdf.display()
                 ));
             }
+            boox_paths.extend(document_boox_paths);
             if document.original_file_name.trim().is_empty() {
                 return Err(format!(
                     "{} has an empty originalFileName",
@@ -181,27 +184,31 @@ impl TransportConfig {
                 ("outgoing", &document.supernote_export_directory),
                 ("incoming", &document.supernote_incoming_directory),
             ] {
-                let key = normalized_path_key(directory)?;
-                if supernote_paths.iter().any(|existing| {
-                    key_contains_path(existing, &key) || key_contains_path(&key, existing)
+                let directory_paths = path_key_variants(directory)?;
+                if directory_paths.iter().any(|key| {
+                    supernote_paths.iter().any(|existing| {
+                        key_contains_path(existing, key) || key_contains_path(key, existing)
+                    })
                 }) {
                     return Err(format!(
                         "Supernote {direction} directory {} overlaps a directory used by another mapping or direction",
                         directory.display()
                     ));
                 }
-                supernote_paths.insert(key.clone());
-                if boox_paths
-                    .iter()
-                    .any(|boox| boox_mapping_overlaps_path(boox, &key))
-                {
+                if directory_paths.iter().any(|key| {
+                    boox_paths
+                        .iter()
+                        .any(|boox| boox_mapping_overlaps_path(boox, key))
+                }) {
                     return Err(format!(
                         "Supernote {direction} directory {} overlaps a mapped BOOX file",
                         directory.display()
                     ));
                 }
                 if let Some((reserved_path, _)) = state_paths.iter().find(|(_, state)| {
-                    key_contains_path(&key, state) || key_contains_path(state, &key)
+                    directory_paths
+                        .iter()
+                        .any(|key| key_contains_path(key, state) || key_contains_path(state, key))
                 }) {
                     return Err(format!(
                         "statePath or companion {} must be outside Supernote {direction} directory {}",
@@ -209,6 +216,7 @@ impl TransportConfig {
                         directory.display()
                     ));
                 }
+                supernote_paths.extend(directory_paths);
             }
         }
         Ok(())
@@ -1195,6 +1203,51 @@ mod tests {
         assert!(TransportConfig::load(&entry)
             .unwrap_err()
             .contains("mapped Supernote"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configuration_rejects_temporary_beside_a_symlinked_boox_entry() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let entry_directory = directory.path().join("boox-entry");
+        let target_directory = directory.path().join("boox-target");
+        std::fs::create_dir_all(&entry_directory).unwrap();
+        std::fs::create_dir_all(&target_directory).unwrap();
+        let target = target_directory.join("book.pdf");
+        let entry = entry_directory.join("book.pdf");
+        std::fs::write(&target, b"pdf").unwrap();
+        symlink(&target, &entry).unwrap();
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::new(),
+            documents: vec![
+                DocumentFolders {
+                    document_id: test_document_id('a'),
+                    original_file_name: "first.pdf".to_owned(),
+                    boox_pdf: entry,
+                    supernote_export_directory: directory.path().join("first/outgoing"),
+                    supernote_incoming_directory: directory.path().join("first/incoming"),
+                },
+                DocumentFolders {
+                    document_id: test_document_id('b'),
+                    original_file_name: "second.pdf".to_owned(),
+                    boox_pdf: entry_directory.join(".book.pdf.compact-upload.part"),
+                    supernote_export_directory: directory.path().join("second/outgoing"),
+                    supernote_incoming_directory: directory.path().join("second/incoming"),
+                },
+            ],
+        };
+
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("reserved temporary"));
     }
 
     #[cfg(unix)]
