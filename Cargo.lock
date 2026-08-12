@@ -1078,6 +1078,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkbridge-folder-transport"
+version = "1.0.1"
+dependencies = [
+ "inkbridge-broker",
+ "inkbridge-convert",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "inkread-daily"
 version = "1.0.1"
 dependencies = [

@@ -478,6 +478,7 @@ impl Broker {
         manifest
             .coordinate_transform
             .pdf_to_supernote_normalized_y_offset = self.normalized_y_offset;
+        refresh_manifest_id(&mut manifest);
         if state.original_page_count != 0
             && manifest.document.page_count != state.original_page_count
         {
@@ -731,6 +732,27 @@ impl Broker {
             based_on: event.based_on,
         })
     }
+}
+
+fn refresh_manifest_id(manifest: &mut Manifest) {
+    let upserted = manifest
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, Operation::UpsertStroke { .. }))
+        .count();
+    let deleted = manifest.operations.len() - upserted;
+    let seed = format!(
+        "{}|{}|{}|{}|{:.8}",
+        manifest.document.pdf_sha256,
+        manifest.operations.len(),
+        upserted,
+        deleted,
+        manifest
+            .coordinate_transform
+            .pdf_to_supernote_normalized_y_offset
+    );
+    let hash = sha256_hex(seed.as_bytes());
+    manifest.manifest_id = format!("inkbridge-{}", &hash[..20]);
 }
 
 fn validate_event(event: &StorageEvent) -> Result<(), BrokerError> {
