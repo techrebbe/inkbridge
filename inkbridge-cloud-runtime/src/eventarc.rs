@@ -20,7 +20,16 @@ pub struct CloudStorageObjectData {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventTranslation {
     Process(StorageEvent),
+    Register(RegistrationEvent),
     Ignore { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistrationEvent {
+    pub event_id: String,
+    pub object_path: String,
+    pub source_generation: u64,
+    pub original_file_name: String,
 }
 
 pub fn translate_storage_finalized_event(
@@ -48,6 +57,39 @@ pub fn translate_storage_finalized_event(
             ),
         });
     }
+    let source_generation = object
+        .generation
+        .parse::<u64>()
+        .map_err(|error| format!("invalid Cloud Storage generation: {error}"))?;
+    if object.name.starts_with("Staging/") {
+        if !object
+            .metadata
+            .get("inkbridge-register-original")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            return Ok(EventTranslation::Ignore {
+                reason: format!(
+                    "staging object {} is not marked for document registration",
+                    object.name
+                ),
+            });
+        }
+        let original_file_name = object
+            .metadata
+            .get("inkbridge-original-file-name")
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| object.name.rsplit('/').next())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "registration object has no usable file name".to_owned())?
+            .to_owned();
+        return Ok(EventTranslation::Register(RegistrationEvent {
+            event_id,
+            object_path: object.name,
+            source_generation,
+            original_file_name,
+        }));
+    }
     let source = if object.name.starts_with("BOOX_Folder/") {
         DeviceSide::Boox
     } else if object.name.starts_with("Supernote_Folder/") {
@@ -58,10 +100,6 @@ pub fn translate_storage_finalized_event(
         });
     };
     let document_id = required_metadata(&object.metadata, "inkbridge-document-id")?.to_owned();
-    let source_generation = object
-        .generation
-        .parse::<u64>()
-        .map_err(|error| format!("invalid Cloud Storage generation: {error}"))?;
     let generated_by_broker = object
         .metadata
         .get("inkbridge-generated-by")
@@ -229,5 +267,38 @@ mod tests {
         };
         assert_eq!(event.source_revision, 7);
         assert_eq!(event.broker_output.unwrap().event_id, "source-event");
+    }
+
+    #[test]
+    fn translates_only_explicitly_marked_staging_objects_to_registration() {
+        let unmarked = serde_json::to_vec(&json!({
+            "bucket": "private-sync",
+            "name": "Staging/original.pdf",
+            "generation": "20"
+        }))
+        .unwrap();
+        assert!(matches!(
+            translate_storage_finalized_event("private-sync", &headers(), &unmarked).unwrap(),
+            EventTranslation::Ignore { .. }
+        ));
+
+        let marked = serde_json::to_vec(&json!({
+            "bucket": "private-sync",
+            "name": "Staging/upload-20.pdf",
+            "generation": "20",
+            "metadata": {
+                "inkbridge-register-original": "true",
+                "inkbridge-original-file-name": "daily reading.pdf"
+            }
+        }))
+        .unwrap();
+        let EventTranslation::Register(registration) =
+            translate_storage_finalized_event("private-sync", &headers(), &marked).unwrap()
+        else {
+            panic!("expected registration event")
+        };
+        assert_eq!(registration.event_id, "event-1");
+        assert_eq!(registration.source_generation, 20);
+        assert_eq!(registration.original_file_name, "daily reading.pdf");
     }
 }

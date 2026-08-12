@@ -12,6 +12,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile.cloud-runtime"
+      - "cloudbuild.runtime.yaml"
       - ".dockerignore"
       - ".github/workflows/inkbridge-cloud-runtime.yml"
   pull_request:
@@ -24,6 +25,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile.cloud-runtime"
+      - "cloudbuild.runtime.yaml"
       - ".dockerignore"
       - ".github/workflows/inkbridge-cloud-runtime.yml"
 
@@ -81,3 +83,7 @@ jobs:
         run: terraform validate
       - name: Verify deployment is opt-in
         run: grep -q 'default *= *false' variables.tf
+      - name: Test disabled, guard, bootstrap, and runtime stages without credentials
+        run: terraform test
+      - name: Verify real deployments declare a remote backend
+        run: grep -q 'backend "gcs"' versions.tf

@@ -1,0 +1,15 @@
+enable_deployment          = false
+deployment_acknowledgement = ""
+
+project_id     = "replace-with-project-id"
+project_number = "000000000000"
+region         = "me-west1"
+bucket_name    = "replace-with-globally-unique-bucket"
+cloud_build_source_bucket_name = "replace-with-globally-unique-build-source-bucket"
+
+artifact_repository = "inkbridge"
+cloud_run_image      = ""
+
+# Optional alert only. A budget does not cap or stop spending.
+monthly_budget_usd = 0
+billing_account   = ""

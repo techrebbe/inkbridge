@@ -7,8 +7,10 @@ Google Cloud interfaces without creating or deploying cloud resources.
 
 Eventarc sends a binary CloudEvent for
 `google.cloud.storage.object.v1.finalized` to the private Cloud Run service.
-The runtime accepts only objects in `BOOX_Folder/` or `Supernote_Folder/` and
-derives device side from that folder. Stable document identity comes from the
+The runtime accepts device updates in `BOOX_Folder/` or `Supernote_Folder/` and
+derives device side from that folder. It also accepts explicitly marked
+registration objects in `Staging/`; unmarked staging objects are ignored.
+Stable document identity comes from original PDF bytes or the
 `inkbridge-document-id` object metadata, never from a filename.
 
 Device uploads include:
@@ -65,23 +67,22 @@ per-document limit.
 
 ## Immutable original registration
 
-An authenticated operator or future folder adapter stages a source PDF outside
-the two device folders and calls:
+The deployed registration path stays private and reuses the existing
+authenticated Eventarc delivery. An authorized operator or future folder
+adapter uploads the original to `Staging/` with:
 
-```http
-POST /v1/documents/register
-Content-Type: application/json
-
-{
-  "originalObjectPath": "Staging/my-document.pdf",
-  "originalFileName": "my-document.pdf",
-  "sourceGeneration": 123
-}
+```text
+inkbridge-register-original=true
+inkbridge-original-file-name=<logical file name>
 ```
 
-The broker validates the PDF, derives its stable content-based document ID, and
-stores the immutable original under `Originals/<documentId>/original.pdf`.
-Registration is idempotent for identical source bytes.
+The finalized-object event reaches the same internal-only Cloud Run endpoint as
+device events. The broker verifies the exact object generation, validates the
+PDF, derives its stable content-based document ID, and stores the immutable
+original under `Originals/<documentId>/original.pdf`. Duplicate delivery is
+idempotent. Unmarked staging objects are ignored. The HTTP
+`/v1/documents/register` handler remains useful for local adapter tests, but the
+reviewed cloud deployment does not expose or rely on it.
 
 ## Cloud Storage layout
 
@@ -113,5 +114,17 @@ PORT                          # defaults to 8080
 ```
 
 The runtime container includes `inkbridge-convert` and `qpdf` and targets Linux
-`amd64`. `infra/gcp` is an opt-in blueprint and CI validates it without a plan,
-apply, credentials, or resource creation.
+`amd64`. `infra/gcp` is an opt-in deployment configuration. CI validates three
+credential-free, no-apply states: disabled, bootstrap, and runtime. Bootstrap
+creates the data plane and regional image repository while omitting Cloud Run
+and Eventarc. Runtime requires an immutable Artifact Registry `@sha256` image
+and adds those two resources. Real applies use the partial GCS backend so
+canonical infrastructure state is not left on one workstation.
+
+`cloudbuild.runtime.yaml` builds the existing runtime Dockerfile as Linux
+amd64. Source archives are submitted through the dedicated private build-source
+bucket, so the builder account has no read access to the device-data bucket.
+The reviewed operator flow tags a source commit, resolves that tag to a digest,
+adds the protected `deployed-current` tag, and supplies only the immutable
+digest to Terraform. Cleanup expires old `build-` tags while the protected
+deployed tag prevents the Cloud Run digest from being removed.
