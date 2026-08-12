@@ -479,40 +479,66 @@ impl Broker {
             .clone()
             .unwrap_or_else(|| state.original_file_name.clone())];
         for operation in &manifest.operations {
-            let (source_uuid, page_index, snapshot) = match operation {
+            let (source_uuid, page_index, snapshots) = match operation {
                 Operation::UpsertStroke {
                     source_uuid,
                     page_index,
+                    before,
                     after,
                     ..
-                } => (source_uuid, page_index, after),
+                } => (
+                    source_uuid,
+                    page_index,
+                    before
+                        .iter()
+                        .chain(std::iter::once(after))
+                        .collect::<Vec<_>>(),
+                ),
                 Operation::DeleteStroke {
                     source_uuid,
                     page_index,
                     before,
-                } => (source_uuid, page_index, before),
+                } => (source_uuid, page_index, vec![before]),
             };
-            if source_uuid.trim().is_empty()
-                || source_uuid != &snapshot.source_uuid
-                || page_index != &snapshot.page_index
-                || usize::try_from(*page_index)
-                    .ok()
-                    .is_none_or(|page| page >= manifest.document.page_count)
-                || snapshot.samples.len() < 2
-                || snapshot.samples.iter().any(|[x, y, pressure]| {
-                    !x.is_finite()
-                        || !y.is_finite()
-                        || !pressure.is_finite()
-                        || !(0.0..=1.0).contains(x)
-                        || !(0.0..=1.0).contains(y)
-                        || !(0.0..=4096.0).contains(pressure)
-                })
-                || snapshot.geometry_fingerprint
-                    != geometry_fingerprint(&snapshot.native_style, &snapshot.samples)
-            {
-                return Err(BrokerError::InvalidEvent(
-                    "BOOX operation manifest contains an invalid stroke operation".to_owned(),
-                ));
+            for snapshot in snapshots {
+                if source_uuid.trim().is_empty()
+                    || source_uuid != &snapshot.source_uuid
+                    || page_index != &snapshot.page_index
+                    || usize::try_from(*page_index)
+                        .ok()
+                        .is_none_or(|page| page >= manifest.document.page_count)
+                    || snapshot.samples.len() < 2
+                    || snapshot.samples.iter().any(|[x, y, pressure]| {
+                        !x.is_finite()
+                            || !y.is_finite()
+                            || !pressure.is_finite()
+                            || !(0.0..=1.0).contains(x)
+                            || !(0.0..=1.0).contains(y)
+                            || !(0.0..=4096.0).contains(pressure)
+                    })
+                    || snapshot.geometry_fingerprint
+                        != geometry_fingerprint(&snapshot.native_style, &snapshot.samples)
+                {
+                    return Err(BrokerError::InvalidEvent(
+                        "BOOX operation manifest contains an invalid stroke operation".to_owned(),
+                    ));
+                }
+            }
+        }
+        // Supernote currently persists only black and dark gray native pen colors. Normalize
+        // compact BOOX styles before they enter canonical state or the emitted manifest, and
+        // recompute the style-sensitive fingerprint so the next native export compares cleanly.
+        for operation in &mut manifest.operations {
+            match operation {
+                Operation::UpsertStroke { before, after, .. } => {
+                    if let Some(before) = before {
+                        normalize_supernote_pen_color(before);
+                    }
+                    normalize_supernote_pen_color(after);
+                }
+                Operation::DeleteStroke { before, .. } => {
+                    normalize_supernote_pen_color(before);
+                }
             }
         }
         let stroke_ids = manifest
@@ -564,14 +590,16 @@ impl Broker {
                 .get(source_uuid)
                 .filter(|canonical| canonical.tombstone.is_none());
             let valid_operation_set = match (delete, upsert, active) {
-                (Some(deleted), None, Some(canonical)) => canonical.snapshot == *deleted,
+                (Some(deleted), None, Some(canonical)) => {
+                    normalized_supernote_snapshot(&canonical.snapshot) == *deleted
+                }
                 (None, Some((Some(before), after)), Some(canonical)) => {
-                    canonical.snapshot == *before
+                    normalized_supernote_snapshot(&canonical.snapshot) == *before
                         && after.page_index == canonical.snapshot.page_index
                 }
                 (None, Some((None, _)), None) => !state.strokes.contains_key(source_uuid),
                 (Some(deleted), Some((None, after)), Some(canonical)) => {
-                    canonical.snapshot == *deleted
+                    normalized_supernote_snapshot(&canonical.snapshot) == *deleted
                         && after.page_index != canonical.snapshot.page_index
                 }
                 _ => false,
@@ -803,6 +831,25 @@ fn mark_event_only<S: BrokerStorage>(
         )?])
         .map_err(BrokerError::ConditionalWrite)?;
     Ok(())
+}
+
+fn normalize_supernote_pen_color(snapshot: &mut StrokeSnapshot) {
+    let normalized = if snapshot.native_style.pen_color == 0x00 {
+        0x00
+    } else {
+        0x9d
+    };
+    if snapshot.native_style.pen_color == normalized {
+        return;
+    }
+    snapshot.native_style.pen_color = normalized;
+    snapshot.geometry_fingerprint = geometry_fingerprint(&snapshot.native_style, &snapshot.samples);
+}
+
+fn normalized_supernote_snapshot(snapshot: &StrokeSnapshot) -> StrokeSnapshot {
+    let mut normalized = snapshot.clone();
+    normalize_supernote_pen_color(&mut normalized);
+    normalized
 }
 
 fn apply_manifest(state: &mut CanonicalDocumentState, manifest: &Manifest, event: &StorageEvent) {

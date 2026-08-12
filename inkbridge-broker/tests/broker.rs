@@ -492,6 +492,88 @@ fn compact_manifest_rejects_samples_the_supernote_would_clamp() {
 }
 
 #[test]
+fn compact_manifest_normalizes_pen_colors_before_canonical_storage() {
+    let mut harness = Harness::new();
+    let mut original = stroke("normalized-color", 0.2, 0.3);
+    original.native_style.pen_color = 130;
+    original.geometry_fingerprint = geometry_fingerprint(&original.native_style, &original.samples);
+    let mut first = harness.event(
+        "boox-compact-normalized-color-1",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: original.source_uuid.clone(),
+                page_index: original.page_index,
+                before: None,
+                after: original.clone(),
+            }],
+            1,
+        ),
+    );
+    first.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness
+        .broker
+        .process(&mut harness.storage, &first)
+        .unwrap();
+
+    let first_state = harness.state();
+    let normalized = &first_state.strokes["normalized-color"].snapshot;
+    assert_eq!(normalized.native_style.pen_color, 0x9d);
+    assert_eq!(
+        normalized.geometry_fingerprint,
+        geometry_fingerprint(&normalized.native_style, &normalized.samples)
+    );
+    let emitted: Manifest = serde_json::from_slice(
+        &harness
+            .storage
+            .object(&supernote_manifest_path(
+                &harness.document_id,
+                "boox-compact-normalized-color-1",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let Operation::UpsertStroke { after, .. } = &emitted.operations[0] else {
+        panic!("fixture must contain an upsert")
+    };
+    assert_eq!(after, normalized);
+
+    let mut moved = original.clone();
+    moved.samples[0][0] += 0.02;
+    moved.geometry_fingerprint = geometry_fingerprint(&moved.native_style, &moved.samples);
+    let mut second = harness.event(
+        "boox-compact-normalized-color-2",
+        DeviceSide::Boox,
+        2,
+        RevisionPair {
+            boox: 1,
+            supernote: 0,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: moved.source_uuid.clone(),
+                page_index: moved.page_index,
+                before: Some(original),
+                after: moved.clone(),
+            }],
+            1,
+        ),
+    );
+    second.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness
+        .broker
+        .process(&mut harness.storage, &second)
+        .unwrap();
+    let second_state = harness.state();
+    let normalized_moved = &second_state.strokes["normalized-color"].snapshot;
+    assert_eq!(normalized_moved.native_style.pen_color, 0x9d);
+    assert_eq!(normalized_moved.samples, moved.samples);
+}
+
+#[test]
 fn compact_manifest_uses_the_broker_coordinate_calibration() {
     let mut harness = Harness::new();
     let snapshot = stroke("calibrated-stroke", 0.2, 0.3);
