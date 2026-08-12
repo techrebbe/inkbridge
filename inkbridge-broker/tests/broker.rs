@@ -1,5 +1,8 @@
 use inkbridge_broker::*;
-use inkbridge_convert::{geometry_fingerprint, Manifest, NativeStyle, Operation, StrokeSnapshot};
+use inkbridge_convert::{
+    geometry_fingerprint, CoordinateTransform, DocumentIdentity, Manifest, NativeStyle, Operation,
+    StrokeSnapshot, Summary,
+};
 use lopdf::{dictionary, Document, Object, Stream};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -308,6 +311,8 @@ fn compact_boox_manifest_produces_the_same_supernote_operations() {
         .bytes
         .to_vec();
     let expected: Manifest = serde_json::from_slice(&full_manifest_bytes).unwrap();
+    let mut compact_input = expected.clone();
+    compact_input.document.target_file_names.clear();
 
     let mut compact = Harness::new();
     let mut compact_event = compact.event(
@@ -315,7 +320,7 @@ fn compact_boox_manifest_produces_the_same_supernote_operations() {
         DeviceSide::Boox,
         1,
         RevisionPair::default(),
-        full_manifest_bytes,
+        serde_json::to_vec(&compact_input).unwrap(),
     );
     compact_event.payload_kind = DevicePayloadKind::BooxOperationManifest;
     compact
@@ -334,6 +339,92 @@ fn compact_boox_manifest_produces_the_same_supernote_operations() {
     )
     .unwrap();
     assert_eq!(actual, expected);
+}
+
+fn compact_delete_manifest(before: StrokeSnapshot) -> Vec<u8> {
+    serde_json::to_vec(&Manifest {
+        schema_version: 1,
+        manifest_id: "compact-delete".to_owned(),
+        source: "boox-neoreader-embedded-pdf".to_owned(),
+        document: DocumentIdentity {
+            source_file_name: "boox-view.pdf".to_owned(),
+            target_file_names: Vec::new(),
+            page_count: 1,
+            pdf_sha256: "compact-input".to_owned(),
+        },
+        coordinate_transform: CoordinateTransform {
+            pdf_to_supernote_normalized_y_offset: -0.0008,
+        },
+        operations: vec![Operation::DeleteStroke {
+            source_uuid: before.source_uuid.clone(),
+            page_index: before.page_index,
+            before,
+        }],
+        summary: Summary {
+            deleted: 1,
+            ..Summary::default()
+        },
+    })
+    .unwrap()
+}
+
+#[test]
+fn compact_delete_must_match_the_active_canonical_snapshot() {
+    let mut harness = Harness::new();
+    let export = harness.event(
+        "sn-before-compact-delete",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("tracked-stroke", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &export)
+        .unwrap();
+    let mut mismatched = harness.state().strokes["tracked-stroke"].snapshot.clone();
+    mismatched.samples[0][0] += 0.01;
+    mismatched.geometry_fingerprint =
+        geometry_fingerprint(&mismatched.native_style, &mismatched.samples);
+    let mut event = harness.event(
+        "boox-bad-compact-delete",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        compact_delete_manifest(mismatched),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    let error = harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap_err();
+    assert!(matches!(error, BrokerError::InvalidEvent(_)));
+    assert!(harness.state().strokes["tracked-stroke"]
+        .tombstone
+        .is_none());
+}
+
+#[test]
+fn compact_delete_rejects_an_unknown_stroke() {
+    let mut harness = Harness::new();
+    let mut event = harness.event(
+        "boox-unknown-compact-delete",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_delete_manifest(stroke("unknown-stroke", 0.2, 0.3)),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert!(!harness.state().strokes.contains_key("unknown-stroke"));
 }
 
 #[test]

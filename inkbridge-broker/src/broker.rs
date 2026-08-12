@@ -427,7 +427,7 @@ impl Broker {
         state: &CanonicalDocumentState,
         bytes: &[u8],
     ) -> Result<Manifest, BrokerError> {
-        let manifest: Manifest = serde_json::from_slice(bytes).map_err(|error| {
+        let mut manifest: Manifest = serde_json::from_slice(bytes).map_err(|error| {
             BrokerError::InvalidEvent(format!("BOOX operation manifest is invalid JSON: {error}"))
         })?;
         if manifest.schema_version != 1 || manifest.source != "boox-neoreader-embedded-pdf" {
@@ -443,6 +443,14 @@ impl Broker {
                 manifest.document.page_count, state.original_page_count
             )));
         }
+        // Compact inputs do not necessarily carry a baseline-derived document guard. The
+        // canonical Supernote file name is authoritative and prevents the headless plugin from
+        // applying otherwise valid operations to whichever document happens to be open.
+        manifest.document.target_file_names = vec![state
+            .supernote
+            .source_file_name
+            .clone()
+            .unwrap_or_else(|| state.original_file_name.clone())];
         for operation in &manifest.operations {
             let (source_uuid, page_index, snapshot) = match operation {
                 Operation::UpsertStroke {
@@ -473,6 +481,21 @@ impl Broker {
                 return Err(BrokerError::InvalidEvent(
                     "BOOX operation manifest contains an invalid stroke operation".to_owned(),
                 ));
+            }
+            if let Operation::DeleteStroke {
+                source_uuid,
+                before,
+                ..
+            } = operation
+            {
+                let matches_active = state.strokes.get(source_uuid).is_some_and(|canonical| {
+                    canonical.tombstone.is_none() && canonical.snapshot == *before
+                });
+                if !matches_active {
+                    return Err(BrokerError::InvalidEvent(format!(
+                        "BOOX operation manifest delete does not match active canonical stroke {source_uuid}"
+                    )));
+                }
             }
         }
         Ok(manifest)
