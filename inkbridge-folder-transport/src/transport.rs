@@ -1158,6 +1158,10 @@ fn canonical_path_key(path: &Path) -> String {
 fn sha256_file(path: &Path) -> Result<String, String> {
     let file =
         File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    sha256_open_file(&file, path)
+}
+
+fn sha256_open_file(file: &File, path: &Path) -> Result<String, String> {
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -1395,6 +1399,17 @@ fn rename_create_only(_source: &Path, _destination: &Path) -> std::io::Result<()
 }
 
 fn reconcile_staged_backup(destination: &Path, published_hash: &str) -> Result<(), String> {
+    reconcile_staged_backup_with(destination, published_hash, || Ok(()))
+}
+
+fn reconcile_staged_backup_with<F>(
+    destination: &Path,
+    published_hash: &str,
+    after_destination_opened: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     let backup = sibling_temporary(destination, "previous");
     let backup_is_symlink = match symlink_metadata_if_exists(&backup)? {
         None => return Ok(()),
@@ -1426,8 +1441,15 @@ fn reconcile_staged_backup(destination: &Path, published_hash: &str) -> Result<(
             backup.display()
         )),
         Some(_) => {
-            let current_hash = sha256_file(destination)?;
+            let opened_destination = open_installed_regular_file(destination)?;
+            after_destination_opened()?;
+            let current_hash = sha256_open_file(&opened_destination, destination)?;
             if current_hash == published_hash && !backup_is_symlink {
+                // Keep this second handle open through backup retirement. On Windows it
+                // is opened without delete sharing, preventing a concurrent replacement;
+                // on Unix its file identity and two lstat checks detect a replacement.
+                let _installed_guard =
+                    open_same_installed_regular_file(destination, &opened_destination)?;
                 remove_file_if_exists(&backup)
             } else {
                 Err(format!(
@@ -1438,6 +1460,121 @@ fn reconcile_staged_backup(destination: &Path, published_hash: &str) -> Result<(
             }
         }
     }
+}
+
+fn open_installed_regular_file(path: &Path) -> Result<File, String> {
+    let metadata = symlink_metadata_if_exists(path)?.ok_or_else(|| {
+        format!(
+            "BOOX destination {} disappeared during recovery; preserved staged backup",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "BOOX destination {} is no longer a regular file; preserved staged backup",
+            path.display()
+        ));
+    }
+    let file = open_entry_guard(path).map_err(|error| {
+        format!(
+            "could not open BOOX destination {} during recovery: {error}; preserved staged backup",
+            path.display()
+        )
+    })?;
+    open_same_installed_regular_file(path, &file)?;
+    Ok(file)
+}
+
+fn open_same_installed_regular_file(path: &Path, opened: &File) -> Result<File, String> {
+    let before = symlink_metadata_if_exists(path)?.ok_or_else(|| {
+        format!(
+            "BOOX destination {} disappeared during recovery; preserved staged backup",
+            path.display()
+        )
+    })?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(format!(
+            "BOOX destination {} changed filesystem entry during recovery; preserved staged backup",
+            path.display()
+        ));
+    }
+    let current = open_entry_guard(path).map_err(|error| {
+        format!(
+            "could not re-open BOOX destination {} during recovery: {error}; preserved staged backup",
+            path.display()
+        )
+    })?;
+    let after = symlink_metadata_if_exists(path)?.ok_or_else(|| {
+        format!(
+            "BOOX destination {} disappeared during recovery; preserved staged backup",
+            path.display()
+        )
+    })?;
+    if after.file_type().is_symlink()
+        || !after.is_file()
+        || open_file_identity(opened)? != open_file_identity(&current)?
+    {
+        return Err(format!(
+            "BOOX destination {} changed filesystem entry during recovery; preserved staged backup",
+            path.display()
+        ));
+    }
+    Ok(current)
+}
+
+#[cfg(windows)]
+fn open_entry_guard(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_entry_guard(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn open_file_identity(file: &File) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect opened BOOX destination: {error}"))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn open_file_identity(file: &File) -> Result<(u32, u64), String> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: The handle remains owned by `file` for the call duration and
+    // `information` points to writable storage of the required type.
+    if unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+    } == 0
+    {
+        return Err(format!(
+            "could not identify opened BOOX destination: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: A successful GetFileInformationByHandle initializes the full structure.
+    let information = unsafe { information.assume_init() };
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
 }
 
 fn restore_staged_file(backup: &Path, destination: &Path) -> Result<(), String> {
@@ -1658,6 +1795,35 @@ mod snapshot_tests {
             .expect_err("the recreated symlink must preserve the staged backup");
 
         assert!(error.contains("recreated as a symlink"));
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), published);
+        assert_eq!(fs::read(&backup).unwrap(), b"staged broker predecessor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_preserves_backup_when_destination_becomes_symlink_after_open() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("book.pdf");
+        let backup = sibling_temporary(&destination, "previous");
+        let target = directory.path().join("sync-client-book.pdf");
+        let published = b"published broker view";
+        fs::write(&destination, published).unwrap();
+        fs::write(&backup, b"staged broker predecessor").unwrap();
+        fs::write(&target, published).unwrap();
+
+        let error = reconcile_staged_backup_with(&destination, &sha256_hex(published), || {
+            fs::remove_file(&destination).map_err(|error| error.to_string())?;
+            symlink(&target, &destination).map_err(|error| error.to_string())
+        })
+        .expect_err("a symlink replacement after open must preserve the backup");
+
+        assert!(error.contains("changed filesystem entry"));
         assert!(fs::symlink_metadata(&destination)
             .unwrap()
             .file_type()
