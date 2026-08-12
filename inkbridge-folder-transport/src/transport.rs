@@ -422,6 +422,25 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             });
             return Ok(());
         }
+        let post_build_hash = sha256_file(&document.boox_pdf)?;
+        if post_build_hash != built.source_pdf_sha256 {
+            state
+                .observations
+                .get_mut(&local_key)
+                .ok_or_else(|| {
+                    format!(
+                        "settled observation disappeared for {}",
+                        document.boox_pdf.display()
+                    )
+                })?
+                .content_sha256 = Some(post_build_hash);
+            report.actions.push(TransportAction::Deferred {
+                side: DeviceSide::Boox,
+                reason: "the BOOX PDF content changed while its compact manifest was being built"
+                    .to_owned(),
+            });
+            return Ok(());
+        }
         let source_hash = built.source_pdf_sha256;
         state
             .observations

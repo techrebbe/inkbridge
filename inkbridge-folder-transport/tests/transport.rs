@@ -89,10 +89,10 @@ impl CloudFolder for FakeCloud {
 struct FakeBuilder;
 
 impl BooxManifestBuilder for FakeBuilder {
-    fn build(&self, _pdf: &Path, _baselines: &[PathBuf]) -> Result<BuiltBooxManifest, String> {
+    fn build(&self, pdf: &Path, _baselines: &[PathBuf]) -> Result<BuiltBooxManifest, String> {
         Ok(BuiltBooxManifest {
             bytes: b"{\"schemaVersion\":1}\n".to_vec(),
-            source_pdf_sha256: "f".repeat(64),
+            source_pdf_sha256: sha256_hex(&fs::read(pdf).unwrap()),
         })
     }
 }
@@ -104,6 +104,17 @@ impl BooxManifestBuilder for HashingBuilder {
         Ok(BuiltBooxManifest {
             bytes: b"{\"schemaVersion\":1}\n".to_vec(),
             source_pdf_sha256: sha256_hex(&fs::read(pdf).unwrap()),
+        })
+    }
+}
+
+struct StaleHashBuilder;
+
+impl BooxManifestBuilder for StaleHashBuilder {
+    fn build(&self, _pdf: &Path, _baselines: &[PathBuf]) -> Result<BuiltBooxManifest, String> {
+        Ok(BuiltBooxManifest {
+            bytes: b"{\"schemaVersion\":1}\n".to_vec(),
+            source_pdf_sha256: sha256_hex(b"different bytes observed before conversion"),
         })
     }
 }
@@ -393,6 +404,57 @@ fn boox_skip_rehashes_a_settled_file_when_size_and_mtime_look_unchanged() {
 }
 
 #[test]
+fn boox_upload_is_deferred_when_post_conversion_hash_does_not_match_source() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    fs::write(&document.boox_pdf, b"current BOOX bytes").unwrap();
+    let export = document.supernote_export_directory.join("page.json");
+    let export_bytes = native_export();
+    fs::write(&export, &export_bytes).unwrap();
+    let export_key = path_key(&export);
+    let export_hash = sha256_hex(&export_bytes);
+    let mut state = TransportState {
+        documents: BTreeMap::from([(
+            document.document_id.clone(),
+            DocumentTransportState {
+                supernote: SideTransportState {
+                    uploaded_local_hashes: BTreeMap::from([(
+                        export_key.clone(),
+                        export_hash.clone(),
+                    )]),
+                    accepted_local_hashes: BTreeMap::from([(export_key, export_hash)]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]),
+        ..TransportState::empty()
+    };
+    let cloud = FakeCloud::default();
+    let builder = StaleHashBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("content changed")
+    )));
+    assert!(cloud.objects.lock().unwrap().is_empty());
+    assert!(state.documents[&document.document_id]
+        .boox
+        .pending
+        .is_none());
+}
+
+#[test]
 fn generated_boox_view_never_overwrites_an_unpublished_local_edit() {
     let root = tempdir().unwrap();
     let document = mapping(root.path());
@@ -552,7 +614,7 @@ fn acknowledged_boox_upload_recovers_after_checkpoint_loss_without_allocating_r2
             .accepted_local_hashes
             .get(&path_key(&document.boox_pdf))
             .map(String::as_str),
-        Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        Some(sha256_hex(b"edited BOOX view").as_str())
     );
 }
 
