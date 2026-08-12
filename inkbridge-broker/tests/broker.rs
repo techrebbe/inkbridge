@@ -426,6 +426,55 @@ fn compact_manifest_requires_identity_and_verified_fingerprints() {
 }
 
 #[test]
+fn compact_manifest_uses_the_broker_coordinate_calibration() {
+    let mut harness = Harness::new();
+    let snapshot = stroke("calibrated-stroke", 0.2, 0.3);
+    let mut manifest: Manifest = serde_json::from_slice(&compact_manifest(
+        vec![Operation::UpsertStroke {
+            source_uuid: snapshot.source_uuid.clone(),
+            page_index: snapshot.page_index,
+            before: None,
+            after: snapshot,
+        }],
+        1,
+    ))
+    .unwrap();
+    manifest
+        .coordinate_transform
+        .pdf_to_supernote_normalized_y_offset = 0.25;
+    let mut event = harness.event(
+        "boox-compact-wrong-calibration",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        serde_json::to_vec(&manifest).unwrap(),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+    let emitted: Manifest = serde_json::from_slice(
+        &harness
+            .storage
+            .object(&supernote_manifest_path(
+                &harness.document_id,
+                "boox-compact-wrong-calibration",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(
+        emitted
+            .coordinate_transform
+            .pdf_to_supernote_normalized_y_offset,
+        -0.0008
+    );
+}
+
+#[test]
 fn compact_delete_must_match_the_active_canonical_snapshot() {
     let mut harness = Harness::new();
     let export = harness.event(

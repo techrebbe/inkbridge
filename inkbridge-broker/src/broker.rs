@@ -438,6 +438,11 @@ impl Broker {
                 "BOOX operation manifest has an unsupported schema or source".to_owned(),
             ));
         }
+        // Device adapters report unshifted canonical samples. Only the broker owns the
+        // calibrated PDF-to-Supernote presentation offset.
+        manifest
+            .coordinate_transform
+            .pdf_to_supernote_normalized_y_offset = self.normalized_y_offset;
         if state.original_page_count != 0
             && manifest.document.page_count != state.original_page_count
         {
