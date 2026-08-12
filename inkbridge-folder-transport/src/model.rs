@@ -95,23 +95,29 @@ impl TransportConfig {
                 return Err(format!("duplicate documentId {}", document.document_id));
             }
             let boox_path = normalized_path_key(&document.boox_pdf)?;
-            if !boox_paths.insert(boox_path.clone()) {
+            if boox_paths
+                .iter()
+                .any(|existing| boox_paths_conflict(existing, &boox_path))
+            {
                 return Err(format!(
-                    "duplicate booxPdf mapping {}",
+                    "booxPdf mapping {} collides with another BOOX file or reserved temporary path",
                     document.boox_pdf.display()
                 ));
             }
-            if supernote_paths.iter().any(|directory| {
-                key_contains_path(directory, &boox_path) || key_contains_path(&boox_path, directory)
-            }) {
+            boox_paths.insert(boox_path.clone());
+            if supernote_paths
+                .iter()
+                .any(|directory| boox_mapping_overlaps_path(&boox_path, directory))
+            {
                 return Err(format!(
                     "BOOX file {} overlaps a mapped Supernote directory",
                     document.boox_pdf.display()
                 ));
             }
-            if let Some((reserved_path, _)) = state_paths.iter().find(|(_, state)| {
-                key_contains_path(state, &boox_path) || key_contains_path(&boox_path, state)
-            }) {
+            if let Some((reserved_path, _)) = state_paths
+                .iter()
+                .find(|(_, state)| boox_mapping_overlaps_path(&boox_path, state))
+            {
                 return Err(format!(
                     "statePath or companion {} collides with BOOX file {}",
                     reserved_path.display(),
@@ -143,7 +149,7 @@ impl TransportConfig {
                 }
                 if boox_paths
                     .iter()
-                    .any(|boox| key_contains_path(&key, boox) || key_contains_path(boox, &key))
+                    .any(|boox| boox_mapping_overlaps_path(boox, &key))
                 {
                     return Err(format!(
                         "Supernote {direction} directory {} overlaps a mapped BOOX file",
@@ -201,6 +207,62 @@ fn normalized_path_key(path: &Path) -> Result<String, String> {
 
 fn key_contains_path(directory: &str, candidate: &str) -> bool {
     Path::new(candidate).starts_with(Path::new(directory))
+}
+
+fn boox_paths_conflict(left: &str, right: &str) -> bool {
+    left == right || is_boox_temporary_for(left, right) || is_boox_temporary_for(right, left)
+}
+
+fn boox_mapping_overlaps_path(boox: &str, other: &str) -> bool {
+    key_contains_path(other, boox)
+        || key_contains_path(boox, other)
+        || boox_static_temporary_keys(boox).iter().any(|temporary| {
+            key_contains_path(other, temporary) || key_contains_path(temporary, other)
+        })
+        || is_boox_temporary_for(other, boox)
+}
+
+fn boox_static_temporary_keys(boox: &str) -> [String; 2] {
+    [
+        sibling_temporary_key(boox, "compact-upload"),
+        sibling_temporary_key(boox, "previous"),
+    ]
+}
+
+fn sibling_temporary_key(path: &str, suffix: &str) -> String {
+    let path = Path::new(path);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("inkbridge");
+    path.with_file_name(format!(".{name}.{suffix}.part"))
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn is_boox_temporary_for(candidate: &str, boox: &str) -> bool {
+    let candidate = Path::new(candidate);
+    let boox = Path::new(boox);
+    if candidate.parent() != boox.parent() {
+        return false;
+    }
+    let Some(candidate_name) = candidate.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(boox_name) = boox.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if candidate_name == format!(".{boox_name}.compact-upload.part")
+        || candidate_name == format!(".{boox_name}.previous.part")
+    {
+        return true;
+    }
+    candidate_name
+        .strip_prefix(&format!(".{boox_name}.g"))
+        .and_then(|suffix| suffix.strip_suffix(".part"))
+        .is_some_and(|generation| {
+            !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
@@ -609,7 +671,85 @@ mod tests {
             ],
         };
 
-        assert!(config.validate().unwrap_err().contains("duplicate booxPdf"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("reserved temporary"));
+    }
+
+    #[test]
+    fn configuration_rejects_boox_temporary_path_collisions() {
+        for second_path in [
+            "boox/.book.pdf.compact-upload.part",
+            "boox/.book.pdf.previous.part",
+            "boox/.book.pdf.g42.part",
+        ] {
+            let config = TransportConfig {
+                schema_version: CONFIG_SCHEMA_VERSION,
+                bucket: "bucket".to_owned(),
+                gcloud_command: default_gcloud(),
+                poll_seconds: 1,
+                settle_seconds: 0,
+                state_path: PathBuf::new(),
+                documents: vec![
+                    DocumentFolders {
+                        document_id: test_document_id('a'),
+                        original_file_name: "first.pdf".to_owned(),
+                        boox_pdf: PathBuf::from("boox/book.pdf"),
+                        supernote_export_directory: PathBuf::from("first/outgoing"),
+                        supernote_incoming_directory: PathBuf::from("first/incoming"),
+                    },
+                    DocumentFolders {
+                        document_id: test_document_id('b'),
+                        original_file_name: "second.pdf".to_owned(),
+                        boox_pdf: PathBuf::from(second_path),
+                        supernote_export_directory: PathBuf::from("second/outgoing"),
+                        supernote_incoming_directory: PathBuf::from("second/incoming"),
+                    },
+                ],
+            };
+
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .contains("reserved temporary"));
+        }
+    }
+
+    #[test]
+    fn configuration_rejects_state_and_supernote_temporary_path_collisions() {
+        let state_collision = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::from("boox/.book.pdf.g7.part"),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: PathBuf::from("boox/book.pdf"),
+                supernote_export_directory: PathBuf::from("supernote/outgoing"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+        };
+        assert!(state_collision.validate().unwrap_err().contains("collides"));
+
+        let supernote_collision = TransportConfig {
+            state_path: PathBuf::new(),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: PathBuf::from("boox/book.pdf"),
+                supernote_export_directory: PathBuf::from("boox/.book.pdf.compact-upload.part"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+            ..state_collision
+        };
+        assert!(supernote_collision
+            .validate()
+            .unwrap_err()
+            .contains("overlaps"));
     }
 
     #[test]
@@ -639,7 +779,10 @@ mod tests {
             ],
         };
 
-        assert!(config.validate().unwrap_err().contains("duplicate booxPdf"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("reserved temporary"));
     }
 
     #[test]
