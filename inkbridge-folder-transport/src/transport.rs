@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const GENERATED_BY: &str = "inkbridge-generated-by";
 const DOCUMENT_ID: &str = "inkbridge-document-id";
 const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
+const SOURCE_REVISION: &str = "inkbridge-source-revision";
+const SOURCE_VIEW_SHA256: &str = "inkbridge-source-view-sha256";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 
 pub trait BooxManifestBuilder {
@@ -101,6 +103,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             return Ok(report);
         }
         self.deliver_outputs(document, state, &mut report)?;
+        self.recover_acknowledged_uploads(document, state)?;
         self.upload_boox_if_ready(document, state, now, &mut report)?;
         self.upload_supernote_if_ready(document, state, now, &mut report)?;
         Ok(report)
@@ -129,6 +132,92 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 report.actions.push(TransportAction::Conflict {
                     object_path: object.path,
                 });
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_acknowledged_uploads(
+        &self,
+        document: &DocumentFolders,
+        state: &mut TransportState,
+    ) -> Result<(), String> {
+        let supernote_files = supernote_export_files(&document.supernote_export_directory)?
+            .into_iter()
+            .map(|path| {
+                let hash = sha256_file(&path)?;
+                Ok((hash, canonical_path_key(&path)))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        for side in [DeviceSide::Boox, DeviceSide::Supernote] {
+            let accepted_revision = state
+                .document_mut(&document.document_id)
+                .revisions
+                .get(side);
+            if accepted_revision == 0 {
+                continue;
+            }
+            let root = match side {
+                DeviceSide::Boox => "BOOX_Folder",
+                DeviceSide::Supernote => "Supernote_Folder",
+            };
+            let mut accepted_hashes = BTreeMap::<u64, String>::new();
+            for object in self
+                .cloud
+                .list(&format!("{root}/{}/uploads/", document.document_id))?
+            {
+                if object
+                    .metadata
+                    .get(DOCUMENT_ID)
+                    .is_none_or(|id| id != &document.document_id)
+                {
+                    continue;
+                }
+                let Some(source_revision) = object
+                    .metadata
+                    .get(SOURCE_REVISION)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|revision| *revision > 0 && *revision <= accepted_revision)
+                else {
+                    continue;
+                };
+                let Some(source_hash) = object
+                    .metadata
+                    .get(SOURCE_VIEW_SHA256)
+                    .filter(|hash| is_sha256(hash))
+                    .cloned()
+                else {
+                    continue;
+                };
+                if let Some(previous) = accepted_hashes.insert(source_revision, source_hash.clone())
+                {
+                    if previous != source_hash {
+                        return Err(format!(
+                            "accepted {side:?} revision {source_revision} has multiple immutable source views; preserve both inputs before resuming"
+                        ));
+                    }
+                }
+            }
+
+            for source_hash in accepted_hashes.into_values() {
+                let local_keys = match side {
+                    DeviceSide::Boox => vec![canonical_path_key(&document.boox_pdf)],
+                    DeviceSide::Supernote => supernote_files
+                        .iter()
+                        .filter(|(hash, _)| hash == &source_hash)
+                        .map(|(_, key)| key.clone())
+                        .collect(),
+                };
+                for local_key in local_keys {
+                    let side_state = state.document_mut(&document.document_id).side_mut(side);
+                    side_state
+                        .uploaded_local_hashes
+                        .insert(local_key.clone(), source_hash.clone());
+                    side_state
+                        .accepted_local_hashes
+                        .insert(local_key, source_hash.clone());
+                }
             }
         }
         Ok(())
@@ -486,10 +575,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         );
         let metadata = BTreeMap::from([
             (DOCUMENT_ID.to_owned(), document.document_id.clone()),
-            (
-                "inkbridge-source-revision".to_owned(),
-                source_revision.to_string(),
-            ),
+            (SOURCE_REVISION.to_owned(), source_revision.to_string()),
             (
                 "inkbridge-based-on-boox".to_owned(),
                 based_on.boox.to_string(),
@@ -501,10 +587,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             (CONTENT_SHA256.to_owned(), payload_hash.to_owned()),
             ("inkbridge-sync-ready".to_owned(), "true".to_owned()),
             ("inkbridge-payload-kind".to_owned(), payload_kind.to_owned()),
-            (
-                "inkbridge-source-view-sha256".to_owned(),
-                local_hash.to_owned(),
-            ),
+            (SOURCE_VIEW_SHA256.to_owned(), local_hash.to_owned()),
         ]);
         let object = self
             .cloud
@@ -581,6 +664,10 @@ fn required_metadata<'a>(object: &'a CloudObject, key: &str) -> Result<&'a str, 
         .map(String::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("broker output {} is missing {key}", object.path))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_revision_metadata(object: &CloudObject) -> Result<RevisionPair, String> {

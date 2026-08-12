@@ -380,6 +380,92 @@ fn already_installed_boox_view_recovers_a_lost_checkpoint() {
 }
 
 #[test]
+fn acknowledged_boox_upload_recovers_after_checkpoint_loss_without_allocating_r2() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    fs::write(&document.boox_pdf, b"edited BOOX view").unwrap();
+    let export = document.supernote_export_directory.join("page.json");
+    let export_bytes = native_export();
+    fs::write(&export, &export_bytes).unwrap();
+    let export_hash = sha256_hex(&export_bytes);
+    let export_key = path_key(&export);
+    let checkpoint = TransportState {
+        documents: BTreeMap::from([(
+            document.document_id.clone(),
+            DocumentTransportState {
+                supernote: SideTransportState {
+                    uploaded_local_hashes: BTreeMap::from([(
+                        export_key.clone(),
+                        export_hash.clone(),
+                    )]),
+                    accepted_local_hashes: BTreeMap::from([(export_key, export_hash)]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]),
+        ..TransportState::empty()
+    };
+    let cloud = FakeCloud::default();
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let mut state = checkpoint.clone();
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(state.documents[&document.document_id]
+        .boox
+        .pending
+        .is_some());
+
+    let manifest = b"{\"operations\":[]}".to_vec();
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/incoming/accepted.operations.json",
+            document.document_id
+        ),
+        manifest.clone(),
+        generated_metadata(&document.document_id, "1:0", &manifest),
+    );
+
+    // Simulate losing the checkpoint written after the immutable r1 upload.
+    state = checkpoint;
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    let uploads = cloud
+        .objects
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(object, _)| {
+            object
+                .path
+                .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
+        })
+        .count();
+    assert_eq!(
+        uploads, 1,
+        "the accepted r1 source was uploaded again as r2"
+    );
+    let recovered = &state.documents[&document.document_id];
+    assert_eq!(recovered.revisions.boox, 1);
+    assert!(recovered.boox.pending.is_none());
+    assert_eq!(
+        recovered
+            .boox
+            .accepted_local_hashes
+            .get(&path_key(&document.boox_pdf))
+            .map(String::as_str),
+        Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    );
+}
+
+#[test]
 fn conflict_object_blocks_new_uploads_and_is_reported() {
     let root = tempdir().unwrap();
     let document = mapping(root.path());
