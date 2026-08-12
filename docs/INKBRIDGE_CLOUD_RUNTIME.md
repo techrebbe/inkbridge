@@ -146,8 +146,11 @@ INKBRIDGE_FIRESTORE_DATABASE  # defaults to (default)
 PORT                          # defaults to 8080
 ```
 
-The runtime container includes `inkbridge-convert` and `qpdf` and targets Linux
-`amd64`. `infra/gcp` is an opt-in deployment configuration. CI validates three
+The runtime container includes `inkbridge-convert` and qpdf 12.2 or newer and
+targets Linux `amd64`. The minimum qpdf version is enforced while the image is
+built: qpdf 11.3 can repair NeoReader's malformed cross-reference table while
+silently omitting annotations that qpdf 12.2+ preserves. `infra/gcp` is an
+opt-in deployment configuration. CI validates three
 credential-free, no-apply states: disabled, bootstrap, and runtime. Bootstrap
 creates the data plane and regional image repository while omitting Cloud Run
 and Eventarc. Runtime requires an immutable Artifact Registry `@sha256` image

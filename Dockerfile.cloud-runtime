@@ -22,9 +22,11 @@ COPY reader-core ./reader-core
 
 RUN cargo build --locked --release -p inkbridge-cloud-runtime -p inkbridge-convert
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates qpdf \
+    && qpdf_version="$(qpdf --version | awk 'NR == 1 { print $3 }')" \
+    && dpkg --compare-versions "$qpdf_version" ge 12.2.0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/inkbridge-cloud-runtime /usr/local/bin/inkbridge-cloud-runtime
