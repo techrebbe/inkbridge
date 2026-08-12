@@ -230,6 +230,15 @@ fn supernote_export_upload_is_revisioned_and_duplicate_scan_is_idempotent() {
         .supernote
         .pending
         .is_some());
+    assert_eq!(
+        cloud.objects.lock().unwrap()[0]
+            .0
+            .metadata
+            .get(SOURCE_LOCAL_ID),
+        Some(&sha256_hex(
+            format!("{}\0supernote-page\0{}", document.document_id, 0).as_bytes()
+        ))
+    );
 
     let second = transport
         .sync_document(&document, &mut state, SystemTime::now())
@@ -544,6 +553,86 @@ fn recovery_replaces_a_stale_accepted_path_after_export_rename() {
         .accepted_local_hashes;
     assert!(!accepted.contains_key(&old_key));
     assert_eq!(accepted.get(&new_key), Some(&content_hash));
+}
+
+#[test]
+fn recovery_retires_an_older_page_identity_after_rename_and_edit() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    fs::write(&document.boox_pdf, b"edited BOOX view").unwrap();
+    let old_path = document.supernote_export_directory.join("old-page.json");
+    let new_path = document
+        .supernote_export_directory
+        .join("renamed-page.json");
+    let old_bytes = native_export();
+    let new_bytes = String::from_utf8(old_bytes.clone())
+        .unwrap()
+        .replace("s1", "s2")
+        .into_bytes();
+    fs::write(&old_path, &old_bytes).unwrap();
+    let old_key = path_key(&old_path);
+    fs::rename(&old_path, &new_path).unwrap();
+    fs::write(&new_path, &new_bytes).unwrap();
+    let new_key = path_key(&new_path);
+    let old_hash = sha256_hex(&old_bytes);
+    let new_hash = sha256_hex(&new_bytes);
+    let page_identity =
+        sha256_hex(format!("{}\0supernote-page\0{}", document.document_id, 0).as_bytes());
+    let cloud = FakeCloud::default();
+    for (revision, bytes, hash) in [
+        (1_u64, old_bytes, old_hash.clone()),
+        (2_u64, new_bytes, new_hash.clone()),
+    ] {
+        cloud.put(
+            &format!(
+                "Supernote_Folder/{}/uploads/supernote-r{revision}.json",
+                document.document_id
+            ),
+            bytes,
+            BTreeMap::from([
+                (DOCUMENT_ID.to_owned(), document.document_id.clone()),
+                (SOURCE_REVISION.to_owned(), revision.to_string()),
+                (SOURCE_VIEW_SHA256.to_owned(), hash),
+                (SOURCE_LOCAL_ID.to_owned(), page_identity.clone()),
+            ]),
+        );
+    }
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 2,
+            },
+            supernote: SideTransportState {
+                accepted_local_hashes: BTreeMap::from([(old_key.clone(), old_hash)]),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    let accepted = &state.documents[&document.document_id]
+        .supernote
+        .accepted_local_hashes;
+    assert_eq!(accepted, &BTreeMap::from([(new_key, new_hash)]));
+    assert!(!accepted.contains_key(&old_key));
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            ..
+        }
+    )));
 }
 
 #[test]

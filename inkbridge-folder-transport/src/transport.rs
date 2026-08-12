@@ -597,6 +597,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         }
         let manifest_bytes = built.bytes;
         let payload_hash = sha256_hex(&manifest_bytes);
+        let source_local_id = sha256_hex(local_key.as_bytes());
         let temporary = sibling_temporary(&document.boox_pdf, "compact-upload");
         fs::write(&temporary, &manifest_bytes)
             .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
@@ -606,6 +607,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             DeviceSide::Boox,
             &temporary,
             &local_key,
+            &source_local_id,
             &source_hash,
             &payload_hash,
             "boox_operation_manifest",
@@ -708,6 +710,17 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             {
                 continue;
             }
+            // A Supernote page is the logical local source. Its identity must
+            // survive export-file renames so accepted revisions supersede the
+            // earlier revision instead of leaving an obsolete missing-path
+            // sentinel that blocks later BOOX updates.
+            let source_local_id = sha256_hex(
+                format!(
+                    "{}\0supernote-page\0{}",
+                    document.document_id, parsed.page_index
+                )
+                .as_bytes(),
+            );
             let temporary = sibling_temporary(&export, "native-upload");
             fs::write(&temporary, &bytes)
                 .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
@@ -717,6 +730,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 DeviceSide::Supernote,
                 &temporary,
                 &local_key,
+                &source_local_id,
                 &content_hash,
                 &content_hash,
                 "device_view",
@@ -749,6 +763,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         side: DeviceSide,
         payload_path: &Path,
         local_key: &str,
+        source_local_id: &str,
         local_hash: &str,
         payload_hash: &str,
         payload_kind: &str,
@@ -792,7 +807,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             ("inkbridge-sync-ready".to_owned(), "true".to_owned()),
             ("inkbridge-payload-kind".to_owned(), payload_kind.to_owned()),
             (SOURCE_VIEW_SHA256.to_owned(), local_hash.to_owned()),
-            (SOURCE_LOCAL_ID.to_owned(), sha256_hex(local_key.as_bytes())),
+            (SOURCE_LOCAL_ID.to_owned(), source_local_id.to_owned()),
         ]);
         let object = self
             .cloud

@@ -54,7 +54,36 @@ impl TransportConfig {
             resolve_path(base, &mut document.supernote_incoming_directory);
         }
         config.validate()?;
+        config.validate_config_path(path)?;
         Ok(config)
+    }
+
+    fn validate_config_path(&self, path: &Path) -> Result<(), String> {
+        let config_path = normalized_path_key(path)?;
+        for document in &self.documents {
+            let boox_path = normalized_path_key(&document.boox_pdf)?;
+            if boox_mapping_overlaps_path(&boox_path, &config_path) {
+                return Err(format!(
+                    "configuration file {} must be outside mapped BOOX paths",
+                    path.display()
+                ));
+            }
+            for directory in [
+                &document.supernote_export_directory,
+                &document.supernote_incoming_directory,
+            ] {
+                let directory = normalized_path_key(directory)?;
+                if key_contains_path(&directory, &config_path)
+                    || key_contains_path(&config_path, &directory)
+                {
+                    return Err(format!(
+                        "configuration file {} must be outside mapped Supernote directories",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -879,6 +908,34 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("overlaps a directory"));
+    }
+
+    #[test]
+    fn configuration_load_rejects_its_file_inside_supernote_outgoing() {
+        let directory = tempdir().unwrap();
+        let outgoing = directory.path().join("supernote/outgoing");
+        std::fs::create_dir_all(&outgoing).unwrap();
+        let config_path = outgoing.join("inkbridge-folder-transport.json");
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: directory.path().join("state.json"),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: directory.path().join("boox/book.pdf"),
+                supernote_export_directory: outgoing,
+                supernote_incoming_directory: directory.path().join("supernote/incoming"),
+            }],
+        };
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        assert!(TransportConfig::load(&config_path)
+            .unwrap_err()
+            .contains("configuration file"));
     }
 
     #[test]
