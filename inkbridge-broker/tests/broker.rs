@@ -227,6 +227,19 @@ fn stable_document_id_is_independent_of_file_name() {
 }
 
 #[test]
+fn registration_rejects_a_zero_page_pdf() {
+    let broker = Broker::default();
+    let mut storage = MemoryStorage::default();
+    let error = broker
+        .register_document(&mut storage, "empty.pdf", &original_pdf_with_pages(0))
+        .expect_err("a device view cannot address an empty page tree");
+
+    assert!(
+        matches!(error, BrokerError::InvalidEvent(message) if message.contains("at least one page"))
+    );
+}
+
+#[test]
 fn re_registering_legacy_document_persists_original_page_count() {
     let original = original_pdf_with_pages(3);
     let broker = Broker::default();
@@ -492,6 +505,58 @@ fn compact_manifest_rejects_samples_the_supernote_would_clamp() {
 }
 
 #[test]
+fn compact_manifest_rejects_native_style_values_the_plugin_cannot_preserve() {
+    let beyond_android_integer = i64::from(i32::MAX) + 1;
+    let invalid_styles = [
+        NativeStyle {
+            layer_num: beyond_android_integer,
+            ..NativeStyle::default()
+        },
+        NativeStyle {
+            thickness: 0,
+            ..NativeStyle::default()
+        },
+        NativeStyle {
+            thickness: beyond_android_integer,
+            ..NativeStyle::default()
+        },
+        NativeStyle {
+            pen_type: beyond_android_integer,
+            ..NativeStyle::default()
+        },
+    ];
+
+    for (index, native_style) in invalid_styles.into_iter().enumerate() {
+        let mut harness = Harness::new();
+        let mut invalid = stroke(&format!("invalid-style-{index}"), 0.2, 0.3);
+        invalid.native_style = native_style;
+        invalid.geometry_fingerprint =
+            geometry_fingerprint(&invalid.native_style, &invalid.samples);
+        let mut event = harness.event(
+            &format!("boox-compact-invalid-style-{index}"),
+            DeviceSide::Boox,
+            1,
+            RevisionPair::default(),
+            compact_manifest(
+                vec![Operation::UpsertStroke {
+                    source_uuid: invalid.source_uuid.clone(),
+                    page_index: invalid.page_index,
+                    before: None,
+                    after: invalid,
+                }],
+                1,
+            ),
+        );
+        event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+        assert!(matches!(
+            harness.broker.process(&mut harness.storage, &event),
+            Err(BrokerError::InvalidEvent(_))
+        ));
+    }
+}
+
+#[test]
 fn compact_manifest_normalizes_pen_colors_before_canonical_storage() {
     let mut harness = Harness::new();
     let mut original = stroke("normalized-color", 0.2, 0.3);
@@ -571,6 +636,38 @@ fn compact_manifest_normalizes_pen_colors_before_canonical_storage() {
     let normalized_moved = &second_state.strokes["normalized-color"].snapshot;
     assert_eq!(normalized_moved.native_style.pen_color, 0x9d);
     assert_eq!(normalized_moved.samples, moved.samples);
+}
+
+#[test]
+fn compact_manifest_indexes_thousands_of_strokes_without_rescanning_operations() {
+    const STROKE_COUNT: usize = 5_000;
+    let mut harness = Harness::new();
+    let operations = (0..STROKE_COUNT)
+        .map(|index| {
+            let snapshot = stroke(&format!("bulk-{index:05}"), 0.2, 0.3);
+            Operation::UpsertStroke {
+                source_uuid: snapshot.source_uuid.clone(),
+                page_index: snapshot.page_index,
+                before: None,
+                after: snapshot,
+            }
+        })
+        .collect();
+    let mut event = harness.event(
+        "boox-compact-bulk",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(operations, 1),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+
+    assert_eq!(harness.state().strokes.len(), STROKE_COUNT);
 }
 
 #[test]

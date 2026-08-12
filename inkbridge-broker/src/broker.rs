@@ -5,7 +5,7 @@ use inkbridge_convert::{
     build_manifest, geometry_fingerprint, parse_baseline_bytes, Manifest, Operation, StrokeSnapshot,
 };
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,12 @@ const GENERATED_EVENT_KEY: &str = "inkbridge-event-id";
 const GENERATED_DOCUMENT_KEY: &str = "inkbridge-document-id";
 const GENERATED_REVISIONS_KEY: &str = "inkbridge-source-revisions";
 const GENERATED_CONTENT_HASH_KEY: &str = "inkbridge-content-sha256";
+
+#[derive(Default)]
+struct CompactOperationSet<'a> {
+    delete: Option<&'a StrokeSnapshot>,
+    upsert: Option<(&'a Option<StrokeSnapshot>, &'a StrokeSnapshot)>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerError {
@@ -88,6 +94,11 @@ impl Broker {
             BrokerError::InvalidEvent(format!("immutable original is not a readable PDF: {error}"))
         })?;
         let original_page_count = original_document.get_pages().len();
+        if original_page_count == 0 {
+            return Err(BrokerError::InvalidEvent(
+                "immutable original PDF must contain at least one page".to_owned(),
+            ));
+        }
         drop(original_document);
         let document_id = stable_document_id(original_pdf);
         let original_path = original_path(&document_id);
@@ -287,6 +298,11 @@ impl Broker {
                 ))
             })?;
             state.original_page_count = document.get_pages().len();
+            if state.original_page_count == 0 {
+                return Err(BrokerError::CorruptState(
+                    "immutable original PDF contains no pages".to_owned(),
+                ));
+            }
         }
 
         let source_bytes = source.bytes;
@@ -508,6 +524,7 @@ impl Broker {
                         .ok()
                         .is_none_or(|page| page >= manifest.document.page_count)
                     || snapshot.samples.len() < 2
+                    || !valid_supernote_native_style(&snapshot.native_style)
                     || snapshot.samples.iter().any(|[x, y, pressure]| {
                         !x.is_finite()
                             || !y.is_finite()
@@ -541,50 +558,40 @@ impl Broker {
                 }
             }
         }
-        let stroke_ids = manifest
-            .operations
-            .iter()
-            .map(|operation| match operation {
-                Operation::UpsertStroke { source_uuid, .. }
-                | Operation::DeleteStroke { source_uuid, .. } => source_uuid.as_str(),
-            })
-            .collect::<BTreeSet<_>>();
-        for source_uuid in stroke_ids {
-            let mut deletes = manifest
-                .operations
-                .iter()
-                .filter_map(|operation| match operation {
-                    Operation::DeleteStroke {
-                        source_uuid: candidate,
-                        before,
-                        ..
-                    } if candidate == source_uuid => Some(before),
-                    _ => None,
-                });
-            let delete = deletes.next();
-            if deletes.next().is_some() {
-                return Err(BrokerError::InvalidEvent(format!(
-                    "BOOX operation manifest contains duplicate deletes for {source_uuid}"
-                )));
+        let mut operation_index =
+            HashMap::<&str, CompactOperationSet<'_>>::with_capacity(manifest.operations.len());
+        for operation in &manifest.operations {
+            match operation {
+                Operation::DeleteStroke {
+                    source_uuid,
+                    before,
+                    ..
+                } => {
+                    let entry = operation_index.entry(source_uuid.as_str()).or_default();
+                    if entry.delete.replace(before).is_some() {
+                        return Err(BrokerError::InvalidEvent(format!(
+                            "BOOX operation manifest contains duplicate deletes for {source_uuid}"
+                        )));
+                    }
+                }
+                Operation::UpsertStroke {
+                    source_uuid,
+                    before,
+                    after,
+                    ..
+                } => {
+                    let entry = operation_index.entry(source_uuid.as_str()).or_default();
+                    if entry.upsert.replace((before, after)).is_some() {
+                        return Err(BrokerError::InvalidEvent(format!(
+                            "BOOX operation manifest contains duplicate upserts for {source_uuid}"
+                        )));
+                    }
+                }
             }
-            let mut upserts = manifest
-                .operations
-                .iter()
-                .filter_map(|operation| match operation {
-                    Operation::UpsertStroke {
-                        source_uuid: candidate,
-                        before,
-                        after,
-                        ..
-                    } if candidate == source_uuid => Some((before, after)),
-                    _ => None,
-                });
-            let upsert = upserts.next();
-            if upserts.next().is_some() {
-                return Err(BrokerError::InvalidEvent(format!(
-                    "BOOX operation manifest contains duplicate upserts for {source_uuid}"
-                )));
-            }
+        }
+        for (source_uuid, operations) in operation_index {
+            let delete = operations.delete;
+            let upsert = operations.upsert;
             let active = state
                 .strokes
                 .get(source_uuid)
@@ -831,6 +838,16 @@ fn mark_event_only<S: BrokerStorage>(
         )?])
         .map_err(BrokerError::ConditionalWrite)?;
     Ok(())
+}
+
+fn valid_supernote_native_style(style: &inkbridge_convert::NativeStyle) -> bool {
+    // The plugin crosses both the JavaScript number bridge and Android integer APIs. Keep the
+    // compact wire format inside the narrower native integer domain, which is exactly
+    // representable by JavaScript and rejects values the Supernote host cannot preserve.
+    let native_integer = 0..=i64::from(i32::MAX);
+    native_integer.contains(&style.layer_num)
+        && (1..=i64::from(i32::MAX)).contains(&style.thickness)
+        && native_integer.contains(&style.pen_type)
 }
 
 fn normalize_supernote_pen_color(snapshot: &mut StrokeSnapshot) {
