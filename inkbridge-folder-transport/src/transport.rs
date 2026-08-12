@@ -1407,18 +1407,36 @@ fn reconcile_staged_backup(destination: &Path, published_hash: &str) -> Result<(
         }
         Some(_) => false,
     };
-    match file_identity(destination)? {
-        FileIdentity::Missing => restore_staged_file(&backup, destination),
-        FileIdentity::Sha256(current_hash)
-            if current_hash == published_hash && !backup_is_symlink =>
-        {
-            remove_file_if_exists(&backup)
-        }
-        FileIdentity::Sha256(_) => Err(format!(
-            "both BOOX destination {} and interrupted staged backup {} contain distinct data; preserved both",
+    let destination_metadata = symlink_metadata_if_exists(destination)?;
+    if destination_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!(
+            "BOOX destination {} was recreated as a symlink; preserved staged backup {}",
+            destination.display(),
+            backup.display()
+        ));
+    }
+    match destination_metadata {
+        None => restore_staged_file(&backup, destination),
+        Some(metadata) if !metadata.is_file() => Err(format!(
+            "BOOX destination {} is not a regular file; preserved staged backup {}",
             destination.display(),
             backup.display()
         )),
+        Some(_) => {
+            let current_hash = sha256_file(destination)?;
+            if current_hash == published_hash && !backup_is_symlink {
+                remove_file_if_exists(&backup)
+            } else {
+                Err(format!(
+                    "both BOOX destination {} and interrupted staged backup {} contain distinct data; preserved both",
+                    destination.display(),
+                    backup.display()
+                ))
+            }
+        }
     }
 }
 
@@ -1620,5 +1638,31 @@ mod snapshot_tests {
             .is_symlink());
         assert_eq!(fs::read(&backup).unwrap(), b"staged broker predecessor");
         assert!(!missing_target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_preserves_a_recreated_symlink_to_published_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("book.pdf");
+        let backup = sibling_temporary(&destination, "previous");
+        let target = directory.path().join("sync-client-book.pdf");
+        let published = b"published broker view";
+        fs::write(&backup, b"staged broker predecessor").unwrap();
+        fs::write(&target, published).unwrap();
+        symlink(&target, &destination).unwrap();
+
+        let error = reconcile_staged_backup(&destination, &sha256_hex(published))
+            .expect_err("the recreated symlink must preserve the staged backup");
+
+        assert!(error.contains("recreated as a symlink"));
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), published);
+        assert_eq!(fs::read(&backup).unwrap(), b"staged broker predecessor");
     }
 }
