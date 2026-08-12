@@ -1,0 +1,54 @@
+name: InkBridge folder transport
+
+on:
+  push:
+    branches: [master, "agent/device-folder-transport", "feat/**"]
+    paths:
+      - "inkbridge-folder-transport/**"
+      - "inkbridge-convert/**"
+      - "inkbridge-broker/**"
+      - "docs/INKBRIDGE_FOLDER_TRANSPORT.md"
+      - "docs/examples/inkbridge-folder-transport.example.json"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/inkbridge-folder-transport.yml"
+  pull_request:
+    paths:
+      - "inkbridge-folder-transport/**"
+      - "inkbridge-convert/**"
+      - "inkbridge-broker/**"
+      - "docs/INKBRIDGE_FOLDER_TRANSPORT.md"
+      - "docs/examples/inkbridge-folder-transport.example.json"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/inkbridge-folder-transport.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: transport fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint folder transport
+        run: cargo clippy -p inkbridge-folder-transport --all-targets -- -D warnings
+      - name: Test folder transport
+        run: cargo test -p inkbridge-folder-transport
+
+  windows:
+    name: Windows folder transport
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Test and build Windows transport
+        run: |
+          cargo test -p inkbridge-folder-transport
+          cargo build -p inkbridge-folder-transport --release

@@ -7,10 +7,11 @@
 
 <h1 align="center">inkread</h1>
 
-> InkBridge development note: the current cross-device synchronization milestone is the
-> storage-independent two-folder broker described in
-> [docs/INKBRIDGE_BROKER_ARCHITECTURE.md](docs/INKBRIDGE_BROKER_ARCHITECTURE.md). It does not deploy
-> cloud resources.
+> InkBridge development note: the private two-folder broker is deployed, and the current milestone
+> is the local finalized-folder transport described in
+> [docs/INKBRIDGE_FOLDER_TRANSPORT.md](docs/INKBRIDGE_FOLDER_TRANSPORT.md). BOOX edits are converted
+> locally into compact operation manifests; broker outputs are delivered back into the two device
+> folders without making filename order or modification time authoritative.
 
 <p align="center">
   <strong>A Rust-core, e-ink-first document reader with first-class handwriting.</strong><br>

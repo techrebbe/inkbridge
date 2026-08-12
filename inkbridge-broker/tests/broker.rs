@@ -684,6 +684,7 @@ fn compact_manifest_uses_the_broker_coordinate_calibration() {
         1,
     ))
     .unwrap();
+    let adapter_manifest_id = manifest.manifest_id.clone();
     manifest
         .coordinate_transform
         .pdf_to_supernote_normalized_y_offset = 0.25;
@@ -717,6 +718,8 @@ fn compact_manifest_uses_the_broker_coordinate_calibration() {
             .pdf_to_supernote_normalized_y_offset,
         -0.0008
     );
+    assert_ne!(emitted.manifest_id, adapter_manifest_id);
+    assert!(emitted.manifest_id.starts_with("inkbridge-"));
 }
 
 #[test]

@@ -67,3 +67,4 @@ outputs/
 *.swp
 logcat.txt
 *.log
+.inkbridge-folder-state.json*
