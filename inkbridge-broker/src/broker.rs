@@ -2,7 +2,7 @@ use crate::model::*;
 use crate::pdf_view::write_boox_view_with_tombstones_owned;
 use crate::storage::*;
 use inkbridge_convert::{
-    build_manifest, parse_baseline_bytes, Manifest, Operation, StrokeSnapshot,
+    build_manifest, geometry_fingerprint, parse_baseline_bytes, Manifest, Operation, StrokeSnapshot,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -430,7 +430,10 @@ impl Broker {
         let mut manifest: Manifest = serde_json::from_slice(bytes).map_err(|error| {
             BrokerError::InvalidEvent(format!("BOOX operation manifest is invalid JSON: {error}"))
         })?;
-        if manifest.schema_version != 1 || manifest.source != "boox-neoreader-embedded-pdf" {
+        if manifest.schema_version != 1
+            || manifest.manifest_id.trim().is_empty()
+            || manifest.source != "boox-neoreader-embedded-pdf"
+        {
             return Err(BrokerError::InvalidEvent(
                 "BOOX operation manifest has an unsupported schema or source".to_owned(),
             ));
@@ -477,6 +480,8 @@ impl Broker {
                     .iter()
                     .flatten()
                     .any(|value| !value.is_finite())
+                || snapshot.geometry_fingerprint
+                    != geometry_fingerprint(&snapshot.native_style, &snapshot.samples)
             {
                 return Err(BrokerError::InvalidEvent(
                     "BOOX operation manifest contains an invalid stroke operation".to_owned(),

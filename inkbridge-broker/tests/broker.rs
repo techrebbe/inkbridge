@@ -374,6 +374,58 @@ fn compact_manifest(operations: Vec<Operation>, page_count: usize) -> Vec<u8> {
 }
 
 #[test]
+fn compact_manifest_requires_identity_and_verified_fingerprints() {
+    let mut harness = Harness::new();
+    let snapshot = stroke("new-stroke", 0.2, 0.3);
+    let valid = compact_manifest(
+        vec![Operation::UpsertStroke {
+            source_uuid: snapshot.source_uuid.clone(),
+            page_index: snapshot.page_index,
+            before: None,
+            after: snapshot,
+        }],
+        1,
+    );
+    let mut missing_id: Manifest = serde_json::from_slice(&valid).unwrap();
+    missing_id.manifest_id.clear();
+    let mut missing_id_event = harness.event(
+        "boox-compact-missing-id",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        serde_json::to_vec(&missing_id).unwrap(),
+    );
+    missing_id_event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &missing_id_event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+
+    let mut stale_fingerprint: Manifest = serde_json::from_slice(&valid).unwrap();
+    let Operation::UpsertStroke { after, .. } = &mut stale_fingerprint.operations[0] else {
+        panic!("fixture must contain an upsert")
+    };
+    after.geometry_fingerprint = "fnv1a32:00000000".to_owned();
+    let mut stale_fingerprint_event = harness.event(
+        "boox-compact-stale-fingerprint",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        serde_json::to_vec(&stale_fingerprint).unwrap(),
+    );
+    stale_fingerprint_event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &stale_fingerprint_event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert!(!harness.state().strokes.contains_key("new-stroke"));
+}
+
+#[test]
 fn compact_delete_must_match_the_active_canonical_snapshot() {
     let mut harness = Harness::new();
     let export = harness.event(
