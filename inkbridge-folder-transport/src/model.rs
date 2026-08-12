@@ -1,6 +1,7 @@
 use inkbridge_broker::{DeviceSide, RevisionPair};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -75,6 +76,9 @@ impl TransportConfig {
         let mut ids = BTreeSet::new();
         let mut boox_paths = BTreeSet::new();
         let mut supernote_paths = BTreeSet::new();
+        let state_path = (!self.state_path.as_os_str().is_empty())
+            .then(|| normalized_path_key(&self.state_path))
+            .transpose()?;
         for document in &self.documents {
             if !document.document_id.starts_with("inkbridge-doc-v1-")
                 || document.document_id.contains(['/', '\\'])
@@ -87,10 +91,17 @@ impl TransportConfig {
             if !ids.insert(&document.document_id) {
                 return Err(format!("duplicate documentId {}", document.document_id));
             }
-            let boox_path = normalized_path_key(&document.boox_pdf);
-            if !boox_paths.insert(boox_path) {
+            let boox_path = normalized_path_key(&document.boox_pdf)?;
+            if !boox_paths.insert(boox_path.clone()) {
                 return Err(format!(
                     "duplicate booxPdf mapping {}",
+                    document.boox_pdf.display()
+                ));
+            }
+            if state_path.as_deref() == Some(boox_path.as_str()) {
+                return Err(format!(
+                    "statePath {} collides with BOOX file {}",
+                    self.state_path.display(),
                     document.boox_pdf.display()
                 ));
             }
@@ -110,10 +121,20 @@ impl TransportConfig {
                 ("outgoing", &document.supernote_export_directory),
                 ("incoming", &document.supernote_incoming_directory),
             ] {
-                let key = normalized_path_key(directory);
-                if !supernote_paths.insert(key) {
+                let key = normalized_path_key(directory)?;
+                if !supernote_paths.insert(key.clone()) {
                     return Err(format!(
                         "Supernote {direction} directory {} is shared by multiple mappings or directions",
+                        directory.display()
+                    ));
+                }
+                if state_path
+                    .as_deref()
+                    .is_some_and(|state| key_contains_path(&key, state))
+                {
+                    return Err(format!(
+                        "statePath {} must be outside Supernote {direction} directory {}",
+                        self.state_path.display(),
                         directory.display()
                     ));
                 }
@@ -129,15 +150,57 @@ fn resolve_path(base: &Path, value: &mut PathBuf) {
     }
 }
 
-fn normalized_path_key(path: &Path) -> String {
-    let resolved = path
-        .canonicalize()
-        .unwrap_or_else(|_| lexical_normalize(path));
+fn normalized_path_key(path: &Path) -> Result<String, String> {
+    let resolved = resolve_existing_ancestor(path)?;
     let value = resolved.to_string_lossy().replace('\\', "/");
     if cfg!(windows) {
-        value.to_lowercase()
+        Ok(value.to_lowercase())
     } else {
-        value
+        Ok(value)
+    }
+}
+
+fn key_contains_path(directory: &str, candidate: &str) -> bool {
+    candidate == directory
+        || candidate
+            .strip_prefix(directory)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("could not resolve current directory: {error}"))?
+            .join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(lexical_normalize(&resolved));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or_else(|| {
+                    format!("could not find an existing ancestor for {}", path.display())
+                })?;
+                missing.push(component.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    format!("could not find an existing ancestor for {}", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not resolve mapped path {}: {error}",
+                    path.display()
+                ));
+            }
+        }
     }
 }
 
@@ -224,9 +287,9 @@ impl TransportState {
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
         std::fs::write(&next, [bytes.as_slice(), b"\n"].concat())
             .map_err(|error| format!("could not write {}: {error}", next.display()))?;
-        remove_file_if_exists(&previous)?;
         let had_current = regular_file_exists(path)?;
         if had_current {
+            remove_file_if_exists(&previous)?;
             std::fs::rename(path, &previous).map_err(|error| {
                 format!(
                     "could not stage existing state {} as {}: {error}",
@@ -515,5 +578,55 @@ mod tests {
         };
 
         assert!(config.validate().unwrap_err().contains("is shared"));
+    }
+
+    #[test]
+    fn configuration_rejects_state_path_inside_a_mapped_device_path() {
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::from("supernote/outgoing/state.json"),
+            documents: vec![DocumentFolders {
+                document_id: "inkbridge-doc-v1-test".to_owned(),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: PathBuf::from("boox/book.pdf"),
+                supernote_export_directory: PathBuf::from("supernote/outgoing"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+        };
+
+        assert!(config.validate().unwrap_err().contains("must be outside"));
+    }
+
+    #[test]
+    fn failed_state_publication_does_not_delete_the_recovery_checkpoint() {
+        let directory = tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        std::fs::create_dir(&state_path).unwrap();
+        let previous = state_path.with_extension("json.previous");
+        std::fs::write(&previous, b"durable recovery").unwrap();
+
+        assert!(TransportState::empty().save(&state_path).is_err());
+        assert_eq!(std::fs::read(previous).unwrap(), b"durable recovery");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_paths_resolve_through_the_nearest_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+
+        assert_eq!(
+            normalized_path_key(&real.join("missing/book.pdf")).unwrap(),
+            normalized_path_key(&alias.join("missing/book.pdf")).unwrap()
+        );
     }
 }
