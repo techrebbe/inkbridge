@@ -1,6 +1,6 @@
 use crate::{
     hydrate_content_hash, translate_storage_finalized_event, CanonicalStateStore,
-    CloudBrokerStorage, EventTranslation, ObjectStore,
+    CloudBrokerStorage, EventTranslation, ObjectStore, RegistrationEvent,
 };
 use axum::body::Bytes;
 use axum::extract::State;
@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use inkbridge_broker::{Broker, CanonicalDocumentState, ProcessOutcome};
+use inkbridge_broker::{Broker, BrokerError, CanonicalDocumentState, ProcessOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -33,9 +33,21 @@ pub struct RegisterDocumentRequest {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RuntimeOutcome {
-    Ignored { reason: String },
-    Rejected { reason: String },
-    Processed { outcome: ProcessOutcome },
+    Ignored {
+        reason: String,
+    },
+    Rejected {
+        reason: String,
+    },
+    Registered {
+        event_id: String,
+        document_id: String,
+        original_sha256: String,
+        state_revision: u64,
+    },
+    Processed {
+        outcome: ProcessOutcome,
+    },
 }
 
 impl RuntimeService {
@@ -59,6 +71,9 @@ impl RuntimeService {
         let mut event = match translate_storage_finalized_event(&self.bucket, headers, body) {
             Err(reason) => return Ok(RuntimeOutcome::Rejected { reason }),
             Ok(EventTranslation::Process(event)) => event,
+            Ok(EventTranslation::Register(registration)) => {
+                return self.register_storage_event(&registration);
+            }
             Ok(EventTranslation::Ignore { reason }) => {
                 return Ok(RuntimeOutcome::Ignored { reason });
             }
@@ -116,6 +131,44 @@ impl RuntimeService {
             .map_err(|error| error.to_string())
     }
 
+    fn register_storage_event(
+        &self,
+        registration: &RegistrationEvent,
+    ) -> Result<RuntimeOutcome, String> {
+        let original = self
+            .objects
+            .read(&registration.object_path)?
+            .ok_or_else(|| {
+                format!(
+                    "registration source {} does not exist",
+                    registration.object_path
+                )
+            })?;
+        if original.generation != registration.source_generation {
+            return Ok(RuntimeOutcome::Rejected {
+                reason: format!(
+                    "registration source generation changed: expected {}, found {}",
+                    registration.source_generation, original.generation
+                ),
+            });
+        }
+        let mut storage = CloudBrokerStorage::new(self.objects.clone(), self.states.clone());
+        match Broker::default().register_document(
+            &mut storage,
+            &registration.original_file_name,
+            &original.bytes,
+        ) {
+            Ok(state) => Ok(RuntimeOutcome::Registered {
+                event_id: registration.event_id.clone(),
+                document_id: state.document_id,
+                original_sha256: state.original_pdf_sha256,
+                state_revision: state.state_revision,
+            }),
+            Err(BrokerError::InvalidEvent(reason)) => Ok(RuntimeOutcome::Rejected { reason }),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     pub fn router(self) -> Router {
         Router::new()
             .route("/", post(eventarc_handler))
@@ -135,6 +188,16 @@ async fn eventarc_handler(
         Ok(Ok(outcome)) => {
             if let RuntimeOutcome::Rejected { reason } = &outcome {
                 eprintln!("rejected permanent Eventarc input: {reason}");
+            }
+            if let RuntimeOutcome::Registered {
+                event_id,
+                document_id,
+                ..
+            } = &outcome
+            {
+                eprintln!(
+                    "registered immutable original from Eventarc event {event_id} as {document_id}"
+                );
             }
             (StatusCode::OK, Json(json!(outcome))).into_response()
         }
@@ -363,6 +426,79 @@ mod tests {
         assert!(matches!(
             service
                 .handle_storage_event(&headers("false-hash"), &false_hash)
+                .unwrap(),
+            RuntimeOutcome::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn marked_staging_finalize_registers_idempotently_through_eventarc() {
+        let objects = Arc::new(MemoryObjectStore::default());
+        let states = Arc::new(MemoryCanonicalStateStore::default());
+        let original = objects.put("Staging/upload.pdf", original_pdf());
+        let service = RuntimeService::new("sync-bucket", objects, states);
+        let body = serde_json::to_vec(&json!({
+            "bucket": "sync-bucket",
+            "name": "Staging/upload.pdf",
+            "generation": original.generation.to_string(),
+            "metadata": {
+                "inkbridge-register-original": "true",
+                "inkbridge-original-file-name": "daily-reading.pdf"
+            }
+        }))
+        .unwrap();
+
+        let first = service
+            .handle_storage_event(&headers("register-event"), &body)
+            .unwrap();
+        let RuntimeOutcome::Registered {
+            document_id,
+            original_sha256,
+            state_revision,
+            ..
+        } = first
+        else {
+            panic!("expected registered outcome")
+        };
+        assert_eq!(state_revision, 0);
+        assert_eq!(original_sha256, sha256_hex(&original_pdf()));
+        assert_eq!(
+            states_record(&service, &document_id).original_file_name,
+            "daily-reading.pdf"
+        );
+
+        let duplicate = service
+            .handle_storage_event(&headers("register-event"), &body)
+            .unwrap();
+        assert!(matches!(
+            duplicate,
+            RuntimeOutcome::Registered {
+                document_id: duplicate_id,
+                state_revision: 0,
+                ..
+            } if duplicate_id == document_id
+        ));
+    }
+
+    #[test]
+    fn invalid_marked_registration_is_acknowledged_as_rejected() {
+        let objects = Arc::new(MemoryObjectStore::default());
+        let states = Arc::new(MemoryCanonicalStateStore::default());
+        let original = objects.put("Staging/not-a-pdf.pdf", b"not a PDF".to_vec());
+        let service = RuntimeService::new("sync-bucket", objects, states);
+        let body = serde_json::to_vec(&json!({
+            "bucket": "sync-bucket",
+            "name": "Staging/not-a-pdf.pdf",
+            "generation": original.generation.to_string(),
+            "metadata": {
+                "inkbridge-register-original": "true"
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            service
+                .handle_storage_event(&headers("invalid-registration"), &body)
                 .unwrap(),
             RuntimeOutcome::Rejected { .. }
         ));

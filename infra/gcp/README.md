@@ -67,27 +67,53 @@ saved plans. Copy `terraform.tfvars.example` to a private `.tfvars` file.
      --config=cloudbuild.runtime.yaml \
      --gcs-source-staging-dir=gs://BUILD_SOURCE_BUCKET/source \
      --service-account=projects/PROJECT_ID/serviceAccounts/inkbridge-builder@PROJECT_ID.iam.gserviceaccount.com \
-     --substitutions=_IMAGE=REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/runtime:GIT_SHA
+     --substitutions=_IMAGE=REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/runtime:build-GIT_SHA
    ```
 
 5. Resolve the pushed tag to its immutable digest:
 
    ```text
    gcloud artifacts docker images describe \
-     REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/runtime:GIT_SHA \
+     REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/runtime:build-GIT_SHA \
      --format="value(image_summary.digest)"
    ```
 
-6. Set `cloud_run_image` to the same image path with `:GIT_SHA` replaced by
-   `@sha256:...`. Save and inspect a fresh runtime plan.
-7. Apply only that exact saved runtime plan, then test registration and one
-   finalized update from each device folder.
+6. Protect the selected digest from cleanup before deployment:
 
-The Artifact Registry repository keeps the five most recent versions and
-deletes untagged versions older than seven days. The dedicated build-source
-bucket deletes source archives after one day, and the builder can read that
-bucket but not the device-data bucket. Cloud Run remains private, uses zero
-minimum instances, one maximum instance, and concurrency one.
+   ```text
+   gcloud artifacts docker tags add \
+     REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/runtime@sha256:DIGEST \
+     REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/runtime:deployed-current
+   ```
+
+7. Set `cloud_run_image` to the same image path with the build tag replaced by
+   `@sha256:...`. Save and inspect a fresh runtime plan, then apply only that
+   exact saved plan.
+8. Register an immutable original through the same private Eventarc path used
+   for device updates. The metadata marker is required; unrelated objects in
+   `Staging/` are ignored:
+
+   ```text
+   cargo run -p inkbridge-broker -- document-id ORIGINAL.pdf
+
+   gcloud storage cp ORIGINAL.pdf gs://DEVICE_BUCKET/Staging/REGISTRATION_ID.pdf \
+     --if-generation-match=0 \
+     --custom-metadata=inkbridge-register-original=true,inkbridge-original-file-name=ORIGINAL.pdf
+   ```
+
+   Eventarc authenticates this finalized-object event with its existing private
+   Cloud Run invoker identity. The broker validates the PDF and registers it
+   idempotently. The local `document-id` command prints the stable ID to use in
+   the two device folders. After registration, test one finalized update from
+   each device folder.
+
+The Artifact Registry repository keeps the five most recent versions, retains
+every `deployed-` tagged digest, and deletes older `build-` tagged or untagged
+versions after seven days. Move `deployed-current` to the new digest only when
+the matching runtime apply is ready. The dedicated build-source bucket deletes
+source archives after one day, and the builder can read that bucket but not the
+device-data bucket. Cloud Run remains private, uses zero minimum instances, one
+maximum instance, and concurrency one.
 
 ## Planned resources
 

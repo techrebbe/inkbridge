@@ -98,6 +98,17 @@ resource "google_artifact_registry_repository" "runtime" {
   cleanup_policy_dry_run = false
 
   cleanup_policies {
+    id     = "delete-old-builds"
+    action = "DELETE"
+
+    condition {
+      tag_state    = "TAGGED"
+      tag_prefixes = ["build-"]
+      older_than   = "604800s"
+    }
+  }
+
+  cleanup_policies {
     id     = "delete-old-untagged"
     action = "DELETE"
 
@@ -113,6 +124,16 @@ resource "google_artifact_registry_repository" "runtime" {
 
     most_recent_versions {
       keep_count = 5
+    }
+  }
+
+  cleanup_policies {
+    id     = "keep-deployed"
+    action = "KEEP"
+
+    condition {
+      tag_state    = "TAGGED"
+      tag_prefixes = ["deployed-"]
     }
   }
 

@@ -63,6 +63,22 @@ run "bootstrap_omits_runtime" {
   }
 
   assert {
+    condition = anytrue([
+      for policy in google_artifact_registry_repository.runtime[0].cleanup_policies :
+      policy.id == "delete-old-builds" && try(policy.condition[0].tag_state == "TAGGED", false)
+    ])
+    error_message = "Commit-tagged build images must be eligible for cleanup."
+  }
+
+  assert {
+    condition = anytrue([
+      for policy in google_artifact_registry_repository.runtime[0].cleanup_policies :
+      policy.id == "keep-deployed" && try(contains(policy.condition[0].tag_prefixes, "deployed-"), false)
+    ])
+    error_message = "The deployed image tag must be explicitly protected from cleanup."
+  }
+
+  assert {
     condition = (
       google_storage_bucket_iam_member.builder_source[0].bucket ==
       google_storage_bucket.build_source[0].name

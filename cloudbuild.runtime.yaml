@@ -17,4 +17,4 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 substitutions:
-  _IMAGE: us-docker.pkg.dev/example-project/inkbridge/runtime:replace-me
+  _IMAGE: us-docker.pkg.dev/example-project/inkbridge/runtime:build-replace-me
