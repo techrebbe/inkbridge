@@ -224,6 +224,36 @@ fn stable_document_id_is_independent_of_file_name() {
 }
 
 #[test]
+fn re_registering_legacy_document_persists_original_page_count() {
+    let original = original_pdf_with_pages(3);
+    let broker = Broker::default();
+    let mut storage = MemoryStorage::default();
+    let mut legacy = broker
+        .register_document(&mut storage, "legacy.pdf", &original)
+        .unwrap();
+    legacy.original_page_count = 0;
+    storage.put_unchecked(
+        state_path(&legacy.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+
+    let migrated = broker
+        .register_document(&mut storage, "renamed-legacy.pdf", &original)
+        .unwrap();
+    let persisted: CanonicalDocumentState = serde_json::from_slice(
+        &storage
+            .object(&state_path(&legacy.document_id))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+
+    assert_eq!(migrated.original_page_count, 3);
+    assert_eq!(persisted.original_page_count, 3);
+}
+
+#[test]
 fn boox_only_update_emits_supernote_manifest() {
     let mut harness = Harness::new();
     let pdf = write_boox_view(&harness.original, [stroke("boox-a", 0.1, 0.2)]).unwrap();

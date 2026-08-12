@@ -93,11 +93,24 @@ impl Broker {
         let original_path = original_path(&document_id);
         let state_path = state_path(&document_id);
         if let Some(existing) = storage.read(&state_path).map_err(BrokerError::Storage)? {
-            let state = decode_state(&existing.bytes)?;
+            let mut state = decode_state(&existing.bytes)?;
             if state.original_pdf_sha256 != sha256_hex(original_pdf) {
                 return Err(BrokerError::InvalidEvent(
                     "document id collision with a different immutable original".to_owned(),
                 ));
+            }
+            // States created before originalPageCount was introduced deserialize it as zero.
+            // Persist the value while the immutable original is already available so compact
+            // BOOX manifests cannot bypass page-bound validation for legacy documents.
+            if state.original_page_count == 0 {
+                state.original_page_count = original_page_count;
+                storage
+                    .commit(vec![state_write(
+                        &state_path,
+                        &state,
+                        GenerationPrecondition::Match(existing.generation),
+                    )?])
+                    .map_err(BrokerError::ConditionalWrite)?;
             }
             return Ok(state);
         }
