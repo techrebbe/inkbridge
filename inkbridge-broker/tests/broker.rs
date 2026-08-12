@@ -577,6 +577,86 @@ fn compact_cross_page_move_accepts_none_before_with_matching_delete() {
 }
 
 #[test]
+fn compact_cross_page_upsert_requires_a_matching_delete() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let before = stroke_on_page("cross-page", 0, 0.2, 0.3);
+    let export = harness.event(
+        "sn-before-invalid-cross-page",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&before)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &export)
+        .unwrap();
+    let after = stroke_on_page("cross-page", 1, 0.3, 0.4);
+    let mut event = harness.event(
+        "boox-cross-page-without-delete",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: after.source_uuid.clone(),
+                page_index: after.page_index,
+                before: Some(before.clone()),
+                after,
+            }],
+            2,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert_eq!(harness.state().strokes["cross-page"].snapshot, before);
+}
+
+#[test]
+fn compact_manifest_rejects_duplicate_upserts_for_one_stroke() {
+    let mut harness = Harness::new();
+    let first = stroke("duplicate", 0.2, 0.3);
+    let second = stroke("duplicate", 0.4, 0.5);
+    let mut event = harness.event(
+        "boox-duplicate-upserts",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![
+                Operation::UpsertStroke {
+                    source_uuid: first.source_uuid.clone(),
+                    page_index: first.page_index,
+                    before: None,
+                    after: first,
+                },
+                Operation::UpsertStroke {
+                    source_uuid: second.source_uuid.clone(),
+                    page_index: second.page_index,
+                    before: None,
+                    after: second,
+                },
+            ],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert!(!harness.state().strokes.contains_key("duplicate"));
+}
+
+#[test]
 #[ignore = "large-memory validation; set INKBRIDGE_LARGE_DOCUMENT_MIB (default 300)"]
 fn large_document_round_trip_does_not_create_an_accepted_pdf_copy() {
     let size_mib = std::env::var("INKBRIDGE_LARGE_DOCUMENT_MIB")

@@ -482,56 +482,72 @@ impl Broker {
                     "BOOX operation manifest contains an invalid stroke operation".to_owned(),
                 ));
             }
-            if let Operation::DeleteStroke {
-                source_uuid,
-                before,
-                ..
-            } = operation
-            {
-                let matches_active = state.strokes.get(source_uuid).is_some_and(|canonical| {
-                    canonical.tombstone.is_none() && canonical.snapshot == *before
+        }
+        let stroke_ids = manifest
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                Operation::UpsertStroke { source_uuid, .. }
+                | Operation::DeleteStroke { source_uuid, .. } => source_uuid.as_str(),
+            })
+            .collect::<BTreeSet<_>>();
+        for source_uuid in stroke_ids {
+            let mut deletes = manifest
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::DeleteStroke {
+                        source_uuid: candidate,
+                        before,
+                        ..
+                    } if candidate == source_uuid => Some(before),
+                    _ => None,
                 });
-                if !matches_active {
-                    return Err(BrokerError::InvalidEvent(format!(
-                        "BOOX operation manifest delete does not match active canonical stroke {source_uuid}"
-                    )));
-                }
+            let delete = deletes.next();
+            if deletes.next().is_some() {
+                return Err(BrokerError::InvalidEvent(format!(
+                    "BOOX operation manifest contains duplicate deletes for {source_uuid}"
+                )));
             }
-            if let Operation::UpsertStroke {
-                source_uuid,
-                before,
-                after,
-                ..
-            } = operation
-            {
-                let active = state
-                    .strokes
-                    .get(source_uuid)
-                    .filter(|canonical| canonical.tombstone.is_none());
-                let valid_baseline = match (before, active) {
-                    (Some(before), Some(canonical)) => canonical.snapshot == *before,
-                    (None, None) => !state.strokes.contains_key(source_uuid),
-                    (None, Some(canonical)) => {
-                        after.page_index != canonical.snapshot.page_index
-                            && manifest.operations.iter().any(|candidate| {
-                                matches!(
-                                    candidate,
-                                    Operation::DeleteStroke {
-                                        source_uuid: deleted_uuid,
-                                        before: deleted,
-                                        ..
-                                    } if deleted_uuid == source_uuid
-                                        && deleted == &canonical.snapshot
-                                )
-                            })
-                    }
-                    (Some(_), None) => false,
-                };
-                if !valid_baseline {
-                    return Err(BrokerError::InvalidEvent(format!(
-                        "BOOX operation manifest upsert does not match active canonical stroke {source_uuid}"
-                    )));
+            let mut upserts = manifest
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::UpsertStroke {
+                        source_uuid: candidate,
+                        before,
+                        after,
+                        ..
+                    } if candidate == source_uuid => Some((before, after)),
+                    _ => None,
+                });
+            let upsert = upserts.next();
+            if upserts.next().is_some() {
+                return Err(BrokerError::InvalidEvent(format!(
+                    "BOOX operation manifest contains duplicate upserts for {source_uuid}"
+                )));
+            }
+            let active = state
+                .strokes
+                .get(source_uuid)
+                .filter(|canonical| canonical.tombstone.is_none());
+            let valid_operation_set = match (delete, upsert, active) {
+                (Some(deleted), None, Some(canonical)) => canonical.snapshot == *deleted,
+                (None, Some((Some(before), after)), Some(canonical)) => {
+                    canonical.snapshot == *before
+                        && after.page_index == canonical.snapshot.page_index
                 }
+                (None, Some((None, _)), None) => !state.strokes.contains_key(source_uuid),
+                (Some(deleted), Some((None, after)), Some(canonical)) => {
+                    canonical.snapshot == *deleted
+                        && after.page_index != canonical.snapshot.page_index
+                }
+                _ => false,
+            };
+            if !valid_operation_set {
+                return Err(BrokerError::InvalidEvent(format!(
+                    "BOOX operation manifest does not match active canonical stroke {source_uuid}"
+                )));
             }
         }
         Ok(manifest)
