@@ -1486,6 +1486,17 @@ fn open_installed_regular_file(path: &Path) -> Result<File, String> {
 }
 
 fn open_same_installed_regular_file(path: &Path, opened: &File) -> Result<File, String> {
+    open_same_installed_regular_file_with(path, opened, || Ok(()))
+}
+
+fn open_same_installed_regular_file_with<F>(
+    path: &Path,
+    opened: &File,
+    after_current_opened: F,
+) -> Result<File, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     let before = symlink_metadata_if_exists(path)?.ok_or_else(|| {
         format!(
             "BOOX destination {} disappeared during recovery; preserved staged backup",
@@ -1504,6 +1515,7 @@ fn open_same_installed_regular_file(path: &Path, opened: &File) -> Result<File, 
             path.display()
         )
     })?;
+    after_current_opened()?;
     let after = symlink_metadata_if_exists(path)?.ok_or_else(|| {
         format!(
             "BOOX destination {} disappeared during recovery; preserved staged backup",
@@ -1513,6 +1525,7 @@ fn open_same_installed_regular_file(path: &Path, opened: &File) -> Result<File, 
     if after.file_type().is_symlink()
         || !after.is_file()
         || open_file_identity(opened)? != open_file_identity(&current)?
+        || !metadata_matches_open_file(&after, &current)?
     {
         return Err(format!(
             "BOOX destination {} changed filesystem entry during recovery; preserved staged backup",
@@ -1520,6 +1533,20 @@ fn open_same_installed_regular_file(path: &Path, opened: &File) -> Result<File, 
         ));
     }
     Ok(current)
+}
+
+#[cfg(unix)]
+fn metadata_matches_open_file(metadata: &fs::Metadata, file: &File) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok((metadata.dev(), metadata.ino()) == open_file_identity(file)?)
+}
+
+#[cfg(windows)]
+fn metadata_matches_open_file(_metadata: &fs::Metadata, _file: &File) -> Result<bool, String> {
+    // `open_entry_guard` omits FILE_SHARE_DELETE on Windows, so the pathname
+    // cannot be replaced while the current handle is alive.
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -1829,6 +1856,28 @@ mod snapshot_tests {
             .file_type()
             .is_symlink());
         assert_eq!(fs::read(&target).unwrap(), published);
+        assert_eq!(fs::read(&backup).unwrap(), b"staged broker predecessor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_regular_path_replacement_after_reopen() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("book.pdf");
+        let backup = sibling_temporary(&destination, "previous");
+        let replacement = directory.path().join("sync-client-book.pdf");
+        fs::write(&destination, b"published broker view").unwrap();
+        fs::write(&backup, b"staged broker predecessor").unwrap();
+        fs::write(&replacement, b"new local edit").unwrap();
+        let opened = open_installed_regular_file(&destination).unwrap();
+
+        let error = open_same_installed_regular_file_with(&destination, &opened, || {
+            fs::rename(&replacement, &destination).map_err(|error| error.to_string())
+        })
+        .expect_err("a regular pathname replacement must fail identity validation");
+
+        assert!(error.contains("changed filesystem entry"));
+        assert_eq!(fs::read(&destination).unwrap(), b"new local edit");
         assert_eq!(fs::read(&backup).unwrap(), b"staged broker predecessor");
     }
 }
