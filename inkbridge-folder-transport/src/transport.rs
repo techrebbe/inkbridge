@@ -1423,20 +1423,26 @@ fn reconcile_staged_backup(destination: &Path, published_hash: &str) -> Result<(
 }
 
 fn restore_staged_file(backup: &Path, destination: &Path) -> Result<(), String> {
-    if metadata_if_exists(destination)?.is_some() {
+    if symlink_metadata_if_exists(destination)?.is_some() {
         return Err(format!(
             "destination {} was recreated; preserved staged file at {}",
             destination.display(),
             backup.display()
         ));
     }
-    fs::rename(backup, destination).map_err(|error| {
-        format!(
+    match rename_create_only(backup, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "destination {} was recreated during recovery; preserved staged file at {}",
+            destination.display(),
+            backup.display()
+        )),
+        Err(error) => Err(format!(
             "could not restore {} as {}: {error}",
             backup.display(),
             destination.display()
-        )
-    })
+        )),
+    }
 }
 
 fn replace_file_unconditionally(source: &Path, destination: &Path) -> Result<(), String> {
@@ -1590,5 +1596,29 @@ mod snapshot_tests {
         assert_eq!(fs::read(&target).unwrap(), b"expected old view");
         assert!(!source.exists());
         assert!(!sibling_temporary(&destination, "previous").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_preserves_a_recreated_dangling_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("book.pdf");
+        let backup = sibling_temporary(&destination, "previous");
+        let missing_target = directory.path().join("sync-client-missing.pdf");
+        fs::write(&backup, b"staged broker predecessor").unwrap();
+        symlink(&missing_target, &destination).unwrap();
+
+        let error = reconcile_staged_backup(&destination, &sha256_hex(b"broker view"))
+            .expect_err("the recreated symlink must block restoration");
+
+        assert!(error.contains("recreated"));
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&backup).unwrap(), b"staged broker predecessor");
+        assert!(!missing_target.exists());
     }
 }
