@@ -38,7 +38,6 @@ impl TransportConfig {
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let mut config: Self = serde_json::from_slice(&bytes)
             .map_err(|error| format!("invalid transport config: {error}"))?;
-        config.validate()?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         if config.state_path.as_os_str().is_empty() {
             config.state_path = base.join(".inkbridge-folder-state.json");
@@ -53,6 +52,7 @@ impl TransportConfig {
             resolve_path(base, &mut document.supernote_export_directory);
             resolve_path(base, &mut document.supernote_incoming_directory);
         }
+        config.validate()?;
         Ok(config)
     }
 
@@ -73,6 +73,7 @@ impl TransportConfig {
             return Err("at least one document mapping is required".to_owned());
         }
         let mut ids = BTreeSet::new();
+        let mut boox_paths = BTreeSet::new();
         for document in &self.documents {
             if !document.document_id.starts_with("inkbridge-doc-v1-")
                 || document.document_id.contains(['/', '\\'])
@@ -84,6 +85,13 @@ impl TransportConfig {
             }
             if !ids.insert(&document.document_id) {
                 return Err(format!("duplicate documentId {}", document.document_id));
+            }
+            let boox_path = normalized_path_key(&document.boox_pdf);
+            if !boox_paths.insert(boox_path) {
+                return Err(format!(
+                    "duplicate booxPdf mapping {}",
+                    document.boox_pdf.display()
+                ));
             }
             if document.original_file_name.trim().is_empty() {
                 return Err(format!(
@@ -105,6 +113,19 @@ impl TransportConfig {
 fn resolve_path(base: &Path, value: &mut PathBuf) {
     if value.is_relative() {
         *value = base.join(&*value);
+    }
+}
+
+fn normalized_path_key(path: &Path) -> String {
+    let value = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
     }
 }
 
@@ -358,5 +379,36 @@ mod tests {
             }],
         };
         assert!(config.validate().unwrap_err().contains("separate"));
+    }
+
+    #[test]
+    fn configuration_rejects_duplicate_boox_paths_across_documents() {
+        let shared = PathBuf::from("boox/book.pdf");
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::new(),
+            documents: vec![
+                DocumentFolders {
+                    document_id: "inkbridge-doc-v1-first".to_owned(),
+                    original_file_name: "first.pdf".to_owned(),
+                    boox_pdf: shared.clone(),
+                    supernote_export_directory: PathBuf::from("first/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("first/incoming"),
+                },
+                DocumentFolders {
+                    document_id: "inkbridge-doc-v1-second".to_owned(),
+                    original_file_name: "second.pdf".to_owned(),
+                    boox_pdf: shared,
+                    supernote_export_directory: PathBuf::from("second/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("second/incoming"),
+                },
+            ],
+        };
+
+        assert!(config.validate().unwrap_err().contains("duplicate booxPdf"));
     }
 }

@@ -801,15 +801,24 @@ fn supernote_export_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
                 )
             })?
             .path();
-        if path.is_file()
-            && path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-            && !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.') || name.ends_with(".part.json"))
-        {
+        let is_json = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+        let is_temporary = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.') || name.ends_with(".part.json"));
+        if !is_json || is_temporary {
+            continue;
+        }
+        let metadata = fs::metadata(&path).map_err(|error| {
+            format!(
+                "could not inspect candidate export {} from {}: {error}",
+                path.display(),
+                directory.display()
+            )
+        })?;
+        if metadata.is_file() {
             files.push(path);
         }
     }
