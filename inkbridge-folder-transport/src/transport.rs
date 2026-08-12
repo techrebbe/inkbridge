@@ -393,11 +393,13 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             .supernote
             .accepted_local_hashes;
         let mut baselines = Vec::new();
+        let mut baseline_hashes = Vec::new();
         let mut unaccepted = Vec::new();
         for candidate in baseline_candidates {
             let key = canonical_path_key(&candidate);
             let hash = sha256_file(&candidate)?;
             if accepted.get(&key).is_some_and(|accepted| accepted == &hash) {
+                baseline_hashes.push((candidate.clone(), hash));
                 baselines.push(candidate);
             } else {
                 unaccepted.push(candidate);
@@ -424,22 +426,37 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         }
         let post_build_hash = sha256_file(&document.boox_pdf)?;
         if post_build_hash != built.source_pdf_sha256 {
-            state
-                .observations
-                .get_mut(&local_key)
-                .ok_or_else(|| {
-                    format!(
-                        "settled observation disappeared for {}",
-                        document.boox_pdf.display()
-                    )
-                })?
-                .content_sha256 = Some(post_build_hash);
+            remember_content_change(&document.boox_pdf, state, now, &post_build_hash)?;
             report.actions.push(TransportAction::Deferred {
                 side: DeviceSide::Boox,
                 reason: "the BOOX PDF content changed while its compact manifest was being built"
                     .to_owned(),
             });
             return Ok(());
+        }
+        let current_baselines = supernote_export_files(&document.supernote_export_directory)?;
+        if current_baselines != baselines {
+            report.actions.push(TransportAction::Deferred {
+                side: DeviceSide::Boox,
+                reason:
+                    "the Supernote baseline set changed while the compact manifest was being built"
+                        .to_owned(),
+            });
+            return Ok(());
+        }
+        for (baseline, accepted_hash) in baseline_hashes {
+            let current_hash = sha256_file(&baseline)?;
+            if current_hash != accepted_hash {
+                remember_content_change(&baseline, state, now, &current_hash)?;
+                report.actions.push(TransportAction::Deferred {
+                    side: DeviceSide::Boox,
+                    reason: format!(
+                        "Supernote baseline {} changed while the compact manifest was being built",
+                        baseline.display()
+                    ),
+                });
+                return Ok(());
+            }
         }
         let source_hash = built.source_pdf_sha256;
         state
@@ -790,6 +807,28 @@ fn remember_file_hash(
     let key = canonical_path_key(path);
     state.observations.insert(
         key,
+        FileObservation {
+            size: metadata.len(),
+            modified_unix_millis: unix_millis(metadata.modified().map_err(|error| {
+                format!("could not read mtime for {}: {error}", path.display())
+            })?)?,
+            first_seen_unix_millis: unix_millis(now)?,
+            content_sha256: Some(hash.to_owned()),
+        },
+    );
+    Ok(())
+}
+
+fn remember_content_change(
+    path: &Path,
+    state: &mut TransportState,
+    now: SystemTime,
+    hash: &str,
+) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+    state.observations.insert(
+        canonical_path_key(path),
         FileObservation {
             size: metadata.len(),
             modified_unix_millis: unix_millis(metadata.modified().map_err(|error| {

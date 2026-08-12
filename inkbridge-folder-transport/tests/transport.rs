@@ -119,6 +119,21 @@ impl BooxManifestBuilder for StaleHashBuilder {
     }
 }
 
+struct MutatingBaselineBuilder;
+
+impl BooxManifestBuilder for MutatingBaselineBuilder {
+    fn build(&self, pdf: &Path, baselines: &[PathBuf]) -> Result<BuiltBooxManifest, String> {
+        let replacement = String::from_utf8(fs::read(&baselines[0]).unwrap())
+            .unwrap()
+            .replace("s1", "s2");
+        fs::write(&baselines[0], replacement).unwrap();
+        Ok(BuiltBooxManifest {
+            bytes: b"{\"schemaVersion\":1}\n".to_vec(),
+            source_pdf_sha256: sha256_hex(&fs::read(pdf).unwrap()),
+        })
+    }
+}
+
 fn mapping(root: &Path) -> DocumentFolders {
     DocumentFolders {
         document_id: "inkbridge-doc-v1-test".to_owned(),
@@ -415,6 +430,8 @@ fn boox_upload_is_deferred_when_post_conversion_hash_does_not_match_source() {
     fs::write(&export, &export_bytes).unwrap();
     let export_key = path_key(&export);
     let export_hash = sha256_hex(&export_bytes);
+    let boox_key = path_key(&document.boox_pdf);
+    let metadata = fs::metadata(&document.boox_pdf).unwrap();
     let mut state = TransportState {
         documents: BTreeMap::from([(
             document.document_id.clone(),
@@ -432,13 +449,26 @@ fn boox_upload_is_deferred_when_post_conversion_hash_does_not_match_source() {
         )]),
         ..TransportState::empty()
     };
+    state.observations.insert(
+        boox_key.clone(),
+        FileObservation {
+            size: metadata.len(),
+            modified_unix_millis: metadata
+                .modified()
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            first_seen_unix_millis: 1,
+            content_sha256: Some(sha256_hex(b"current BOOX bytes")),
+        },
+    );
     let cloud = FakeCloud::default();
     let builder = StaleHashBuilder;
     let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(12_345);
 
-    let report = transport
-        .sync_document(&document, &mut state, SystemTime::now())
-        .unwrap();
+    let report = transport.sync_document(&document, &mut state, now).unwrap();
 
     assert!(report.actions.iter().any(|action| matches!(
         action,
@@ -447,11 +477,77 @@ fn boox_upload_is_deferred_when_post_conversion_hash_does_not_match_source() {
             reason,
         } if reason.contains("content changed")
     )));
-    assert!(cloud.objects.lock().unwrap().is_empty());
+    assert!(!cloud.objects.lock().unwrap().iter().any(|(object, _)| {
+        object
+            .path
+            .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
+    }));
     assert!(state.documents[&document.document_id]
         .boox
         .pending
         .is_none());
+    assert_eq!(
+        state.observations[&boox_key].first_seen_unix_millis,
+        12_345_000
+    );
+}
+
+#[test]
+fn boox_upload_is_deferred_when_an_accepted_baseline_changes_during_conversion() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    fs::write(&document.boox_pdf, b"current BOOX bytes").unwrap();
+    let export = document.supernote_export_directory.join("page.json");
+    let export_bytes = native_export();
+    fs::write(&export, &export_bytes).unwrap();
+    let export_key = path_key(&export);
+    let export_hash = sha256_hex(&export_bytes);
+    let mut state = TransportState {
+        documents: BTreeMap::from([(
+            document.document_id.clone(),
+            DocumentTransportState {
+                supernote: SideTransportState {
+                    uploaded_local_hashes: BTreeMap::from([(
+                        export_key.clone(),
+                        export_hash.clone(),
+                    )]),
+                    accepted_local_hashes: BTreeMap::from([(export_key.clone(), export_hash)]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]),
+        ..TransportState::empty()
+    };
+    let cloud = FakeCloud::default();
+    let builder = MutatingBaselineBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(23_456);
+
+    let report = transport.sync_document(&document, &mut state, now).unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("Supernote baseline") && reason.contains("changed")
+    )));
+    assert!(!cloud.objects.lock().unwrap().iter().any(|(object, _)| {
+        object
+            .path
+            .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
+    }));
+    assert!(state.documents[&document.document_id]
+        .boox
+        .pending
+        .is_none());
+    assert_eq!(
+        state.observations[&export_key].first_seen_unix_millis,
+        23_456_000
+    );
 }
 
 #[test]
