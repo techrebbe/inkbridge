@@ -85,9 +85,7 @@ impl TransportConfig {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for document in &self.documents {
-            if !document.document_id.starts_with("inkbridge-doc-v1-")
-                || document.document_id.contains(['/', '\\'])
-            {
+            if !is_stable_document_id(&document.document_id) {
                 return Err(format!(
                     "invalid stable documentId {}",
                     document.document_id
@@ -165,6 +163,15 @@ impl TransportConfig {
         }
         Ok(())
     }
+}
+
+fn is_stable_document_id(value: &str) -> bool {
+    value.strip_prefix("inkbridge-doc-v1-").is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
 
 fn state_reserved_paths(path: &Path) -> [PathBuf; 4] {
@@ -498,6 +505,10 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_document_id(nibble: char) -> String {
+        format!("inkbridge-doc-v1-{}", nibble.to_string().repeat(64))
+    }
+
     #[test]
     fn state_load_recovers_the_previous_checkpoint_after_interrupted_publish() {
         let directory = tempdir().unwrap();
@@ -505,7 +516,7 @@ mod tests {
         let previous = state_path.with_extension("json.previous");
         let mut expected = TransportState::empty();
         expected.documents.insert(
-            "inkbridge-doc-v1-test".to_owned(),
+            test_document_id('a'),
             DocumentTransportState {
                 revisions: RevisionPair {
                     boox: 2,
@@ -520,6 +531,36 @@ mod tests {
     }
 
     #[test]
+    fn configuration_rejects_malformed_stable_document_ids() {
+        for document_id in [
+            "inkbridge-doc-v1-deadbeef".to_owned(),
+            format!("inkbridge-doc-v1-{}", "A".repeat(64)),
+            format!("inkbridge-doc-v1-{}g", "a".repeat(63)),
+        ] {
+            let config = TransportConfig {
+                schema_version: CONFIG_SCHEMA_VERSION,
+                bucket: "bucket".to_owned(),
+                gcloud_command: default_gcloud(),
+                poll_seconds: 1,
+                settle_seconds: 0,
+                state_path: PathBuf::new(),
+                documents: vec![DocumentFolders {
+                    document_id,
+                    original_file_name: "book.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("boox.pdf"),
+                    supernote_export_directory: PathBuf::from("supernote/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+                }],
+            };
+
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .contains("invalid stable documentId"));
+        }
+    }
+
+    #[test]
     fn configuration_rejects_one_directory_for_both_supernote_directions() {
         let shared = PathBuf::from("shared");
         let config = TransportConfig {
@@ -530,7 +571,7 @@ mod tests {
             settle_seconds: 0,
             state_path: PathBuf::new(),
             documents: vec![DocumentFolders {
-                document_id: "inkbridge-doc-v1-test".to_owned(),
+                document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
                 boox_pdf: PathBuf::from("boox.pdf"),
                 supernote_export_directory: shared.clone(),
@@ -552,14 +593,14 @@ mod tests {
             state_path: PathBuf::new(),
             documents: vec![
                 DocumentFolders {
-                    document_id: "inkbridge-doc-v1-first".to_owned(),
+                    document_id: test_document_id('a'),
                     original_file_name: "first.pdf".to_owned(),
                     boox_pdf: shared.clone(),
                     supernote_export_directory: PathBuf::from("first/outgoing"),
                     supernote_incoming_directory: PathBuf::from("first/incoming"),
                 },
                 DocumentFolders {
-                    document_id: "inkbridge-doc-v1-second".to_owned(),
+                    document_id: test_document_id('b'),
                     original_file_name: "second.pdf".to_owned(),
                     boox_pdf: shared,
                     supernote_export_directory: PathBuf::from("second/outgoing"),
@@ -582,14 +623,14 @@ mod tests {
             state_path: PathBuf::new(),
             documents: vec![
                 DocumentFolders {
-                    document_id: "inkbridge-doc-v1-first".to_owned(),
+                    document_id: test_document_id('a'),
                     original_file_name: "first.pdf".to_owned(),
                     boox_pdf: PathBuf::from("missing/book.pdf"),
                     supernote_export_directory: PathBuf::from("first/outgoing"),
                     supernote_incoming_directory: PathBuf::from("first/incoming"),
                 },
                 DocumentFolders {
-                    document_id: "inkbridge-doc-v1-second".to_owned(),
+                    document_id: test_document_id('b'),
                     original_file_name: "second.pdf".to_owned(),
                     boox_pdf: PathBuf::from("missing/../missing/book.pdf"),
                     supernote_export_directory: PathBuf::from("second/outgoing"),
@@ -612,14 +653,14 @@ mod tests {
             state_path: PathBuf::new(),
             documents: vec![
                 DocumentFolders {
-                    document_id: "inkbridge-doc-v1-first".to_owned(),
+                    document_id: test_document_id('a'),
                     original_file_name: "book.pdf".to_owned(),
                     boox_pdf: PathBuf::from("first/book.pdf"),
                     supernote_export_directory: PathBuf::from("shared/outgoing"),
                     supernote_incoming_directory: PathBuf::from("first/incoming"),
                 },
                 DocumentFolders {
-                    document_id: "inkbridge-doc-v1-second".to_owned(),
+                    document_id: test_document_id('b'),
                     original_file_name: "book.pdf".to_owned(),
                     boox_pdf: PathBuf::from("second/book.pdf"),
                     supernote_export_directory: PathBuf::from("second/outgoing"),
@@ -641,7 +682,7 @@ mod tests {
             settle_seconds: 0,
             state_path: PathBuf::from("supernote/outgoing/state.json"),
             documents: vec![DocumentFolders {
-                document_id: "inkbridge-doc-v1-test".to_owned(),
+                document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
                 boox_pdf: PathBuf::from("boox/book.pdf"),
                 supernote_export_directory: PathBuf::from("supernote/outgoing"),
@@ -663,7 +704,7 @@ mod tests {
                 settle_seconds: 0,
                 state_path: PathBuf::from("state.json"),
                 documents: vec![DocumentFolders {
-                    document_id: "inkbridge-doc-v1-test".to_owned(),
+                    document_id: test_document_id('a'),
                     original_file_name: "book.pdf".to_owned(),
                     boox_pdf: PathBuf::from(companion),
                     supernote_export_directory: PathBuf::from("supernote/outgoing"),
@@ -685,7 +726,7 @@ mod tests {
             settle_seconds: 0,
             state_path: PathBuf::from("supernote"),
             documents: vec![DocumentFolders {
-                document_id: "inkbridge-doc-v1-test".to_owned(),
+                document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
                 boox_pdf: PathBuf::from("boox/book.pdf"),
                 supernote_export_directory: PathBuf::from("supernote/outgoing"),
@@ -716,7 +757,7 @@ mod tests {
             settle_seconds: 0,
             state_path: PathBuf::from("state.json"),
             documents: vec![DocumentFolders {
-                document_id: "inkbridge-doc-v1-test".to_owned(),
+                document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
                 boox_pdf: PathBuf::from("shared/book.pdf"),
                 supernote_export_directory: PathBuf::from("shared"),
@@ -738,14 +779,14 @@ mod tests {
             state_path: PathBuf::from("state.json"),
             documents: vec![
                 DocumentFolders {
-                    document_id: "inkbridge-doc-v1-first".to_owned(),
+                    document_id: test_document_id('a'),
                     original_file_name: "first.pdf".to_owned(),
                     boox_pdf: PathBuf::from("first/book.pdf"),
                     supernote_export_directory: PathBuf::from("shared"),
                     supernote_incoming_directory: PathBuf::from("first/incoming"),
                 },
                 DocumentFolders {
-                    document_id: "inkbridge-doc-v1-second".to_owned(),
+                    document_id: test_document_id('b'),
                     original_file_name: "second.pdf".to_owned(),
                     boox_pdf: PathBuf::from("shared/second.pdf"),
                     supernote_export_directory: PathBuf::from("second/outgoing"),

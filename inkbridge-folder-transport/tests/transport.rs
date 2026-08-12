@@ -162,7 +162,7 @@ impl BooxManifestBuilder for MutatingBaselineBuilder {
 
 fn mapping(root: &Path) -> DocumentFolders {
     DocumentFolders {
-        document_id: "inkbridge-doc-v1-test".to_owned(),
+        document_id: format!("inkbridge-doc-v1-{}", "a".repeat(64)),
         original_file_name: "book.pdf".to_owned(),
         boox_pdf: root.join("boox/book.pdf"),
         supernote_export_directory: root.join("supernote/outgoing"),
