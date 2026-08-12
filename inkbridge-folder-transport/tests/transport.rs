@@ -332,6 +332,54 @@ fn generated_boox_view_never_overwrites_an_unpublished_local_edit() {
 }
 
 #[test]
+fn already_installed_boox_view_recovers_a_lost_checkpoint() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    let generated = b"broker view already on disk".to_vec();
+    fs::write(&document.boox_pdf, &generated).unwrap();
+    let cloud = FakeCloud::default();
+    cloud.put(
+        &format!("BOOX_Folder/{}/book.pdf", document.document_id),
+        generated.clone(),
+        generated_metadata(&document.document_id, "0:1", &generated),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let mut state = TransportState::empty();
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            ..
+        }
+    )));
+    assert!(!report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            ..
+        }
+    )));
+    let recovered = &state.documents[&document.document_id];
+    assert_eq!(
+        recovered.revisions,
+        RevisionPair {
+            boox: 0,
+            supernote: 1
+        }
+    );
+    assert_eq!(
+        recovered.boox.delivered_content_sha256.as_deref(),
+        Some(sha256_hex(&generated).as_str())
+    );
+}
+
+#[test]
 fn conflict_object_blocks_new_uploads_and_is_reported() {
     let root = tempdir().unwrap();
     let document = mapping(root.path());

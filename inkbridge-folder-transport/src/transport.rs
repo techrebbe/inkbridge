@@ -187,7 +187,21 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 continue;
             }
 
-            if side == DeviceSide::Boox && self.boox_has_unpublished_local_edit(document, state)? {
+            let local_path = match side {
+                DeviceSide::Boox => document.boox_pdf.clone(),
+                DeviceSide::Supernote => document.supernote_incoming_directory.join(
+                    Path::new(&object.path)
+                        .file_name()
+                        .ok_or_else(|| format!("remote path {} has no file name", object.path))?,
+                ),
+            };
+            let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
+            let already_installed = local_path.is_file()
+                && sha256_file(&local_path).is_ok_and(|hash| hash == expected_hash);
+            if side == DeviceSide::Boox
+                && !already_installed
+                && self.boox_has_unpublished_local_edit(document, state)?
+            {
                 report.actions.push(TransportAction::Deferred {
                     side,
                     reason: format!(
@@ -198,16 +212,9 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 continue;
             }
 
-            let local_path = match side {
-                DeviceSide::Boox => document.boox_pdf.clone(),
-                DeviceSide::Supernote => document.supernote_incoming_directory.join(
-                    Path::new(&object.path)
-                        .file_name()
-                        .ok_or_else(|| format!("remote path {} has no file name", object.path))?,
-                ),
-            };
-            self.download_verified(&object, &local_path)?;
-            let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
+            if !already_installed {
+                self.download_verified(&object, &local_path)?;
+            }
             remember_file_hash(&local_path, state, SystemTime::now(), &expected_hash)?;
             let document_state = state.document_mut(&document.document_id);
             document_state.revisions = revisions;
