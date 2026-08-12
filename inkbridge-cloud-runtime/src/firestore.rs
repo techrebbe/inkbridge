@@ -1,6 +1,6 @@
 use crate::{
-    bearer_headers, ActiveState, CanonicalStateStore, HttpRequest, HttpTransport, PendingCommit,
-    StateRecord, TokenProvider,
+    bearer_headers, ActiveState, CanonicalStateStore, HttpBody, HttpRequest, HttpTransport,
+    PendingCommit, StateRecord, TokenProvider,
 };
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -85,7 +85,7 @@ impl FirestoreCanonicalStateStore {
             method: "GET".to_owned(),
             url: format!("{}/{}/{}", self.database_root(), collection, encode(id)),
             headers: self.authorized_headers()?,
-            body: Vec::new(),
+            body: HttpBody::empty(),
         })?;
         if response.status == 404 {
             return Ok(None);
@@ -154,7 +154,7 @@ impl FirestoreCanonicalStateStore {
                 encode(&self.database_id)
             ),
             headers: self.authorized_headers()?,
-            body,
+            body: HttpBody::bytes(body),
         })?;
         if response.status != 200 {
             return Err(format!(
@@ -387,7 +387,7 @@ mod tests {
         };
         store.reserve(&pending).unwrap();
         let requests = transport.requests.lock().unwrap();
-        let commit: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let commit: Value = serde_json::from_slice(requests[1].body.as_ref()).unwrap();
         let writes = commit["writes"].as_array().unwrap();
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0]["currentDocument"]["exists"], false);

@@ -1,3 +1,4 @@
+use crate::storage::Blob;
 use inkbridge_convert::StrokeSnapshot;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,8 +42,27 @@ pub fn write_boox_view_with_tombstones(
     strokes: impl IntoIterator<Item = StrokeSnapshot>,
     tombstones: impl IntoIterator<Item = String>,
 ) -> Result<Vec<u8>, String> {
-    let mut document = Document::load_mem(original_pdf)
+    let document = Document::load_mem(original_pdf)
         .map_err(|error| format!("could not load immutable original PDF: {error}"))?;
+    write_loaded_boox_view(document, strokes, tombstones)
+}
+
+pub fn write_boox_view_with_tombstones_owned(
+    original_pdf: Blob,
+    strokes: impl IntoIterator<Item = StrokeSnapshot>,
+    tombstones: impl IntoIterator<Item = String>,
+) -> Result<Vec<u8>, String> {
+    let document = Document::load_mem(&original_pdf)
+        .map_err(|error| format!("could not load immutable original PDF: {error}"))?;
+    drop(original_pdf);
+    write_loaded_boox_view(document, strokes, tombstones)
+}
+
+fn write_loaded_boox_view(
+    mut document: Document,
+    strokes: impl IntoIterator<Item = StrokeSnapshot>,
+    tombstones: impl IntoIterator<Item = String>,
+) -> Result<Vec<u8>, String> {
     let pages = document.get_pages();
     let strokes = strokes.into_iter().collect::<Vec<_>>();
     let mut canonical_ids = strokes

@@ -87,6 +87,18 @@ run "bootstrap_omits_runtime" {
   }
 
   assert {
+    condition = (
+      length(google_storage_bucket.sync[0].lifecycle_rule) == 2 &&
+      alltrue([
+        for rule in google_storage_bucket.sync[0].lifecycle_rule :
+        contains(one(rule.condition).matches_prefix, "Staging/") &&
+        !contains(one(rule.condition).matches_prefix, "BrokerOutbox/")
+      ])
+    )
+    error_message = "The data bucket must expire staging objects without age-deleting recoverable outbox payloads."
+  }
+
+  assert {
     condition     = length(google_cloud_run_v2_service.runtime) == 0
     error_message = "Bootstrap must not create Cloud Run."
   }
@@ -124,6 +136,16 @@ run "immutable_digest_enables_runtime" {
   assert {
     condition     = length(google_eventarc_trigger.storage_finalized) == 1
     error_message = "Runtime must create Eventarc."
+  }
+
+  assert {
+    condition = (
+      google_cloud_run_v2_service.runtime[0].template[0].timeout == "900s" &&
+      google_cloud_run_v2_service.runtime[0].template[0].max_instance_request_concurrency == 1 &&
+      google_cloud_run_v2_service.runtime[0].template[0].containers[0].resources[0].limits["cpu"] == "2" &&
+      google_cloud_run_v2_service.runtime[0].template[0].containers[0].resources[0].limits["memory"] == "8Gi"
+    )
+    error_message = "Runtime must use the reviewed single-request large-PDF resource envelope."
   }
 }
 

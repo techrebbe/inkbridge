@@ -23,7 +23,7 @@ async fn run() -> Result<(), String> {
         .unwrap_or_else(|_| "8080".to_owned())
         .parse::<u16>()
         .map_err(|error| format!("invalid PORT: {error}"))?;
-    let transport = Arc::new(ReqwestTransport::new(Duration::from_secs(90))?);
+    let transport = Arc::new(ReqwestTransport::new(Duration::from_secs(840))?);
     let tokens = Arc::new(GoogleTokenProvider::new(transport.clone()));
     let objects = Arc::new(GoogleCloudStorage::new(
         &bucket,

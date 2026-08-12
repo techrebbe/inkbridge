@@ -13,9 +13,9 @@ of its desktop coordination or polling logic is carried into this broker core.
 - The immutable original PDF is addressed by its SHA-256-derived document ID, not by a filename.
 - Canonical state owns revision history, stroke identity, tombstones, source generations, content
   hashes, processed event IDs, generated-output markers, and conflict records.
-- Every accepted device input is archived immutably with its revision and content hash in the same
-  conditional commit as the generated output and state update. Conflict evidence never depends on
-  rereading a mutable device-folder path.
+- Every accepted device input records its exact immutable object generation, revision, and content
+  hash. Conflict evidence reads that generation rather than the latest mutable-looking folder path,
+  avoiding another full-size accepted-source copy.
 - A device event states the exact revision pair on which it was based. If canonical state has moved
   beyond that pair, the incoming bytes are preserved under `Conflicts/` and processing reports a
   conflict. There is no latest-file-wins path.
@@ -34,8 +34,6 @@ Originals/
 
 Canonical/
   <document-id>/state.json                      broker-owned canonical state
-  <document-id>/accepted/<side>/revision-<revision>-<hash>.<ext>
-                                                immutable accepted source revisions
 
 BOOX_Folder/
   <document-id>/<logical-name>.pdf              editable PDF /Ink view
@@ -68,7 +66,8 @@ Renaming either device view therefore does not create a new logical document.
   "sourceGeneration": 418,
   "sourceRevision": 2,
   "basedOn": { "boox": 1, "supernote": 1 },
-  "contentSha256": "<sha256>"
+  "contentSha256": "<sha256>",
+  "payloadKind": "device_view"
 }
 ```
 
@@ -79,10 +78,15 @@ broker verifies it against object metadata before treating the event as a loop.
 
 ### BOOX to Supernote
 
-The broker runs the existing `inkbridge-convert` NeoReader parser against the finalized PDF and the
-active canonical baseline. Standard `/Ink` and NeoReader `#ONYX-STROKE` annotations become a
-Supernote-native upsert/delete manifest. The converter's qpdf recovery path remains active for the
-malformed incremental xref tables observed on real hardware.
+The broker can run the existing `inkbridge-convert` NeoReader parser against the exact finalized PDF
+generation and active canonical baseline. Standard `/Ink` and NeoReader `#ONYX-STROKE` annotations
+become a Supernote-native upsert/delete manifest. The converter's qpdf recovery path remains active
+for malformed incremental xref tables observed on real hardware. A folder adapter can instead run
+that same converter on the BOOX side and upload its compact output with
+`payloadKind: "boox_operation_manifest"`; broker validation and canonical application are identical.
+
+Device events must also carry `inkbridge-sync-ready=true`. This prevents a watcher from treating a
+copy that has not been explicitly finalized/closed as a sync revision.
 
 ### Supernote to BOOX
 

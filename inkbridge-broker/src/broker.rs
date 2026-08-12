@@ -1,11 +1,11 @@
 use crate::model::*;
-use crate::pdf_view::write_boox_view_with_tombstones;
+use crate::pdf_view::write_boox_view_with_tombstones_owned;
 use crate::storage::*;
 use inkbridge_convert::{
-    build_manifest, parse_baseline_bytes, Manifest, Operation, StrokeSnapshot,
+    build_manifest, geometry_fingerprint, parse_baseline_bytes, Manifest, Operation, StrokeSnapshot,
 };
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,12 @@ const GENERATED_EVENT_KEY: &str = "inkbridge-event-id";
 const GENERATED_DOCUMENT_KEY: &str = "inkbridge-document-id";
 const GENERATED_REVISIONS_KEY: &str = "inkbridge-source-revisions";
 const GENERATED_CONTENT_HASH_KEY: &str = "inkbridge-content-sha256";
+
+#[derive(Default)]
+struct CompactOperationSet<'a> {
+    delete: Option<&'a StrokeSnapshot>,
+    upsert: Option<(&'a Option<StrokeSnapshot>, &'a StrokeSnapshot)>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerError {
@@ -84,18 +90,38 @@ impl Broker {
             ));
         }
         // Parsing now prevents registering a hash-stable but unusable original.
-        lopdf::Document::load_mem(original_pdf).map_err(|error| {
+        let original_document = lopdf::Document::load_mem(original_pdf).map_err(|error| {
             BrokerError::InvalidEvent(format!("immutable original is not a readable PDF: {error}"))
         })?;
+        let original_page_count = original_document.get_pages().len();
+        if original_page_count == 0 {
+            return Err(BrokerError::InvalidEvent(
+                "immutable original PDF must contain at least one page".to_owned(),
+            ));
+        }
+        drop(original_document);
         let document_id = stable_document_id(original_pdf);
         let original_path = original_path(&document_id);
         let state_path = state_path(&document_id);
         if let Some(existing) = storage.read(&state_path).map_err(BrokerError::Storage)? {
-            let state = decode_state(&existing.bytes)?;
+            let mut state = decode_state(&existing.bytes)?;
             if state.original_pdf_sha256 != sha256_hex(original_pdf) {
                 return Err(BrokerError::InvalidEvent(
                     "document id collision with a different immutable original".to_owned(),
                 ));
+            }
+            // States created before originalPageCount was introduced deserialize it as zero.
+            // Persist the value while the immutable original is already available so compact
+            // BOOX manifests cannot bypass page-bound validation for legacy documents.
+            if state.original_page_count == 0 {
+                state.original_page_count = original_page_count;
+                storage
+                    .commit(vec![state_write(
+                        &state_path,
+                        &state,
+                        GenerationPrecondition::Match(existing.generation),
+                    )?])
+                    .map_err(BrokerError::ConditionalWrite)?;
             }
             return Ok(state);
         }
@@ -105,6 +131,7 @@ impl Broker {
             original_object_path: original_path.clone(),
             original_pdf_sha256: sha256_hex(original_pdf),
             original_file_name: original_file_name.to_owned(),
+            original_page_count,
             state_revision: 0,
             boox: DeviceRevision::default(),
             supernote: DeviceRevision::default(),
@@ -118,7 +145,7 @@ impl Broker {
         let writes = vec![
             ConditionalWrite {
                 path: original_path,
-                bytes: original_pdf.to_vec(),
+                bytes: blob(original_pdf.to_vec()),
                 metadata: BTreeMap::from([
                     ("inkbridge-kind".to_owned(), "immutable-original".to_owned()),
                     (GENERATED_DOCUMENT_KEY.to_owned(), document_id),
@@ -163,11 +190,14 @@ impl Broker {
         }
 
         let source = storage
-            .read(&event.object_path)
-            .map_err(BrokerError::Storage)?
-            .ok_or_else(|| BrokerError::MissingObject(event.object_path.clone()))?;
-        if source.generation != event.source_generation {
-            if source.generation > event.source_generation {
+            .read_generation(&event.object_path, event.source_generation)
+            .map_err(BrokerError::Storage)?;
+        let Some(source) = source else {
+            if storage
+                .read(&event.object_path)
+                .map_err(BrokerError::Storage)?
+                .is_some_and(|latest| latest.generation > event.source_generation)
+            {
                 mark_event_only(
                     storage,
                     &mut state,
@@ -180,18 +210,21 @@ impl Broker {
                     event_id: event.event_id.clone(),
                 });
             }
-            return Err(BrokerError::InvalidEvent(format!(
-                "event generation {} is newer than stored source generation {}",
-                event.source_generation, source.generation
+            return Err(BrokerError::MissingObject(format!(
+                "source generation {}@{} does not exist",
+                event.object_path, event.source_generation
             )));
-        }
+        };
         let actual_hash = sha256_hex(&source.bytes);
-        if actual_hash != event.content_sha256 {
+        if !event.content_sha256.is_empty() && actual_hash != event.content_sha256 {
             return Err(BrokerError::InvalidEvent(format!(
                 "source content hash mismatch: event={}, actual={actual_hash}",
                 event.content_sha256
             )));
         }
+        let mut effective_event = event.clone();
+        effective_event.content_sha256.clone_from(&actual_hash);
+        let event = &effective_event;
         if is_broker_output(event, &source.metadata, &actual_hash) {
             mark_event_only(
                 storage,
@@ -247,20 +280,55 @@ impl Broker {
                 &source.bytes,
             );
         }
+        if event.payload_kind == DevicePayloadKind::BooxOperationManifest
+            && state.original_page_count == 0
+        {
+            let original = storage
+                .read(&state.original_object_path)
+                .map_err(BrokerError::Storage)?
+                .ok_or_else(|| BrokerError::MissingObject(state.original_object_path.clone()))?;
+            if sha256_hex(&original.bytes) != state.original_pdf_sha256 {
+                return Err(BrokerError::CorruptState(
+                    "immutable original PDF hash changed".to_owned(),
+                ));
+            }
+            let document = lopdf::Document::load_mem(&original.bytes).map_err(|error| {
+                BrokerError::CorruptState(format!(
+                    "immutable original is not a readable PDF: {error}"
+                ))
+            })?;
+            state.original_page_count = document.get_pages().len();
+            if state.original_page_count == 0 {
+                return Err(BrokerError::CorruptState(
+                    "immutable original PDF contains no pages".to_owned(),
+                ));
+            }
+        }
 
-        let (destination_path, output_bytes) = match event.source {
+        let source_bytes = source.bytes;
+        let (destination_path, output_bytes, boox_source_file_name) = match event.source {
             DeviceSide::Boox => {
-                let manifest = self.boox_to_supernote(&state, event, &source.bytes)?;
+                let manifest = match event.payload_kind {
+                    DevicePayloadKind::DeviceView => {
+                        self.boox_to_supernote(&state, event, source_bytes)?
+                    }
+                    DevicePayloadKind::BooxOperationManifest => {
+                        self.validate_boox_manifest(&state, &source_bytes)?
+                    }
+                };
+                let source_file_name = manifest.document.source_file_name.clone();
                 apply_manifest(&mut state, &manifest, event);
                 let bytes = serde_json::to_vec_pretty(&manifest)
                     .map_err(|error| BrokerError::Conversion(error.to_string()))?;
                 (
                     supernote_manifest_path(&event.document_id, &event.event_id),
                     add_newline(bytes),
+                    Some(source_file_name),
                 )
             }
             DeviceSide::Supernote => {
-                apply_supernote_export(&mut state, event, &source.bytes)?;
+                apply_supernote_export(&mut state, event, &source_bytes)?;
+                drop(source_bytes);
                 let original = storage
                     .read(&state.original_object_path)
                     .map_err(BrokerError::Storage)?
@@ -284,25 +352,23 @@ impl Broker {
                     .filter(|stroke| stroke.tombstone.is_some())
                     .map(|stroke| stroke.stroke_id.clone())
                     .collect::<Vec<_>>();
-                let pdf = write_boox_view_with_tombstones(&original.bytes, active, tombstones)
+                let pdf = write_boox_view_with_tombstones_owned(original.bytes, active, tombstones)
                     .map_err(BrokerError::Conversion)?;
-                (boox_view_path(&state), pdf)
+                (boox_view_path(&state), pdf, None)
             }
         };
 
-        let accepted_path = accepted_input_path(event);
         let revisions = {
             let device = state.device_mut(event.source);
             device.revision = event.source_revision;
             device.content_sha256.clone_from(&event.content_sha256);
             device.source_generation = event.source_generation;
             device.source_object_path.clone_from(&event.object_path);
-            device.accepted_object_path.clone_from(&accepted_path);
+            // New states use the immutable device object generation directly.
+            // accepted_object_path remains readable for backward compatibility.
+            device.accepted_object_path.clear();
             if event.source == DeviceSide::Boox {
-                device.source_file_name = Path::new(&event.object_path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(ToOwned::to_owned);
+                device.source_file_name = boox_source_file_name;
             }
             state.revisions()
         };
@@ -348,24 +414,9 @@ impl Broker {
         let writes = vec![
             ConditionalWrite {
                 path: destination_path.clone(),
-                bytes: output_bytes,
+                bytes: blob(output_bytes),
                 metadata: output_metadata(&marker, &output_hash),
                 precondition: destination_precondition,
-            },
-            ConditionalWrite {
-                path: accepted_path,
-                bytes: source.bytes.clone(),
-                metadata: BTreeMap::from([
-                    ("inkbridge-kind".to_owned(), "accepted-source".to_owned()),
-                    (GENERATED_DOCUMENT_KEY.to_owned(), event.document_id.clone()),
-                    (GENERATED_EVENT_KEY.to_owned(), event.event_id.clone()),
-                    (GENERATED_CONTENT_HASH_KEY.to_owned(), actual_hash),
-                    (
-                        "inkbridge-source-generation".to_owned(),
-                        event.source_generation.to_string(),
-                    ),
-                ]),
-                precondition: GenerationPrecondition::DoesNotExist,
             },
             state_write(
                 &state_path,
@@ -389,7 +440,7 @@ impl Broker {
         &self,
         state: &CanonicalDocumentState,
         event: &StorageEvent,
-        pdf: &[u8],
+        pdf: Blob,
     ) -> Result<Manifest, BrokerError> {
         let work =
             tempfile::tempdir().map_err(|error| BrokerError::Conversion(error.to_string()))?;
@@ -398,11 +449,175 @@ impl Broker {
             .and_then(|name| name.to_str())
             .unwrap_or("document.pdf");
         let pdf_path = work.path().join(file_name);
-        std::fs::write(&pdf_path, pdf)
+        std::fs::write(&pdf_path, &pdf)
             .map_err(|error| BrokerError::Conversion(error.to_string()))?;
+        drop(pdf);
         let baselines = write_baselines(work.path(), state)?;
         build_manifest(&pdf_path, &baselines, self.normalized_y_offset)
             .map_err(BrokerError::Conversion)
+    }
+
+    fn validate_boox_manifest(
+        &self,
+        state: &CanonicalDocumentState,
+        bytes: &[u8],
+    ) -> Result<Manifest, BrokerError> {
+        let mut manifest: Manifest = serde_json::from_slice(bytes).map_err(|error| {
+            BrokerError::InvalidEvent(format!("BOOX operation manifest is invalid JSON: {error}"))
+        })?;
+        if manifest.schema_version != 1
+            || manifest.manifest_id.trim().is_empty()
+            || manifest.source != "boox-neoreader-embedded-pdf"
+        {
+            return Err(BrokerError::InvalidEvent(
+                "BOOX operation manifest has an unsupported schema or source".to_owned(),
+            ));
+        }
+        // Device adapters report unshifted canonical samples. Only the broker owns the
+        // calibrated PDF-to-Supernote presentation offset.
+        manifest
+            .coordinate_transform
+            .pdf_to_supernote_normalized_y_offset = self.normalized_y_offset;
+        if state.original_page_count != 0
+            && manifest.document.page_count != state.original_page_count
+        {
+            return Err(BrokerError::InvalidEvent(format!(
+                "BOOX operation manifest page count {} does not match original page count {}",
+                manifest.document.page_count, state.original_page_count
+            )));
+        }
+        // Compact inputs do not necessarily carry a baseline-derived document guard. The
+        // canonical Supernote file name is authoritative and prevents the headless plugin from
+        // applying otherwise valid operations to whichever document happens to be open.
+        manifest.document.target_file_names = vec![state
+            .supernote
+            .source_file_name
+            .clone()
+            .unwrap_or_else(|| state.original_file_name.clone())];
+        for operation in &manifest.operations {
+            let (source_uuid, page_index, snapshots) = match operation {
+                Operation::UpsertStroke {
+                    source_uuid,
+                    page_index,
+                    before,
+                    after,
+                    ..
+                } => (
+                    source_uuid,
+                    page_index,
+                    before
+                        .iter()
+                        .chain(std::iter::once(after))
+                        .collect::<Vec<_>>(),
+                ),
+                Operation::DeleteStroke {
+                    source_uuid,
+                    page_index,
+                    before,
+                } => (source_uuid, page_index, vec![before]),
+            };
+            for snapshot in snapshots {
+                if source_uuid.trim().is_empty()
+                    || source_uuid != &snapshot.source_uuid
+                    || page_index != &snapshot.page_index
+                    || usize::try_from(*page_index)
+                        .ok()
+                        .is_none_or(|page| page >= manifest.document.page_count)
+                    || snapshot.samples.len() < 2
+                    || !valid_supernote_native_style(&snapshot.native_style)
+                    || snapshot.samples.iter().any(|[x, y, pressure]| {
+                        !x.is_finite()
+                            || !y.is_finite()
+                            || !pressure.is_finite()
+                            || !(0.0..=1.0).contains(x)
+                            || !(0.0..=1.0).contains(y)
+                            || !(0.0..=4096.0).contains(pressure)
+                    })
+                    || snapshot.geometry_fingerprint
+                        != geometry_fingerprint(&snapshot.native_style, &snapshot.samples)
+                {
+                    return Err(BrokerError::InvalidEvent(
+                        "BOOX operation manifest contains an invalid stroke operation".to_owned(),
+                    ));
+                }
+            }
+        }
+        // Supernote currently persists only black and dark gray native pen colors. Normalize
+        // compact BOOX styles before they enter canonical state or the emitted manifest, and
+        // recompute the style-sensitive fingerprint so the next native export compares cleanly.
+        for operation in &mut manifest.operations {
+            match operation {
+                Operation::UpsertStroke { before, after, .. } => {
+                    if let Some(before) = before {
+                        normalize_supernote_pen_color(before);
+                    }
+                    normalize_supernote_pen_color(after);
+                }
+                Operation::DeleteStroke { before, .. } => {
+                    normalize_supernote_pen_color(before);
+                }
+            }
+        }
+        let mut operation_index =
+            HashMap::<&str, CompactOperationSet<'_>>::with_capacity(manifest.operations.len());
+        for operation in &manifest.operations {
+            match operation {
+                Operation::DeleteStroke {
+                    source_uuid,
+                    before,
+                    ..
+                } => {
+                    let entry = operation_index.entry(source_uuid.as_str()).or_default();
+                    if entry.delete.replace(before).is_some() {
+                        return Err(BrokerError::InvalidEvent(format!(
+                            "BOOX operation manifest contains duplicate deletes for {source_uuid}"
+                        )));
+                    }
+                }
+                Operation::UpsertStroke {
+                    source_uuid,
+                    before,
+                    after,
+                    ..
+                } => {
+                    let entry = operation_index.entry(source_uuid.as_str()).or_default();
+                    if entry.upsert.replace((before, after)).is_some() {
+                        return Err(BrokerError::InvalidEvent(format!(
+                            "BOOX operation manifest contains duplicate upserts for {source_uuid}"
+                        )));
+                    }
+                }
+            }
+        }
+        for (source_uuid, operations) in operation_index {
+            let delete = operations.delete;
+            let upsert = operations.upsert;
+            let active = state
+                .strokes
+                .get(source_uuid)
+                .filter(|canonical| canonical.tombstone.is_none());
+            let valid_operation_set = match (delete, upsert, active) {
+                (Some(deleted), None, Some(canonical)) => {
+                    normalized_supernote_snapshot(&canonical.snapshot) == *deleted
+                }
+                (None, Some((Some(before), after)), Some(canonical)) => {
+                    normalized_supernote_snapshot(&canonical.snapshot) == *before
+                        && after.page_index == canonical.snapshot.page_index
+                }
+                (None, Some((None, _)), None) => !state.strokes.contains_key(source_uuid),
+                (Some(deleted), Some((None, after)), Some(canonical)) => {
+                    normalized_supernote_snapshot(&canonical.snapshot) == *deleted
+                        && after.page_index != canonical.snapshot.page_index
+                }
+                _ => false,
+            };
+            if !valid_operation_set {
+                return Err(BrokerError::InvalidEvent(format!(
+                    "BOOX operation manifest does not match active canonical stroke {source_uuid}"
+                )));
+            }
+        }
+        Ok(manifest)
     }
 
     fn preserve_conflict<S: BrokerStorage>(
@@ -425,7 +640,7 @@ impl Broker {
         );
         let mut conflict_writes = vec![ConditionalWrite {
             path: preserved_path.clone(),
-            bytes: input.to_vec(),
+            bytes: blob(input.to_vec()),
             metadata: BTreeMap::from([
                 ("inkbridge-kind".to_owned(), "conflict-input".to_owned()),
                 (GENERATED_DOCUMENT_KEY.to_owned(), event.document_id.clone()),
@@ -444,10 +659,13 @@ impl Broker {
             } else {
                 &device.accepted_object_path
             };
-            let current_input = storage
-                .read(evidence_path)
-                .map_err(BrokerError::Storage)?
-                .ok_or_else(|| BrokerError::MissingObject(evidence_path.clone()))?;
+            let current_input = if device.accepted_object_path.is_empty() {
+                storage.read_generation(evidence_path, device.source_generation)
+            } else {
+                storage.read(evidence_path)
+            }
+            .map_err(BrokerError::Storage)?
+            .ok_or_else(|| BrokerError::MissingObject(evidence_path.clone()))?;
             let evidence_hash = sha256_hex(&current_input.bytes);
             if evidence_hash != device.content_sha256 {
                 return Err(BrokerError::CorruptState(format!(
@@ -620,6 +838,35 @@ fn mark_event_only<S: BrokerStorage>(
         )?])
         .map_err(BrokerError::ConditionalWrite)?;
     Ok(())
+}
+
+fn valid_supernote_native_style(style: &inkbridge_convert::NativeStyle) -> bool {
+    // The plugin crosses both the JavaScript number bridge and Android integer APIs. Keep the
+    // compact wire format inside the narrower native integer domain, which is exactly
+    // representable by JavaScript and rejects values the Supernote host cannot preserve.
+    let native_integer = 0..=i64::from(i32::MAX);
+    native_integer.contains(&style.layer_num)
+        && (1..=i64::from(i32::MAX)).contains(&style.thickness)
+        && native_integer.contains(&style.pen_type)
+}
+
+fn normalize_supernote_pen_color(snapshot: &mut StrokeSnapshot) {
+    let normalized = if snapshot.native_style.pen_color == 0x00 {
+        0x00
+    } else {
+        0x9d
+    };
+    if snapshot.native_style.pen_color == normalized {
+        return;
+    }
+    snapshot.native_style.pen_color = normalized;
+    snapshot.geometry_fingerprint = geometry_fingerprint(&snapshot.native_style, &snapshot.samples);
+}
+
+fn normalized_supernote_snapshot(snapshot: &StrokeSnapshot) -> StrokeSnapshot {
+    let mut normalized = snapshot.clone();
+    normalize_supernote_pen_color(&mut normalized);
+    normalized
 }
 
 fn apply_manifest(state: &mut CanonicalDocumentState, manifest: &Manifest, event: &StorageEvent) {
@@ -797,10 +1044,10 @@ fn state_write(
 ) -> Result<ConditionalWrite, BrokerError> {
     Ok(ConditionalWrite {
         path: path.to_owned(),
-        bytes: add_newline(
+        bytes: blob(add_newline(
             serde_json::to_vec_pretty(state)
                 .map_err(|error| BrokerError::CorruptState(error.to_string()))?,
-        ),
+        )),
         metadata: BTreeMap::from([
             ("inkbridge-kind".to_owned(), "canonical-state".to_owned()),
             (GENERATED_DOCUMENT_KEY.to_owned(), state.document_id.clone()),
@@ -870,17 +1117,6 @@ pub fn original_path(document_id: &str) -> String {
 
 pub fn state_path(document_id: &str) -> String {
     format!("Canonical/{document_id}/state.json")
-}
-
-fn accepted_input_path(event: &StorageEvent) -> String {
-    let (side, extension) = match event.source {
-        DeviceSide::Boox => ("boox", "pdf"),
-        DeviceSide::Supernote => ("supernote", "json"),
-    };
-    format!(
-        "Canonical/{}/accepted/{side}/revision-{:020}-{}.{}",
-        event.document_id, event.source_revision, event.content_sha256, extension
-    )
 }
 
 pub fn supernote_manifest_path(document_id: &str, event_id: &str) -> String {

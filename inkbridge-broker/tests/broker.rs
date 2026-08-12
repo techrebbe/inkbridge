@@ -1,6 +1,9 @@
 use inkbridge_broker::*;
-use inkbridge_convert::{geometry_fingerprint, Manifest, NativeStyle, Operation, StrokeSnapshot};
-use lopdf::{dictionary, Document, Object};
+use inkbridge_convert::{
+    geometry_fingerprint, CoordinateTransform, DocumentIdentity, Manifest, NativeStyle, Operation,
+    StrokeSnapshot, Summary,
+};
+use lopdf::{dictionary, Document, Object, Stream};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -70,6 +73,27 @@ fn original_pdf_with_pages(page_count: usize) -> Vec<u8> {
         "Pages" => pages_id,
     });
     document.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn original_pdf_with_padding(payload_mib: usize) -> Vec<u8> {
+    let mut document = Document::load_mem(&original_pdf()).unwrap();
+    let padding = document.add_object(Stream::new(
+        dictionary! {},
+        vec![0x5a; payload_mib * 1024 * 1024],
+    ));
+    let catalog_id = document
+        .trailer
+        .get(b"Root")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    document
+        .get_dictionary_mut(catalog_id)
+        .unwrap()
+        .set("InkBridgeLargeDocumentFixture", padding);
     let mut bytes = Vec::new();
     document.save_to(&mut bytes).unwrap();
     bytes
@@ -170,6 +194,7 @@ impl Harness {
             source_revision: revision,
             based_on,
             content_sha256,
+            payload_kind: DevicePayloadKind::DeviceView,
             broker_output: None,
         }
     }
@@ -202,6 +227,84 @@ fn stable_document_id_is_independent_of_file_name() {
 }
 
 #[test]
+fn registration_rejects_a_zero_page_pdf() {
+    let broker = Broker::default();
+    let mut storage = MemoryStorage::default();
+    let error = broker
+        .register_document(&mut storage, "empty.pdf", &original_pdf_with_pages(0))
+        .expect_err("a device view cannot address an empty page tree");
+
+    assert!(
+        matches!(error, BrokerError::InvalidEvent(message) if message.contains("at least one page"))
+    );
+}
+
+#[test]
+fn re_registering_legacy_document_persists_original_page_count() {
+    let original = original_pdf_with_pages(3);
+    let broker = Broker::default();
+    let mut storage = MemoryStorage::default();
+    let mut legacy = broker
+        .register_document(&mut storage, "legacy.pdf", &original)
+        .unwrap();
+    legacy.original_page_count = 0;
+    storage.put_unchecked(
+        state_path(&legacy.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+
+    let migrated = broker
+        .register_document(&mut storage, "renamed-legacy.pdf", &original)
+        .unwrap();
+    let persisted: CanonicalDocumentState = serde_json::from_slice(
+        &storage
+            .object(&state_path(&legacy.document_id))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+
+    assert_eq!(migrated.original_page_count, 3);
+    assert_eq!(persisted.original_page_count, 3);
+}
+
+#[test]
+fn compact_processing_backfills_legacy_document_page_count() {
+    let mut harness = Harness::new();
+    let mut legacy = harness.state();
+    legacy.original_page_count = 0;
+    harness.storage.put_unchecked(
+        state_path(&harness.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+    let snapshot = stroke("legacy-compact", 0.2, 0.3);
+    let mut event = harness.event(
+        "boox-legacy-compact",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: snapshot.source_uuid.clone(),
+                page_index: snapshot.page_index,
+                before: None,
+                after: snapshot,
+            }],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+    assert_eq!(harness.state().original_page_count, 1);
+}
+
+#[test]
 fn boox_only_update_emits_supernote_manifest() {
     let mut harness = Harness::new();
     let pdf = write_boox_view(&harness.original, [stroke("boox-a", 0.1, 0.2)]).unwrap();
@@ -222,14 +325,709 @@ fn boox_only_update_emits_supernote_manifest() {
         &manifest.operations[0],
         Operation::UpsertStroke { source_uuid, .. } if source_uuid == "boox-a"
     ));
+    assert!(harness
+        .storage
+        .paths()
+        .all(|path| !path.contains("/accepted/")));
     assert_eq!(
         harness
             .storage
             .object(&original_path(&harness.document_id))
             .unwrap()
-            .bytes,
-        harness.original
+            .bytes
+            .as_ref(),
+        harness.original.as_slice()
     );
+}
+
+#[test]
+fn compact_boox_manifest_produces_the_same_supernote_operations() {
+    let mut full = Harness::new();
+    let pdf = write_boox_view(&full.original, [stroke("boox-a", 0.1, 0.2)]).unwrap();
+    let full_event = full.event(
+        "boox-full",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        pdf,
+    );
+    full.broker.process(&mut full.storage, &full_event).unwrap();
+    let full_manifest_bytes = full
+        .storage
+        .object(&supernote_manifest_path(&full.document_id, "boox-full"))
+        .unwrap()
+        .bytes
+        .to_vec();
+    let expected: Manifest = serde_json::from_slice(&full_manifest_bytes).unwrap();
+    let mut compact_input = expected.clone();
+    compact_input.document.target_file_names.clear();
+
+    let mut compact = Harness::new();
+    let mut compact_event = compact.event(
+        "boox-compact",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        serde_json::to_vec(&compact_input).unwrap(),
+    );
+    compact_event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    compact
+        .broker
+        .process(&mut compact.storage, &compact_event)
+        .unwrap();
+    let actual: Manifest = serde_json::from_slice(
+        &compact
+            .storage
+            .object(&supernote_manifest_path(
+                &compact.document_id,
+                "boox-compact",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
+fn compact_manifest(operations: Vec<Operation>, page_count: usize) -> Vec<u8> {
+    let upserted = operations
+        .iter()
+        .filter(|operation| matches!(operation, Operation::UpsertStroke { .. }))
+        .count();
+    let deleted = operations
+        .iter()
+        .filter(|operation| matches!(operation, Operation::DeleteStroke { .. }))
+        .count();
+    serde_json::to_vec(&Manifest {
+        schema_version: 1,
+        manifest_id: "compact-test".to_owned(),
+        source: "boox-neoreader-embedded-pdf".to_owned(),
+        document: DocumentIdentity {
+            source_file_name: "boox-view.pdf".to_owned(),
+            target_file_names: Vec::new(),
+            page_count,
+            pdf_sha256: "compact-input".to_owned(),
+        },
+        coordinate_transform: CoordinateTransform {
+            pdf_to_supernote_normalized_y_offset: -0.0008,
+        },
+        operations,
+        summary: Summary {
+            upserted,
+            deleted,
+            ..Summary::default()
+        },
+    })
+    .unwrap()
+}
+
+#[test]
+fn compact_manifest_requires_identity_and_verified_fingerprints() {
+    let mut harness = Harness::new();
+    let snapshot = stroke("new-stroke", 0.2, 0.3);
+    let valid = compact_manifest(
+        vec![Operation::UpsertStroke {
+            source_uuid: snapshot.source_uuid.clone(),
+            page_index: snapshot.page_index,
+            before: None,
+            after: snapshot,
+        }],
+        1,
+    );
+    let mut missing_id: Manifest = serde_json::from_slice(&valid).unwrap();
+    missing_id.manifest_id.clear();
+    let mut missing_id_event = harness.event(
+        "boox-compact-missing-id",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        serde_json::to_vec(&missing_id).unwrap(),
+    );
+    missing_id_event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &missing_id_event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+
+    let mut stale_fingerprint: Manifest = serde_json::from_slice(&valid).unwrap();
+    let Operation::UpsertStroke { after, .. } = &mut stale_fingerprint.operations[0] else {
+        panic!("fixture must contain an upsert")
+    };
+    after.geometry_fingerprint = "fnv1a32:00000000".to_owned();
+    let mut stale_fingerprint_event = harness.event(
+        "boox-compact-stale-fingerprint",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        serde_json::to_vec(&stale_fingerprint).unwrap(),
+    );
+    stale_fingerprint_event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &stale_fingerprint_event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert!(!harness.state().strokes.contains_key("new-stroke"));
+}
+
+#[test]
+fn compact_manifest_rejects_samples_the_supernote_would_clamp() {
+    let mut harness = Harness::new();
+    let mut out_of_range = stroke("out-of-range", 0.2, 0.3);
+    out_of_range.samples[0] = [1.01, -0.01, 4097.0];
+    out_of_range.geometry_fingerprint =
+        geometry_fingerprint(&out_of_range.native_style, &out_of_range.samples);
+    let mut event = harness.event(
+        "boox-compact-out-of-range",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: out_of_range.source_uuid.clone(),
+                page_index: out_of_range.page_index,
+                before: None,
+                after: out_of_range,
+            }],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert!(!harness.state().strokes.contains_key("out-of-range"));
+}
+
+#[test]
+fn compact_manifest_rejects_native_style_values_the_plugin_cannot_preserve() {
+    let beyond_android_integer = i64::from(i32::MAX) + 1;
+    let invalid_styles = [
+        NativeStyle {
+            layer_num: beyond_android_integer,
+            ..NativeStyle::default()
+        },
+        NativeStyle {
+            thickness: 0,
+            ..NativeStyle::default()
+        },
+        NativeStyle {
+            thickness: beyond_android_integer,
+            ..NativeStyle::default()
+        },
+        NativeStyle {
+            pen_type: beyond_android_integer,
+            ..NativeStyle::default()
+        },
+    ];
+
+    for (index, native_style) in invalid_styles.into_iter().enumerate() {
+        let mut harness = Harness::new();
+        let mut invalid = stroke(&format!("invalid-style-{index}"), 0.2, 0.3);
+        invalid.native_style = native_style;
+        invalid.geometry_fingerprint =
+            geometry_fingerprint(&invalid.native_style, &invalid.samples);
+        let mut event = harness.event(
+            &format!("boox-compact-invalid-style-{index}"),
+            DeviceSide::Boox,
+            1,
+            RevisionPair::default(),
+            compact_manifest(
+                vec![Operation::UpsertStroke {
+                    source_uuid: invalid.source_uuid.clone(),
+                    page_index: invalid.page_index,
+                    before: None,
+                    after: invalid,
+                }],
+                1,
+            ),
+        );
+        event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+        assert!(matches!(
+            harness.broker.process(&mut harness.storage, &event),
+            Err(BrokerError::InvalidEvent(_))
+        ));
+    }
+}
+
+#[test]
+fn compact_manifest_normalizes_pen_colors_before_canonical_storage() {
+    let mut harness = Harness::new();
+    let mut original = stroke("normalized-color", 0.2, 0.3);
+    original.native_style.pen_color = 130;
+    original.geometry_fingerprint = geometry_fingerprint(&original.native_style, &original.samples);
+    let mut first = harness.event(
+        "boox-compact-normalized-color-1",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: original.source_uuid.clone(),
+                page_index: original.page_index,
+                before: None,
+                after: original.clone(),
+            }],
+            1,
+        ),
+    );
+    first.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness
+        .broker
+        .process(&mut harness.storage, &first)
+        .unwrap();
+
+    let first_state = harness.state();
+    let normalized = &first_state.strokes["normalized-color"].snapshot;
+    assert_eq!(normalized.native_style.pen_color, 0x9d);
+    assert_eq!(
+        normalized.geometry_fingerprint,
+        geometry_fingerprint(&normalized.native_style, &normalized.samples)
+    );
+    let emitted: Manifest = serde_json::from_slice(
+        &harness
+            .storage
+            .object(&supernote_manifest_path(
+                &harness.document_id,
+                "boox-compact-normalized-color-1",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let Operation::UpsertStroke { after, .. } = &emitted.operations[0] else {
+        panic!("fixture must contain an upsert")
+    };
+    assert_eq!(after, normalized);
+
+    let mut moved = original.clone();
+    moved.samples[0][0] += 0.02;
+    moved.geometry_fingerprint = geometry_fingerprint(&moved.native_style, &moved.samples);
+    let mut second = harness.event(
+        "boox-compact-normalized-color-2",
+        DeviceSide::Boox,
+        2,
+        RevisionPair {
+            boox: 1,
+            supernote: 0,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: moved.source_uuid.clone(),
+                page_index: moved.page_index,
+                before: Some(original),
+                after: moved.clone(),
+            }],
+            1,
+        ),
+    );
+    second.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness
+        .broker
+        .process(&mut harness.storage, &second)
+        .unwrap();
+    let second_state = harness.state();
+    let normalized_moved = &second_state.strokes["normalized-color"].snapshot;
+    assert_eq!(normalized_moved.native_style.pen_color, 0x9d);
+    assert_eq!(normalized_moved.samples, moved.samples);
+}
+
+#[test]
+fn compact_manifest_indexes_thousands_of_strokes_without_rescanning_operations() {
+    const STROKE_COUNT: usize = 5_000;
+    let mut harness = Harness::new();
+    let operations = (0..STROKE_COUNT)
+        .map(|index| {
+            let snapshot = stroke(&format!("bulk-{index:05}"), 0.2, 0.3);
+            Operation::UpsertStroke {
+                source_uuid: snapshot.source_uuid.clone(),
+                page_index: snapshot.page_index,
+                before: None,
+                after: snapshot,
+            }
+        })
+        .collect();
+    let mut event = harness.event(
+        "boox-compact-bulk",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(operations, 1),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+
+    assert_eq!(harness.state().strokes.len(), STROKE_COUNT);
+}
+
+#[test]
+fn compact_manifest_uses_the_broker_coordinate_calibration() {
+    let mut harness = Harness::new();
+    let snapshot = stroke("calibrated-stroke", 0.2, 0.3);
+    let mut manifest: Manifest = serde_json::from_slice(&compact_manifest(
+        vec![Operation::UpsertStroke {
+            source_uuid: snapshot.source_uuid.clone(),
+            page_index: snapshot.page_index,
+            before: None,
+            after: snapshot,
+        }],
+        1,
+    ))
+    .unwrap();
+    manifest
+        .coordinate_transform
+        .pdf_to_supernote_normalized_y_offset = 0.25;
+    let mut event = harness.event(
+        "boox-compact-wrong-calibration",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        serde_json::to_vec(&manifest).unwrap(),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+    let emitted: Manifest = serde_json::from_slice(
+        &harness
+            .storage
+            .object(&supernote_manifest_path(
+                &harness.document_id,
+                "boox-compact-wrong-calibration",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(
+        emitted
+            .coordinate_transform
+            .pdf_to_supernote_normalized_y_offset,
+        -0.0008
+    );
+}
+
+#[test]
+fn compact_delete_must_match_the_active_canonical_snapshot() {
+    let mut harness = Harness::new();
+    let export = harness.event(
+        "sn-before-compact-delete",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("tracked-stroke", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &export)
+        .unwrap();
+    let mut mismatched = harness.state().strokes["tracked-stroke"].snapshot.clone();
+    mismatched.samples[0][0] += 0.01;
+    mismatched.geometry_fingerprint =
+        geometry_fingerprint(&mismatched.native_style, &mismatched.samples);
+    let mut event = harness.event(
+        "boox-bad-compact-delete",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![Operation::DeleteStroke {
+                source_uuid: mismatched.source_uuid.clone(),
+                page_index: mismatched.page_index,
+                before: mismatched,
+            }],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    let error = harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap_err();
+    assert!(matches!(error, BrokerError::InvalidEvent(_)));
+    assert!(harness.state().strokes["tracked-stroke"]
+        .tombstone
+        .is_none());
+}
+
+#[test]
+fn compact_delete_rejects_an_unknown_stroke() {
+    let mut harness = Harness::new();
+    let mut event = harness.event(
+        "boox-unknown-compact-delete",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::DeleteStroke {
+                source_uuid: "unknown-stroke".to_owned(),
+                page_index: 0,
+                before: stroke("unknown-stroke", 0.2, 0.3),
+            }],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert!(!harness.state().strokes.contains_key("unknown-stroke"));
+}
+
+#[test]
+fn compact_upsert_must_match_the_active_canonical_snapshot() {
+    let mut harness = Harness::new();
+    let export = harness.event(
+        "sn-before-compact-upsert",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("tracked-stroke", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &export)
+        .unwrap();
+    let canonical = harness.state().strokes["tracked-stroke"].snapshot.clone();
+    let mut stale_before = canonical.clone();
+    stale_before.samples[0][0] += 0.01;
+    stale_before.geometry_fingerprint =
+        geometry_fingerprint(&stale_before.native_style, &stale_before.samples);
+    let mut after = canonical.clone();
+    after.samples[1][0] += 0.02;
+    after.geometry_fingerprint = geometry_fingerprint(&after.native_style, &after.samples);
+    let mut event = harness.event(
+        "boox-bad-compact-upsert",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: after.source_uuid.clone(),
+                page_index: after.page_index,
+                before: Some(stale_before),
+                after: after.clone(),
+            }],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert_eq!(
+        harness.state().strokes["tracked-stroke"].snapshot,
+        canonical
+    );
+
+    let mut missing_before = harness.event(
+        "boox-compact-upsert-without-before",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: after.source_uuid.clone(),
+                page_index: after.page_index,
+                before: None,
+                after,
+            }],
+            1,
+        ),
+    );
+    missing_before.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &missing_before),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+}
+
+#[test]
+fn compact_cross_page_move_accepts_none_before_with_matching_delete() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let before = stroke_on_page("cross-page", 0, 0.2, 0.3);
+    let export = harness.event(
+        "sn-before-compact-cross-page",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&before)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &export)
+        .unwrap();
+    let after = stroke_on_page("cross-page", 1, 0.3, 0.4);
+    let mut event = harness.event(
+        "boox-compact-cross-page",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![
+                Operation::DeleteStroke {
+                    source_uuid: before.source_uuid.clone(),
+                    page_index: before.page_index,
+                    before,
+                },
+                Operation::UpsertStroke {
+                    source_uuid: after.source_uuid.clone(),
+                    page_index: after.page_index,
+                    before: None,
+                    after: after.clone(),
+                },
+            ],
+            2,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+    let canonical = &harness.state().strokes["cross-page"];
+    assert_eq!(canonical.snapshot, after);
+    assert!(canonical.tombstone.is_none());
+}
+
+#[test]
+fn compact_cross_page_upsert_requires_a_matching_delete() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let before = stroke_on_page("cross-page", 0, 0.2, 0.3);
+    let export = harness.event(
+        "sn-before-invalid-cross-page",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&before)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &export)
+        .unwrap();
+    let after = stroke_on_page("cross-page", 1, 0.3, 0.4);
+    let mut event = harness.event(
+        "boox-cross-page-without-delete",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: after.source_uuid.clone(),
+                page_index: after.page_index,
+                before: Some(before.clone()),
+                after,
+            }],
+            2,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert_eq!(harness.state().strokes["cross-page"].snapshot, before);
+}
+
+#[test]
+fn compact_manifest_rejects_duplicate_upserts_for_one_stroke() {
+    let mut harness = Harness::new();
+    let first = stroke("duplicate", 0.2, 0.3);
+    let second = stroke("duplicate", 0.4, 0.5);
+    let mut event = harness.event(
+        "boox-duplicate-upserts",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![
+                Operation::UpsertStroke {
+                    source_uuid: first.source_uuid.clone(),
+                    page_index: first.page_index,
+                    before: None,
+                    after: first,
+                },
+                Operation::UpsertStroke {
+                    source_uuid: second.source_uuid.clone(),
+                    page_index: second.page_index,
+                    before: None,
+                    after: second,
+                },
+            ],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert!(!harness.state().strokes.contains_key("duplicate"));
+}
+
+#[test]
+#[ignore = "large-memory validation; set INKBRIDGE_LARGE_DOCUMENT_MIB (default 300)"]
+fn large_document_round_trip_does_not_create_an_accepted_pdf_copy() {
+    let size_mib = std::env::var("INKBRIDGE_LARGE_DOCUMENT_MIB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300);
+    let mut harness = Harness::with_original(original_pdf_with_padding(size_mib));
+    let event = harness.event(
+        "large-supernote-update",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("large-doc-stroke", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+    let state = harness.state();
+    let generated = harness.storage.object(&boox_view_path(&state)).unwrap();
+    assert!(generated.bytes.len() >= size_mib * 1024 * 1024);
+    assert!(harness
+        .storage
+        .paths()
+        .all(|path| !path.contains("/accepted/")));
 }
 
 #[test]
@@ -394,7 +1192,7 @@ fn repeated_event_is_idempotent() {
 }
 
 #[test]
-fn out_of_order_event_for_overwritten_path_is_ignored_as_stale() {
+fn out_of_order_event_reads_its_exact_immutable_generation() {
     let mut harness = Harness::new();
     let stale = harness.event(
         "sn-stale-generation",
@@ -414,10 +1212,11 @@ fn out_of_order_event_for_overwritten_path_is_ignored_as_stale() {
             .broker
             .process(&mut harness.storage, &stale)
             .unwrap(),
-        ProcessOutcome::IgnoredStaleSource { .. }
+        ProcessOutcome::Applied { .. }
     ));
     let state = harness.state();
-    assert_eq!(state.supernote.revision, 0);
+    assert_eq!(state.supernote.revision, 1);
+    assert!(state.strokes.contains_key("old"));
     assert!(state.processed_event_ids.contains("sn-stale-generation"));
 }
 
@@ -454,6 +1253,7 @@ fn broker_generated_output_event_is_ignored() {
         source_revision: 1,
         based_on: revisions,
         content_sha256: sha256_hex(&output.bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: Some(BrokerOutputMarker {
             producer: BROKER_PRODUCER.to_owned(),
             event_id: "sn-source".to_owned(),
@@ -504,7 +1304,10 @@ fn stale_destination_generation_does_not_overwrite_newer_content() {
         .process(&mut harness.storage, &second)
         .unwrap_err();
     assert!(matches!(error, BrokerError::StaleDestination { .. }));
-    assert_eq!(harness.storage.object(&path).unwrap().bytes, external);
+    assert_eq!(
+        harness.storage.object(&path).unwrap().bytes.as_ref(),
+        external
+    );
     assert_eq!(harness.state().supernote.revision, 1);
 }
 
@@ -545,6 +1348,7 @@ fn accepted_in_place_boox_edit_becomes_the_next_destination_baseline() {
             supernote: 1,
         },
         content_sha256: edited_hash.clone(),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: Some(BrokerOutputMarker {
             producer: BROKER_PRODUCER.to_owned(),
             event_id: "sn-1".to_owned(),
@@ -668,15 +1472,23 @@ fn conflict_preserves_the_immutable_accepted_device_revision() {
         source_revision: 1,
         based_on: common,
         content_sha256: sha256_hex(&accepted_boox),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: None,
     };
     harness
         .broker
         .process(&mut harness.storage, &boox_event)
         .unwrap();
-    let accepted_path = harness.state().boox.accepted_object_path;
+    let accepted_state = harness.state();
+    assert!(accepted_state.boox.accepted_object_path.is_empty());
     assert_eq!(
-        harness.storage.object(&accepted_path).unwrap().bytes,
+        harness
+            .storage
+            .read_generation(&boox_path, accepted_object.generation)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
         accepted_boox
     );
 
@@ -705,7 +1517,8 @@ fn conflict_preserves_the_immutable_accepted_device_revision() {
             .storage
             .object(&conflict.competing_preserved_paths[0])
             .unwrap()
-            .bytes,
+            .bytes
+            .as_ref(),
         accepted_boox
     );
 }
@@ -933,6 +1746,7 @@ fn real_device_manifest_is_byte_identical_to_proven_converter_output() {
         source_revision: 1,
         based_on: RevisionPair::default(),
         content_sha256: sha256_hex(&baseline),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: None,
     };
     broker.process(&mut storage, &sn_event).unwrap();
@@ -971,6 +1785,7 @@ fn real_device_manifest_is_byte_identical_to_proven_converter_output() {
             supernote: 1,
         },
         content_sha256: sha256_hex(&boox),
+        payload_kind: DevicePayloadKind::DeviceView,
         broker_output: None,
     };
     broker.process(&mut storage, &boox_event).unwrap();
@@ -981,5 +1796,5 @@ fn real_device_manifest_is_byte_identical_to_proven_converter_output() {
         ))
         .unwrap()
         .bytes;
-    assert_eq!(actual, &expected);
+    assert_eq!(actual.as_ref(), expected.as_slice());
 }

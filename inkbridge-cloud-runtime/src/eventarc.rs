@@ -1,6 +1,6 @@
 use inkbridge_broker::{
-    sha256_hex, BrokerOutputMarker, DeviceSide, RevisionPair, StorageEvent, BROKER_PRODUCER,
-    EVENT_SCHEMA_VERSION,
+    sha256_hex, BrokerOutputMarker, DevicePayloadKind, DeviceSide, RevisionPair, StorageEvent,
+    BROKER_PRODUCER, EVENT_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -104,6 +104,19 @@ pub fn translate_storage_finalized_event(
         .metadata
         .get("inkbridge-generated-by")
         .is_some_and(|value| value == BROKER_PRODUCER);
+    if !generated_by_broker
+        && !object
+            .metadata
+            .get("inkbridge-sync-ready")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return Ok(EventTranslation::Ignore {
+            reason: format!(
+                "object {} is not marked as a finalized InkBridge update",
+                object.name
+            ),
+        });
+    }
     let (source_revision, based_on, broker_output) = if generated_by_broker {
         let revisions = parse_revisions(required_metadata(
             &object.metadata,
@@ -139,6 +152,21 @@ pub fn translate_storage_finalized_event(
         .get("inkbridge-content-sha256")
         .cloned()
         .unwrap_or_default();
+    let payload_kind = match object
+        .metadata
+        .get("inkbridge-payload-kind")
+        .map(String::as_str)
+    {
+        None | Some("device_view") => DevicePayloadKind::DeviceView,
+        Some("boox_operation_manifest") if source == DeviceSide::Boox => {
+            DevicePayloadKind::BooxOperationManifest
+        }
+        Some(value) => {
+            return Err(format!(
+                "unsupported InkBridge payload kind {value} for {source:?}"
+            ));
+        }
+    };
     Ok(EventTranslation::Process(StorageEvent {
         schema_version: EVENT_SCHEMA_VERSION,
         event_id,
@@ -149,6 +177,7 @@ pub fn translate_storage_finalized_event(
         source_revision,
         based_on,
         content_sha256,
+        payload_kind,
         broker_output,
     }))
 }
@@ -225,7 +254,8 @@ mod tests {
                 "inkbridge-document-id": "inkbridge-doc-v1-stable",
                 "inkbridge-source-revision": "3",
                 "inkbridge-based-on-boox": "2",
-                "inkbridge-based-on-supernote": "4"
+                "inkbridge-based-on-supernote": "4",
+                "inkbridge-sync-ready": "true"
             }
         }))
         .unwrap();
@@ -267,6 +297,48 @@ mod tests {
         };
         assert_eq!(event.source_revision, 7);
         assert_eq!(event.broker_output.unwrap().event_id, "source-event");
+    }
+
+    #[test]
+    fn ignores_unfinalized_device_uploads_and_recognizes_compact_boox_manifests() {
+        let metadata = json!({
+            "inkbridge-document-id": "doc",
+            "inkbridge-source-revision": "1",
+            "inkbridge-based-on-boox": "0",
+            "inkbridge-based-on-supernote": "0"
+        });
+        let unready = serde_json::to_vec(&json!({
+            "bucket": "private-sync",
+            "name": "BOOX_Folder/doc/update.json",
+            "generation": "21",
+            "metadata": metadata
+        }))
+        .unwrap();
+        assert!(matches!(
+            translate_storage_finalized_event("private-sync", &headers(), &unready).unwrap(),
+            EventTranslation::Ignore { .. }
+        ));
+
+        let ready = serde_json::to_vec(&json!({
+            "bucket": "private-sync",
+            "name": "BOOX_Folder/doc/update.json",
+            "generation": "22",
+            "metadata": {
+                "inkbridge-document-id": "doc",
+                "inkbridge-source-revision": "1",
+                "inkbridge-based-on-boox": "0",
+                "inkbridge-based-on-supernote": "0",
+                "inkbridge-sync-ready": "true",
+                "inkbridge-payload-kind": "boox_operation_manifest"
+            }
+        }))
+        .unwrap();
+        let EventTranslation::Process(event) =
+            translate_storage_finalized_event("private-sync", &headers(), &ready).unwrap()
+        else {
+            panic!("expected process event")
+        };
+        assert_eq!(event.payload_kind, DevicePayloadKind::BooxOperationManifest);
     }
 
     #[test]

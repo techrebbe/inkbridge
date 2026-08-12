@@ -13,6 +13,7 @@ use pdf::{extract_pdf_strokes, PdfStrokeExtraction};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 pub fn build_manifest(
@@ -20,9 +21,7 @@ pub fn build_manifest(
     baseline_paths: &[PathBuf],
     normalized_y_offset: f64,
 ) -> Result<Manifest, String> {
-    let pdf_bytes = fs::read(pdf_path)
-        .map_err(|error| format!("could not read PDF {}: {error}", pdf_path.display()))?;
-    let pdf_sha256 = format!("{:x}", Sha256::digest(&pdf_bytes));
+    let pdf_sha256 = sha256_file(pdf_path)?;
     let PdfStrokeExtraction {
         page_count,
         strokes: extracted,
@@ -92,6 +91,24 @@ pub fn build_manifest(
             skipped,
         },
     })
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("could not read PDF {}: {error}", path.display()))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read PDF {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn add_target_file_name(targets: &mut Vec<String>, candidate: String) -> Result<(), String> {
@@ -239,6 +256,7 @@ pub fn baseline_by_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn test_stroke(source_uuid: &str, page_index: u32) -> StrokeSnapshot {
         let native_style = NativeStyle::default();
@@ -360,5 +378,20 @@ mod tests {
 
         assert!(operations.is_empty());
         assert_eq!(unchanged, 0);
+    }
+
+    #[test]
+    fn pdf_hashing_streams_the_file_and_matches_in_memory_sha256() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-enough-to-cross-chunks.pdf");
+        let bytes = vec![0x5a; 2 * 1024 * 1024 + 17];
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&bytes).unwrap();
+        drop(file);
+
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            format!("{:x}", Sha256::digest(&bytes))
+        );
     }
 }

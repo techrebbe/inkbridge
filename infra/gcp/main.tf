@@ -61,6 +61,30 @@ resource "google_storage_bucket" "sync" {
     enabled = true
   }
 
+  lifecycle_rule {
+    condition {
+      age            = 1
+      matches_prefix = ["Staging/"]
+      with_state     = "LIVE"
+    }
+
+    action {
+      type = "Delete"
+    }
+  }
+
+  lifecycle_rule {
+    condition {
+      days_since_noncurrent_time = 1
+      matches_prefix             = ["Staging/"]
+      with_state                 = "ARCHIVED"
+    }
+
+    action {
+      type = "Delete"
+    }
+  }
+
   depends_on = [google_project_service.required]
 }
 
@@ -255,7 +279,7 @@ resource "google_cloud_run_v2_service" "runtime" {
 
   template {
     service_account                  = google_service_account.runtime[0].email
-    timeout                          = "300s"
+    timeout                          = "900s"
     max_instance_request_concurrency = 1
 
     scaling {
@@ -265,6 +289,14 @@ resource "google_cloud_run_v2_service" "runtime" {
 
     containers {
       image = var.cloud_run_image
+
+      resources {
+        cpu_idle = true
+        limits = {
+          cpu    = "2"
+          memory = "8Gi"
+        }
+      }
 
       env {
         name  = "INKBRIDGE_GCP_PROJECT"

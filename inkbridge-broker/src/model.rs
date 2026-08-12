@@ -22,6 +22,14 @@ pub enum DeviceSide {
     Supernote,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePayloadKind {
+    #[default]
+    DeviceView,
+    BooxOperationManifest,
+}
+
 impl DeviceSide {
     pub fn other(self) -> Self {
         match self {
@@ -75,6 +83,8 @@ pub struct StorageEvent {
     pub source_revision: u64,
     pub based_on: RevisionPair,
     pub content_sha256: String,
+    #[serde(default)]
+    pub payload_kind: DevicePayloadKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker_output: Option<BrokerOutputMarker>,
 }
@@ -146,6 +156,8 @@ pub struct CanonicalDocumentState {
     pub original_object_path: String,
     pub original_pdf_sha256: String,
     pub original_file_name: String,
+    #[serde(default)]
+    pub original_page_count: usize,
     pub state_revision: u64,
     pub boox: DeviceRevision,
     pub supernote: DeviceRevision,
