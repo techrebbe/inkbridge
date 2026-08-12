@@ -1192,6 +1192,17 @@ fn metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>, String> {
     }
 }
 
+fn symlink_metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not inspect filesystem entry {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1271,6 +1282,17 @@ fn replace_existing_file_conditionally(
             backup.display()
         )
     })?;
+    let staged_metadata = symlink_metadata_if_exists(&backup)?.ok_or_else(|| {
+        format!(
+            "staged BOOX destination {} disappeared before verification",
+            backup.display()
+        )
+    })?;
+    if staged_metadata.file_type().is_symlink() {
+        remove_file_if_exists(source)?;
+        restore_staged_file(&backup, destination)?;
+        return Ok(false);
+    }
     let staged_hash = match sha256_file(&backup) {
         Ok(hash) => hash,
         Err(error) => {
@@ -1374,19 +1396,22 @@ fn rename_create_only(_source: &Path, _destination: &Path) -> std::io::Result<()
 
 fn reconcile_staged_backup(destination: &Path, published_hash: &str) -> Result<(), String> {
     let backup = sibling_temporary(destination, "previous");
-    match metadata_if_exists(&backup)? {
+    let backup_is_symlink = match symlink_metadata_if_exists(&backup)? {
         None => return Ok(()),
+        Some(metadata) if metadata.file_type().is_symlink() => true,
         Some(metadata) if !metadata.is_file() => {
             return Err(format!(
                 "staged BOOX backup {} is not a regular file",
                 backup.display()
             ));
         }
-        Some(_) => {}
-    }
+        Some(_) => false,
+    };
     match file_identity(destination)? {
         FileIdentity::Missing => restore_staged_file(&backup, destination),
-        FileIdentity::Sha256(current_hash) if current_hash == published_hash => {
+        FileIdentity::Sha256(current_hash)
+            if current_hash == published_hash && !backup_is_symlink =>
+        {
             remove_file_if_exists(&backup)
         }
         FileIdentity::Sha256(_) => Err(format!(
@@ -1537,5 +1562,33 @@ mod snapshot_tests {
 
         assert_eq!(fs::read(&destination).unwrap(), published);
         assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_replace_restores_a_leaf_symlink_created_after_validation() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("broker.part");
+        let destination = directory.path().join("book.pdf");
+        let target = directory.path().join("sync-client-book.pdf");
+        fs::write(&source, b"broker view").unwrap();
+        fs::write(&target, b"expected old view").unwrap();
+        symlink(&target, &destination).unwrap();
+
+        assert!(!replace_file(
+            &source,
+            &destination,
+            Some(&FileIdentity::Sha256(sha256_hex(b"expected old view"))),
+        )
+        .unwrap());
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"expected old view");
+        assert!(!source.exists());
+        assert!(!sibling_temporary(&destination, "previous").exists());
     }
 }
