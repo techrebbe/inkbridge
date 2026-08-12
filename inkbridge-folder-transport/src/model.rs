@@ -135,6 +135,7 @@ impl TransportConfig {
             if !ids.insert(&document.document_id) {
                 return Err(format!("duplicate documentId {}", document.document_id));
             }
+            reject_boox_leaf_symlink(&document.boox_pdf)?;
             let document_boox_paths = path_key_variants(&document.boox_pdf)?;
             if document_boox_paths.iter().any(|boox_path| {
                 boox_paths
@@ -289,6 +290,21 @@ fn path_sets_overlap(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool 
             .iter()
             .any(|right| key_contains_path(left, right) || key_contains_path(right, left))
     })
+}
+
+fn reject_boox_leaf_symlink(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "booxPdf {} must not be a leaf symlink; use its target path or a symlinked parent directory",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not inspect booxPdf entry {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn boox_paths_conflict(left: &str, right: &str) -> bool {
@@ -1207,7 +1223,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn configuration_rejects_temporary_beside_a_symlinked_boox_entry() {
+    fn configuration_rejects_a_symlinked_boox_leaf() {
         use std::os::unix::fs::symlink;
 
         let directory = tempdir().unwrap();
@@ -1226,28 +1242,19 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
-            documents: vec![
-                DocumentFolders {
-                    document_id: test_document_id('a'),
-                    original_file_name: "first.pdf".to_owned(),
-                    boox_pdf: entry,
-                    supernote_export_directory: directory.path().join("first/outgoing"),
-                    supernote_incoming_directory: directory.path().join("first/incoming"),
-                },
-                DocumentFolders {
-                    document_id: test_document_id('b'),
-                    original_file_name: "second.pdf".to_owned(),
-                    boox_pdf: entry_directory.join(".book.pdf.compact-upload.part"),
-                    supernote_export_directory: directory.path().join("second/outgoing"),
-                    supernote_incoming_directory: directory.path().join("second/incoming"),
-                },
-            ],
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "first.pdf".to_owned(),
+                boox_pdf: entry,
+                supernote_export_directory: directory.path().join("first/outgoing"),
+                supernote_incoming_directory: directory.path().join("first/incoming"),
+            }],
         };
 
         assert!(config
             .validate()
             .unwrap_err()
-            .contains("reserved temporary"));
+            .contains("must not be a leaf symlink"));
     }
 
     #[cfg(unix)]
