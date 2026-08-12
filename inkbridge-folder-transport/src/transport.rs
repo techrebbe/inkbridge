@@ -789,21 +789,30 @@ fn supernote_export_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
     if !directory.exists() {
         return Ok(Vec::new());
     }
-    let mut files = fs::read_dir(directory)
-        .map_err(|error| format!("could not read {}: {error}", directory.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-                && !path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with('.') || name.ends_with(".part.json"))
-        })
-        .collect::<Vec<_>>();
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("could not read {}: {error}", directory.display()))?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                format!(
+                    "could not enumerate an entry in {}: {error}",
+                    directory.display()
+                )
+            })?
+            .path();
+        if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.') || name.ends_with(".part.json"))
+        {
+            files.push(path);
+        }
+    }
     files.sort();
     Ok(files)
 }
