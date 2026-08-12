@@ -497,6 +497,42 @@ impl Broker {
                     )));
                 }
             }
+            if let Operation::UpsertStroke {
+                source_uuid,
+                before,
+                after,
+                ..
+            } = operation
+            {
+                let active = state
+                    .strokes
+                    .get(source_uuid)
+                    .filter(|canonical| canonical.tombstone.is_none());
+                let valid_baseline = match (before, active) {
+                    (Some(before), Some(canonical)) => canonical.snapshot == *before,
+                    (None, None) => !state.strokes.contains_key(source_uuid),
+                    (None, Some(canonical)) => {
+                        after.page_index != canonical.snapshot.page_index
+                            && manifest.operations.iter().any(|candidate| {
+                                matches!(
+                                    candidate,
+                                    Operation::DeleteStroke {
+                                        source_uuid: deleted_uuid,
+                                        before: deleted,
+                                        ..
+                                    } if deleted_uuid == source_uuid
+                                        && deleted == &canonical.snapshot
+                                )
+                            })
+                    }
+                    (Some(_), None) => false,
+                };
+                if !valid_baseline {
+                    return Err(BrokerError::InvalidEvent(format!(
+                        "BOOX operation manifest upsert does not match active canonical stroke {source_uuid}"
+                    )));
+                }
+            }
         }
         Ok(manifest)
     }
