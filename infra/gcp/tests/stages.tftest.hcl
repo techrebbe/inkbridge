@@ -91,8 +91,11 @@ run "bootstrap_omits_runtime" {
       length(google_storage_bucket.sync[0].lifecycle_rule) == 2 &&
       alltrue([
         for rule in google_storage_bucket.sync[0].lifecycle_rule :
-        contains(try(rule.condition[0].matches_prefix, []), "Staging/") &&
-        !contains(try(rule.condition[0].matches_prefix, []), "BrokerOutbox/")
+        length(try(rule.condition[0].matches_prefix, [])) == 1 &&
+        alltrue([
+          for prefix in try(rule.condition[0].matches_prefix, []) :
+          startswith(prefix, "Staging") && !startswith(prefix, "BrokerOutbox")
+        ])
       ])
     )
     error_message = "The data bucket must expire staging objects without age-deleting recoverable outbox payloads."
