@@ -320,22 +320,23 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 continue;
             }
 
-            if !already_installed {
-                if !self.download_verified(
+            if !already_installed
+                && !self.download_verified(
                     &object,
                     &local_path,
                     boox_destination_identity.as_ref(),
-                )? {
-                    report.actions.push(TransportAction::Deferred {
-                        side,
-                        reason: format!(
-                            "broker view {} was not installed because the local BOOX PDF changed while it was downloading",
-                            object.path
-                        ),
-                    });
-                    continue;
-                }
-            } else if side == DeviceSide::Boox
+                )?
+            {
+                report.actions.push(TransportAction::Deferred {
+                    side,
+                    reason: format!(
+                        "broker view {} was not installed because the local BOOX PDF changed while it was downloading",
+                        object.path
+                    ),
+                });
+                continue;
+            }
+            if side == DeviceSide::Boox
                 && file_identity(&local_path)? != FileIdentity::Sha256(expected_hash.clone())
             {
                 report.actions.push(TransportAction::Deferred {
@@ -801,15 +802,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 object.path
             ));
         }
-        if let Some(expected_destination) = expected_destination {
-            let current_destination = file_identity(destination)?;
-            if &current_destination != expected_destination {
-                remove_file_if_exists(&temporary)?;
-                return Ok(false);
-            }
-        }
-        replace_file(&temporary, destination)?;
-        Ok(true)
+        replace_file(&temporary, destination, expected_destination)
     }
 }
 
@@ -1075,7 +1068,126 @@ fn sibling_temporary(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!(".{name}.{suffix}.part"))
 }
 
-fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+fn replace_file(
+    source: &Path,
+    destination: &Path,
+    expected_destination: Option<&FileIdentity>,
+) -> Result<bool, String> {
+    let Some(expected_destination) = expected_destination else {
+        replace_file_unconditionally(source, destination)?;
+        return Ok(true);
+    };
+    match expected_destination {
+        FileIdentity::Missing => publish_create_only(source, destination),
+        FileIdentity::Sha256(expected_hash) => {
+            replace_existing_file_conditionally(source, destination, expected_hash)
+        }
+    }
+}
+
+fn replace_existing_file_conditionally(
+    source: &Path,
+    destination: &Path,
+    expected_hash: &str,
+) -> Result<bool, String> {
+    match metadata_if_exists(destination)? {
+        None => {
+            remove_file_if_exists(source)?;
+            return Ok(false);
+        }
+        Some(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "refusing to replace non-file destination {}",
+                destination.display()
+            ));
+        }
+        Some(_) => {}
+    }
+    let backup = sibling_temporary(destination, "previous");
+    if metadata_if_exists(&backup)?.is_some() {
+        return Err(format!(
+            "refusing to replace {} while staged backup {} already exists",
+            destination.display(),
+            backup.display()
+        ));
+    }
+    fs::rename(destination, &backup).map_err(|error| {
+        format!(
+            "could not stage {} as {}: {error}",
+            destination.display(),
+            backup.display()
+        )
+    })?;
+    let staged_hash = match sha256_file(&backup) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let restore_error = restore_staged_file(&backup, destination).err();
+            return Err(match restore_error {
+                Some(restore_error) => {
+                    format!("{error}; additionally could not restore staged file: {restore_error}")
+                }
+                None => error,
+            });
+        }
+    };
+    if staged_hash != expected_hash {
+        remove_file_if_exists(source)?;
+        restore_staged_file(&backup, destination)?;
+        return Ok(false);
+    }
+    match publish_create_only(source, destination) {
+        Ok(published) => {
+            remove_file_if_exists(&backup)?;
+            Ok(published)
+        }
+        Err(error) => {
+            let restore_error = restore_staged_file(&backup, destination).err();
+            Err(match restore_error {
+                Some(restore_error) => {
+                    format!("{error}; additionally could not restore staged file: {restore_error}")
+                }
+                None => error,
+            })
+        }
+    }
+}
+
+fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => {
+            remove_file_if_exists(source)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            remove_file_if_exists(source)?;
+            Ok(false)
+        }
+        Err(error) => Err(format!(
+            "could not publish {} as new destination {}: {error}",
+            source.display(),
+            destination.display()
+        )),
+    }
+}
+
+fn restore_staged_file(backup: &Path, destination: &Path) -> Result<(), String> {
+    if metadata_if_exists(destination)?.is_some() {
+        return Err(format!(
+            "destination {} was recreated; preserved staged file at {}",
+            destination.display(),
+            backup.display()
+        ));
+    }
+    fs::rename(backup, destination).map_err(|error| {
+        format!(
+            "could not restore {} as {}: {error}",
+            backup.display(),
+            destination.display()
+        )
+    })
+}
+
+fn replace_file_unconditionally(source: &Path, destination: &Path) -> Result<(), String> {
     match metadata_if_exists(destination)? {
         None => {
             return fs::rename(source, destination).map_err(|error| {
@@ -1135,5 +1247,37 @@ mod snapshot_tests {
         assert_eq!(bytes, b"first-export");
         assert_ne!(content_hash, current_hash);
         assert_eq!(current_hash, sha256_hex(b"later-export"));
+    }
+
+    #[test]
+    fn conditional_replace_restores_a_destination_changed_before_staging() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("broker.part");
+        let destination = directory.path().join("book.pdf");
+        fs::write(&source, b"broker view").unwrap();
+        fs::write(&destination, b"local edit").unwrap();
+
+        assert!(!replace_file(
+            &source,
+            &destination,
+            Some(&FileIdentity::Sha256(sha256_hex(b"old broker view"))),
+        )
+        .unwrap());
+        assert_eq!(fs::read(&destination).unwrap(), b"local edit");
+        assert!(!source.exists());
+        assert!(!sibling_temporary(&destination, "previous").exists());
+    }
+
+    #[test]
+    fn create_only_publish_never_overwrites_a_recreated_destination() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("broker.part");
+        let destination = directory.path().join("book.pdf");
+        fs::write(&source, b"broker view").unwrap();
+        fs::write(&destination, b"new local edit").unwrap();
+
+        assert!(!replace_file(&source, &destination, Some(&FileIdentity::Missing),).unwrap());
+        assert_eq!(fs::read(&destination).unwrap(), b"new local edit");
+        assert!(!source.exists());
     }
 }
