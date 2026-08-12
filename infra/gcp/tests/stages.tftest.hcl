@@ -87,8 +87,15 @@ run "bootstrap_omits_runtime" {
   }
 
   assert {
-    condition     = length(google_storage_bucket.sync[0].lifecycle_rule) == 3
-    error_message = "The data bucket must expire live and archived transient payloads."
+    condition = (
+      length(google_storage_bucket.sync[0].lifecycle_rule) == 2 &&
+      alltrue([
+        for rule in google_storage_bucket.sync[0].lifecycle_rule :
+        contains(try(rule.condition[0].matches_prefix, []), "Staging/") &&
+        !contains(try(rule.condition[0].matches_prefix, []), "BrokerOutbox/")
+      ])
+    )
+    error_message = "The data bucket must expire staging objects without age-deleting recoverable outbox payloads."
   }
 
   assert {
