@@ -99,6 +99,10 @@ the complete editable PDF. The broker continues rebuilding that view from the im
   explicit reconciliation workflow has safely retired those conflict objects.
 - State publication keeps the prior checkpoint until the replacement is complete and recovers from
   a staged prior checkpoint after interruption.
+- Windows crash recovery safely retires a staged BOOX predecessor while holding a handle that blocks
+  destination replacement. Unix cannot atomically bind deletion of that separate backup pathname to
+  the validated destination inode, so it preserves `.previous.part` and stops for explicit
+  reconciliation instead of risking data loss.
 
 ## Validation
 

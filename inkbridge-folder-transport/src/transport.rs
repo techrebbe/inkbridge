@@ -1450,7 +1450,7 @@ where
                 // on Unix its file identity and two lstat checks detect a replacement.
                 let _installed_guard =
                     open_same_installed_regular_file(destination, &opened_destination)?;
-                remove_file_if_exists(&backup)
+                retire_validated_staged_backup(&backup)
             } else {
                 Err(format!(
                     "both BOOX destination {} and interrupted staged backup {} contain distinct data; preserved both",
@@ -1460,6 +1460,24 @@ where
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn retire_validated_staged_backup(backup: &Path) -> Result<(), String> {
+    // The live destination guard omits FILE_SHARE_DELETE, so its pathname
+    // cannot be replaced between validation and backup retirement.
+    remove_file_if_exists(backup)
+}
+
+#[cfg(unix)]
+fn retire_validated_staged_backup(backup: &Path) -> Result<(), String> {
+    // Unix open handles do not pin pathnames. There is no atomic primitive
+    // that ties removing this separate backup path to the validated identity
+    // of the live destination, so preserve the predecessor for explicit review.
+    Err(format!(
+        "confirmed the published BOOX destination, but cannot safely retire staged backup {} on Unix; preserved it for explicit reconciliation",
+        backup.display()
+    ))
 }
 
 fn open_installed_regular_file(path: &Path) -> Result<File, String> {
@@ -1737,6 +1755,7 @@ mod snapshot_tests {
         assert!(!backup.exists());
     }
 
+    #[cfg(windows)]
     #[test]
     fn completed_publication_retires_an_interrupted_staged_backup() {
         let directory = tempdir().unwrap();
@@ -1750,6 +1769,24 @@ mod snapshot_tests {
 
         assert_eq!(fs::read(&destination).unwrap(), published);
         assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_publication_preserves_an_interrupted_staged_backup() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("book.pdf");
+        let backup = sibling_temporary(&destination, "previous");
+        let published = b"broker view";
+        fs::write(&destination, published).unwrap();
+        fs::write(&backup, b"previous broker view").unwrap();
+
+        let error = reconcile_staged_backup(&destination, &sha256_hex(published))
+            .expect_err("Unix recovery must retain the predecessor");
+
+        assert!(error.contains("cannot safely retire staged backup"));
+        assert_eq!(fs::read(&destination).unwrap(), published);
+        assert_eq!(fs::read(&backup).unwrap(), b"previous broker view");
     }
 
     #[cfg(unix)]
