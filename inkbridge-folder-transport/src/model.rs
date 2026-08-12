@@ -59,10 +59,24 @@ impl TransportConfig {
     }
 
     fn validate_config_path(&self, path: &Path) -> Result<(), String> {
-        let config_path = normalized_path_key(path)?;
+        let config_paths = path_key_variants(path)?;
+        for reserved in state_reserved_paths(&self.state_path) {
+            let reserved_paths = path_key_variants(&reserved)?;
+            if path_sets_overlap(&config_paths, &reserved_paths) {
+                return Err(format!(
+                    "configuration file {} collides with statePath or checkpoint companion {}",
+                    path.display(),
+                    reserved.display()
+                ));
+            }
+        }
         for document in &self.documents {
-            let boox_path = normalized_path_key(&document.boox_pdf)?;
-            if boox_mapping_overlaps_path(&boox_path, &config_path) {
+            let boox_paths = path_key_variants(&document.boox_pdf)?;
+            if boox_paths.iter().any(|boox_path| {
+                config_paths
+                    .iter()
+                    .any(|config_path| boox_mapping_overlaps_path(boox_path, config_path))
+            }) {
                 return Err(format!(
                     "configuration file {} must be outside mapped BOOX paths",
                     path.display()
@@ -72,10 +86,8 @@ impl TransportConfig {
                 &document.supernote_export_directory,
                 &document.supernote_incoming_directory,
             ] {
-                let directory = normalized_path_key(directory)?;
-                if key_contains_path(&directory, &config_path)
-                    || key_contains_path(&config_path, &directory)
-                {
+                let directory_paths = path_key_variants(directory)?;
+                if path_sets_overlap(&config_paths, &directory_paths) {
                     return Err(format!(
                         "configuration file {} must be outside mapped Supernote directories",
                         path.display()
@@ -229,16 +241,46 @@ fn resolve_path(base: &Path, value: &mut PathBuf) {
 
 fn normalized_path_key(path: &Path) -> Result<String, String> {
     let resolved = resolve_existing_ancestor(path)?;
-    let value = resolved.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        Ok(value.to_lowercase())
+    Ok(platform_path_key(&resolved))
+}
+
+fn lexical_path_key(path: &Path) -> Result<String, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        Ok(value)
+        std::env::current_dir()
+            .map_err(|error| format!("could not resolve current directory: {error}"))?
+            .join(path)
+    };
+    Ok(platform_path_key(&lexical_normalize(&absolute)))
+}
+
+fn path_key_variants(path: &Path) -> Result<BTreeSet<String>, String> {
+    Ok(BTreeSet::from([
+        lexical_path_key(path)?,
+        normalized_path_key(path)?,
+    ]))
+}
+
+fn platform_path_key(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
     }
 }
 
 fn key_contains_path(directory: &str, candidate: &str) -> bool {
     Path::new(candidate).starts_with(Path::new(directory))
+}
+
+fn path_sets_overlap(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    left.iter().any(|left| {
+        right
+            .iter()
+            .any(|right| key_contains_path(left, right) || key_contains_path(right, left))
+    })
 }
 
 fn boox_paths_conflict(left: &str, right: &str) -> bool {
@@ -531,6 +573,8 @@ pub struct SideTransportState {
     pub uploaded_local_hashes: BTreeMap<String, String>,
     #[serde(default)]
     pub accepted_local_hashes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recovered_source_identities: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_content_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -939,6 +983,33 @@ mod tests {
     }
 
     #[test]
+    fn configuration_load_rejects_checkpoint_companion_as_config_file() {
+        let directory = tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let config_path = state_path.with_extension("json.next");
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path,
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: directory.path().join("boox/book.pdf"),
+                supernote_export_directory: directory.path().join("supernote/outgoing"),
+                supernote_incoming_directory: directory.path().join("supernote/incoming"),
+            }],
+        };
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        assert!(TransportConfig::load(&config_path)
+            .unwrap_err()
+            .contains("checkpoint companion"));
+    }
+
+    #[test]
     fn configuration_rejects_state_path_inside_a_mapped_device_path() {
         let config = TransportConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
@@ -1091,6 +1162,39 @@ mod tests {
             normalized_path_key(&real.join("missing/book.pdf")).unwrap(),
             normalized_path_key(&alias.join("missing/book.pdf")).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configuration_load_rejects_symlink_entry_inside_supernote_outgoing() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let outgoing = directory.path().join("supernote/outgoing");
+        std::fs::create_dir_all(&outgoing).unwrap();
+        let target = directory.path().join("transport-config.json");
+        let entry = outgoing.join("transport-config-link.json");
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: directory.path().join("state.json"),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: directory.path().join("boox/book.pdf"),
+                supernote_export_directory: outgoing,
+                supernote_incoming_directory: directory.path().join("supernote/incoming"),
+            }],
+        };
+        std::fs::write(&target, serde_json::to_vec(&config).unwrap()).unwrap();
+        symlink(&target, &entry).unwrap();
+
+        assert!(TransportConfig::load(&entry)
+            .unwrap_err()
+            .contains("mapped Supernote"));
     }
 
     #[cfg(unix)]

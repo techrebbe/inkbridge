@@ -17,6 +17,7 @@ const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
 const SOURCE_REVISION: &str = "inkbridge-source-revision";
 const SOURCE_VIEW_SHA256: &str = "inkbridge-source-view-sha256";
 const SOURCE_LOCAL_ID: &str = "inkbridge-source-local-id";
+const SOURCE_PAGE_INDEX: &str = "inkbridge-source-page-index";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 const RECOVERED_MISSING_PREFIX: &str = "inkbridge-missing-accepted://";
 
@@ -198,12 +199,17 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 else {
                     continue;
                 };
-                let source_local_id = object
-                    .metadata
-                    .get(SOURCE_LOCAL_ID)
-                    .filter(|identity| is_sha256(identity))
-                    .cloned()
-                    .unwrap_or_else(|| format!("legacy-revision-{source_revision}"));
+                let source_local_id = match side {
+                    DeviceSide::Boox => object
+                        .metadata
+                        .get(SOURCE_LOCAL_ID)
+                        .filter(|identity| is_sha256(identity))
+                        .cloned()
+                        .unwrap_or_else(|| format!("legacy-revision-{source_revision}")),
+                    DeviceSide::Supernote => {
+                        self.recover_supernote_source_identity(document, state, &object)?
+                    }
+                };
                 if let Some((previous_revision, previous_hash)) =
                     accepted_hashes.get(&source_local_id)
                 {
@@ -262,6 +268,76 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
         }
         Ok(())
+    }
+
+    fn recover_supernote_source_identity(
+        &self,
+        document: &DocumentFolders,
+        state: &mut TransportState,
+        object: &CloudObject,
+    ) -> Result<String, String> {
+        if let Some(page_index) = object.metadata.get(SOURCE_PAGE_INDEX) {
+            let page_index = page_index.parse::<u32>().map_err(|error| {
+                format!(
+                    "accepted Supernote upload {} has invalid page index {page_index}: {error}",
+                    object.path
+                )
+            })?;
+            return Ok(supernote_page_identity(&document.document_id, page_index));
+        }
+        let generation_key = object.generation_key();
+        if let Some(identity) = state
+            .document_mut(&document.document_id)
+            .supernote
+            .recovered_source_identities
+            .get(&generation_key)
+            .filter(|identity| is_sha256(identity))
+            .cloned()
+        {
+            return Ok(identity);
+        }
+
+        // Uploads created before page identities were introduced only carry
+        // a path-derived source ID. Recover their logical page from the small
+        // immutable native-export payload once, then checkpoint the result so
+        // normal polling does not repeatedly download legacy objects.
+        let temporary = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("could not create legacy recovery file: {error}"))?;
+        let recovered = (|| {
+            self.cloud.download(object, temporary.path())?;
+            let bytes = fs::read(temporary.path()).map_err(|error| {
+                format!("could not read {}: {error}", temporary.path().display())
+            })?;
+            let expected_hash = object
+                .metadata
+                .get(SOURCE_VIEW_SHA256)
+                .ok_or_else(|| format!("{} has no source view hash", object.path))?;
+            let actual_hash = sha256_hex(&bytes);
+            if &actual_hash != expected_hash {
+                return Err(format!(
+                    "legacy Supernote upload {} content hash {actual_hash} does not match source view hash {expected_hash}",
+                    object.path
+                ));
+            }
+            let parsed = parse_baseline_bytes(&bytes, &object.path)?;
+            if parsed.source_file_name.as_deref() != Some(document.original_file_name.as_str()) {
+                return Err(format!(
+                    "legacy Supernote upload {} targets {:?}, not configured document {}",
+                    object.path, parsed.source_file_name, document.original_file_name
+                ));
+            }
+            Ok(supernote_page_identity(
+                &document.document_id,
+                parsed.page_index,
+            ))
+        })();
+        let identity = recovered?;
+        state
+            .document_mut(&document.document_id)
+            .supernote
+            .recovered_source_identities
+            .insert(generation_key, identity.clone());
+        Ok(identity)
     }
 
     fn deliver_outputs(
@@ -608,6 +684,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             &temporary,
             &local_key,
             &source_local_id,
+            None,
             &source_hash,
             &payload_hash,
             "boox_operation_manifest",
@@ -714,13 +791,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             // survive export-file renames so accepted revisions supersede the
             // earlier revision instead of leaving an obsolete missing-path
             // sentinel that blocks later BOOX updates.
-            let source_local_id = sha256_hex(
-                format!(
-                    "{}\0supernote-page\0{}",
-                    document.document_id, parsed.page_index
-                )
-                .as_bytes(),
-            );
+            let source_local_id = supernote_page_identity(&document.document_id, parsed.page_index);
             let temporary = sibling_temporary(&export, "native-upload");
             fs::write(&temporary, &bytes)
                 .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
@@ -731,6 +802,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 &temporary,
                 &local_key,
                 &source_local_id,
+                Some(parsed.page_index),
                 &content_hash,
                 &content_hash,
                 "device_view",
@@ -764,6 +836,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         payload_path: &Path,
         local_key: &str,
         source_local_id: &str,
+        source_page_index: Option<u32>,
         local_hash: &str,
         payload_hash: &str,
         payload_kind: &str,
@@ -792,7 +865,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             &local_hash[..16],
             extension
         );
-        let metadata = BTreeMap::from([
+        let mut metadata = BTreeMap::from([
             (DOCUMENT_ID.to_owned(), document.document_id.clone()),
             (SOURCE_REVISION.to_owned(), source_revision.to_string()),
             (
@@ -809,6 +882,9 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             (SOURCE_VIEW_SHA256.to_owned(), local_hash.to_owned()),
             (SOURCE_LOCAL_ID.to_owned(), source_local_id.to_owned()),
         ]);
+        if let Some(page_index) = source_page_index {
+            metadata.insert(SOURCE_PAGE_INDEX.to_owned(), page_index.to_string());
+        }
         let object = self
             .cloud
             .upload_create(payload_path, &object_path, &metadata)?;
@@ -890,6 +966,10 @@ fn required_metadata<'a>(object: &'a CloudObject, key: &str) -> Result<&'a str, 
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn supernote_page_identity(document_id: &str, page_index: u32) -> String {
+    sha256_hex(format!("{document_id}\0supernote-page\0{page_index}").as_bytes())
 }
 
 fn parse_revision_metadata(object: &CloudObject) -> Result<RevisionPair, String> {

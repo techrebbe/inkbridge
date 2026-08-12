@@ -21,12 +21,14 @@ const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
 const SOURCE_REVISION: &str = "inkbridge-source-revision";
 const SOURCE_VIEW_SHA256: &str = "inkbridge-source-view-sha256";
 const SOURCE_LOCAL_ID: &str = "inkbridge-source-local-id";
+const SOURCE_PAGE_INDEX: &str = "inkbridge-source-page-index";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 
 #[derive(Default)]
 struct FakeCloud {
     objects: Mutex<Vec<(CloudObject, Vec<u8>)>>,
     next_generation: Mutex<u64>,
+    downloads: Mutex<u64>,
 }
 
 impl FakeCloud {
@@ -78,6 +80,7 @@ impl CloudFolder for FakeCloud {
     }
 
     fn download(&self, object: &CloudObject, destination: &Path) -> Result<(), String> {
+        *self.downloads.lock().unwrap() += 1;
         let objects = self.objects.lock().unwrap();
         let (_, bytes) = objects
             .iter()
@@ -174,7 +177,14 @@ fn mapping(root: &Path) -> DocumentFolders {
 }
 
 fn native_export() -> Vec<u8> {
-    br#"{"sourceFileName":"book.pdf","pageIndex":0,"strokes":[{"sourceUuid":"s1","sourceKey":"s1","layerNum":0,"thickness":2,"penColor":0,"penType":16,"samples":[[0.1,0.2,900],[0.2,0.3,1000]]}]}"#.to_vec()
+    native_export_page(0, "s1")
+}
+
+fn native_export_page(page_index: u32, source_uuid: &str) -> Vec<u8> {
+    format!(
+        r#"{{"sourceFileName":"book.pdf","pageIndex":{page_index},"strokes":[{{"sourceUuid":"{source_uuid}","sourceKey":"{source_uuid}","layerNum":0,"thickness":2,"penColor":0,"penType":16,"samples":[[0.1,0.2,900],[0.2,0.3,1000]]}}]}}"#
+    )
+    .into_bytes()
 }
 
 fn generated_metadata(
@@ -238,6 +248,14 @@ fn supernote_export_upload_is_revisioned_and_duplicate_scan_is_idempotent() {
         Some(&sha256_hex(
             format!("{}\0supernote-page\0{}", document.document_id, 0).as_bytes()
         ))
+    );
+    assert_eq!(
+        cloud.objects.lock().unwrap()[0]
+            .0
+            .metadata
+            .get(SOURCE_PAGE_INDEX)
+            .map(String::as_str),
+        Some("0")
     );
 
     let second = transport
@@ -439,18 +457,22 @@ fn lost_checkpoint_recovery_preserves_an_unmatched_accepted_baseline() {
     fs::create_dir_all(&document.supernote_export_directory).unwrap();
     fs::write(&document.boox_pdf, b"edited BOOX view").unwrap();
     let present = document.supernote_export_directory.join("page-1.json");
-    let present_bytes = native_export();
+    let present_bytes = native_export_page(0, "present");
     fs::write(&present, &present_bytes).unwrap();
     let present_hash = sha256_hex(&present_bytes);
-    let missing_hash = sha256_hex(b"accepted page that disappeared");
+    let missing_bytes = native_export_page(1, "missing");
+    let missing_hash = sha256_hex(&missing_bytes);
     let cloud = FakeCloud::default();
-    for (revision, hash) in [(1_u64, missing_hash.clone()), (2, present_hash)] {
+    for (revision, bytes, hash) in [
+        (1_u64, missing_bytes, missing_hash.clone()),
+        (2, present_bytes, present_hash),
+    ] {
         cloud.put(
             &format!(
                 "Supernote_Folder/{}/uploads/supernote-r{revision}.json",
                 document.document_id
             ),
-            b"accepted export".to_vec(),
+            bytes,
             BTreeMap::from([
                 (DOCUMENT_ID.to_owned(), document.document_id.clone()),
                 (SOURCE_REVISION.to_owned(), revision.to_string()),
@@ -476,18 +498,21 @@ fn lost_checkpoint_recovery_preserves_an_unmatched_accepted_baseline() {
         .sync_document(&document, &mut state, SystemTime::now())
         .unwrap();
 
+    let missing_identity =
+        sha256_hex(format!("{}\0supernote-page\0{}", document.document_id, 1).as_bytes());
+    let missing_key = format!("inkbridge-missing-accepted://{missing_identity}/1");
     assert!(report.actions.iter().any(|action| matches!(
         action,
         TransportAction::Deferred {
             side: DeviceSide::Boox,
             reason,
         } if reason.contains("accepted Supernote baseline files are missing")
-            && reason.contains("inkbridge-missing-accepted://legacy-revision-1/1")
+            && reason.contains(&missing_key)
     )));
     assert_eq!(
         state.documents[&document.document_id]
             .supernote
-            .accepted_local_hashes["inkbridge-missing-accepted://legacy-revision-1/1"],
+            .accepted_local_hashes[&missing_key],
         missing_hash
     );
     assert!(!cloud.objects.lock().unwrap().iter().any(|(object, _)| {
@@ -581,22 +606,38 @@ fn recovery_retires_an_older_page_identity_after_rename_and_edit() {
     let page_identity =
         sha256_hex(format!("{}\0supernote-page\0{}", document.document_id, 0).as_bytes());
     let cloud = FakeCloud::default();
-    for (revision, bytes, hash) in [
-        (1_u64, old_bytes, old_hash.clone()),
-        (2_u64, new_bytes, new_hash.clone()),
+    for (revision, bytes, hash, source_identity, page_index) in [
+        (
+            1_u64,
+            old_bytes,
+            old_hash.clone(),
+            sha256_hex(old_key.as_bytes()),
+            None,
+        ),
+        (
+            2_u64,
+            new_bytes,
+            new_hash.clone(),
+            page_identity.clone(),
+            Some("0".to_owned()),
+        ),
     ] {
+        let mut metadata = BTreeMap::from([
+            (DOCUMENT_ID.to_owned(), document.document_id.clone()),
+            (SOURCE_REVISION.to_owned(), revision.to_string()),
+            (SOURCE_VIEW_SHA256.to_owned(), hash),
+            (SOURCE_LOCAL_ID.to_owned(), source_identity),
+        ]);
+        if let Some(page_index) = page_index {
+            metadata.insert(SOURCE_PAGE_INDEX.to_owned(), page_index);
+        }
         cloud.put(
             &format!(
                 "Supernote_Folder/{}/uploads/supernote-r{revision}.json",
                 document.document_id
             ),
             bytes,
-            BTreeMap::from([
-                (DOCUMENT_ID.to_owned(), document.document_id.clone()),
-                (SOURCE_REVISION.to_owned(), revision.to_string()),
-                (SOURCE_VIEW_SHA256.to_owned(), hash),
-                (SOURCE_LOCAL_ID.to_owned(), page_identity.clone()),
-            ]),
+            metadata,
         );
     }
     let mut state = TransportState::empty();
@@ -633,6 +674,16 @@ fn recovery_retires_an_older_page_identity_after_rename_and_edit() {
             ..
         }
     )));
+    assert_eq!(*cloud.downloads.lock().unwrap(), 1);
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert_eq!(
+        *cloud.downloads.lock().unwrap(),
+        1,
+        "the checkpointed legacy page identity should avoid another download"
+    );
 }
 
 #[test]
