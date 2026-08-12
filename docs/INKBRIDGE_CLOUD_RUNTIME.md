@@ -51,7 +51,10 @@ both records. It performs destination uploads with `ifGenerationMatch`; after
 each output, the outbox records the returned generation. Only after every
 object exists with the expected bytes and metadata does another atomic
 Firestore commit promote the pending canonical-state pointer to active and mark
-the outbox delivered.
+the outbox delivered. The runtime then deletes only the finalized output
+payload generations from `BrokerOutbox/`; the canonical-state payload remains
+the active state evidence. Cleanup is best-effort after finalization, so failure
+can leak storage but cannot invalidate published state or block recovery.
 
 This ordering provides these invariants:
 
@@ -123,9 +126,12 @@ shared payload buffer instead of constructing a second full multipart body.
 The deployment reserves 2 vCPU and 8 GiB only while a request is active, uses
 concurrency one, allows up to 15 minutes for unusually large PDFs, and still
 scales to zero. Live `Staging/` objects expire after one day and live
-`BrokerOutbox/` payloads after seven days; archived versions of those transient
-prefixes expire after one day. Originals, device generations that may still be
-canonical evidence, and conflicts are intentionally not auto-deleted.
+`Staging/` archived versions expire one day later. `BrokerOutbox/` is excluded
+from age-based lifecycle cleanup because a pending Firestore commit may need an
+exact payload generation for arbitrarily delayed recovery. The runtime removes
+those payloads by generation only after successful finalization. Originals,
+device generations that may still be canonical evidence, and conflicts are
+intentionally not auto-deleted.
 
 ## Authentication and local validation
 

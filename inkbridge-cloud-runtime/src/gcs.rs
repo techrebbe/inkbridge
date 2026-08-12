@@ -261,6 +261,25 @@ impl ObjectStore for GoogleCloudStorage {
             metadata: metadata.metadata,
         })
     }
+
+    fn delete_generation(&self, path: &str, generation: u64) -> Result<(), String> {
+        let response = self.transport.execute(HttpRequest {
+            method: "DELETE".to_owned(),
+            url: format!(
+                "{}?generation={generation}&ifGenerationMatch={generation}",
+                self.metadata_url(path)
+            ),
+            headers: self.authorized_headers()?,
+            body: HttpBody::empty(),
+        })?;
+        if matches!(response.status, 200 | 204 | 404) {
+            return Ok(());
+        }
+        Err(format!(
+            "Cloud Storage generation delete for {path}@{generation} returned HTTP {}",
+            response.status
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -353,5 +372,30 @@ mod tests {
         let requests = transport.requests.lock().unwrap();
         assert!(requests[0].url.ends_with("?generation=17"));
         assert!(requests[1].url.contains("alt=media&generation=17"));
+    }
+
+    #[test]
+    fn outbox_cleanup_deletes_only_the_finalized_generation() {
+        let transport = Arc::new(RecordingTransport::default());
+        transport.responses.lock().unwrap().push(HttpResponse {
+            status: 204,
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        });
+        let storage = GoogleCloudStorage::new(
+            "private-bucket",
+            transport.clone(),
+            Arc::new(StaticTokenProvider("token".to_owned())),
+        );
+
+        storage
+            .delete_generation("BrokerOutbox/doc/commit/0000.payload", 23)
+            .unwrap();
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[0].method, "DELETE");
+        assert!(requests[0].url.ends_with(
+            "BrokerOutbox%2Fdoc%2Fcommit%2F0000%2Epayload?generation=23&ifGenerationMatch=23"
+        ));
     }
 }

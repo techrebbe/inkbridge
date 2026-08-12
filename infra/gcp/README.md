@@ -113,13 +113,16 @@ versions after seven days. Move `deployed-current` to the new digest only when
 the matching runtime apply is ready. The dedicated build-source bucket deletes
 source archives after one day, and the builder can read that bucket but not the
 device-data bucket. The data bucket deletes live `Staging/` objects after one
-day, live `BrokerOutbox/` payloads after seven days, and archived generations
-of either transient prefix after one day. It does not automatically delete
-originals, conflicts, or device generations that may still be revision
-evidence. Cloud Run remains private, uses zero minimum instances, one maximum
-instance, concurrency one, 2 vCPU, 8 GiB memory, and a 15-minute request
-timeout. Those resources are billed only while a request is active because the
-service still scales to zero.
+day and their archived generations one day later. `BrokerOutbox/` is excluded
+from age-based lifecycle rules because a pending Firestore commit may require
+its exact generation indefinitely; the runtime deletes each output payload by
+generation only after that commit is finalized. Cleanup failure may leak a
+delivered payload but cannot break recovery. Originals, conflicts, and device
+generations that may still be revision evidence are not automatically deleted.
+Cloud Run remains private, uses zero minimum instances, one maximum instance,
+concurrency one, 2 vCPU, 8 GiB memory, and a 15-minute request timeout. Those
+resources are billed only while a request is active because the service still
+scales to zero.
 
 ## Planned resources
 

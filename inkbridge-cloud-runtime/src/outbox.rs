@@ -67,6 +67,7 @@ pub trait ObjectStore: Send + Sync {
             .map(|object| object.filter(|candidate| candidate.generation == generation))
     }
     fn conditional_write(&self, write: &ConditionalWrite) -> Result<StoredObject, CommitError>;
+    fn delete_generation(&self, path: &str, generation: u64) -> Result<(), String>;
 }
 
 #[derive(Clone, Default)]
@@ -288,6 +289,22 @@ impl ObjectStore for MemoryObjectStore {
             .insert((write.path.clone(), object.generation), object.clone());
         Ok(object)
     }
+
+    fn delete_generation(&self, path: &str, generation: u64) -> Result<(), String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "object lock was poisoned".to_owned())?;
+        if inner
+            .objects
+            .get(path)
+            .is_some_and(|object| object.generation == generation)
+        {
+            inner.objects.remove(path);
+        }
+        inner.versions.remove(&(path.to_owned(), generation));
+        Ok(())
+    }
 }
 
 pub struct CloudBrokerStorage {
@@ -360,6 +377,20 @@ impl CloudBrokerStorage {
             delivered_objects.push(object);
         }
         self.states.finalize(&pending).map_err(CommitError::Other)?;
+        // Only finalized commits may release their immutable delivery payloads. Cleanup is
+        // generation-conditional and best-effort: a failure can leak storage, but it must never
+        // roll back published state or make a pending commit unrecoverable.
+        for write in &pending.object_writes {
+            if let Err(error) = self
+                .objects
+                .delete_generation(&write.payload.path, write.payload.generation)
+            {
+                eprintln!(
+                    "failed to remove delivered outbox payload {}@{}: {error}",
+                    write.payload.path, write.payload.generation
+                );
+            }
+        }
         Ok(delivered_objects)
     }
 
@@ -665,6 +696,13 @@ mod tests {
         let error = storage.commit(writes()).unwrap_err();
         assert!(matches!(error, CommitError::Other(_)));
         assert!(storage.read(&state_path("doc")).unwrap().is_none());
+        assert!(objects
+            .inner
+            .lock()
+            .unwrap()
+            .objects
+            .keys()
+            .any(|path| path.starts_with("BrokerOutbox/")));
         let first_generation = objects
             .read("BOOX_Folder/doc/view.pdf")
             .unwrap()
@@ -691,6 +729,15 @@ mod tests {
             b"state"
         );
         assert!(states.record("doc").unwrap().pending.is_none());
+        let inner = objects.inner.lock().unwrap();
+        assert!(inner
+            .objects
+            .keys()
+            .all(|path| !path.starts_with("BrokerOutbox/")));
+        assert!(inner
+            .versions
+            .keys()
+            .all(|(path, _)| !path.starts_with("BrokerOutbox/")));
     }
 
     #[test]

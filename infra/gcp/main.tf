@@ -75,20 +75,8 @@ resource "google_storage_bucket" "sync" {
 
   lifecycle_rule {
     condition {
-      age            = 7
-      matches_prefix = ["BrokerOutbox/"]
-      with_state     = "LIVE"
-    }
-
-    action {
-      type = "Delete"
-    }
-  }
-
-  lifecycle_rule {
-    condition {
       days_since_noncurrent_time = 1
-      matches_prefix             = ["Staging/", "BrokerOutbox/"]
+      matches_prefix             = ["Staging/"]
       with_state                 = "ARCHIVED"
     }
 
