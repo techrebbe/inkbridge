@@ -76,9 +76,14 @@ impl TransportConfig {
         let mut ids = BTreeSet::new();
         let mut boox_paths = BTreeSet::new();
         let mut supernote_paths = BTreeSet::new();
-        let state_path = (!self.state_path.as_os_str().is_empty())
-            .then(|| normalized_path_key(&self.state_path))
-            .transpose()?;
+        let state_paths = if self.state_path.as_os_str().is_empty() {
+            Vec::new()
+        } else {
+            state_reserved_paths(&self.state_path)
+                .into_iter()
+                .map(|path| normalized_path_key(&path).map(|key| (path, key)))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         for document in &self.documents {
             if !document.document_id.starts_with("inkbridge-doc-v1-")
                 || document.document_id.contains(['/', '\\'])
@@ -98,10 +103,12 @@ impl TransportConfig {
                     document.boox_pdf.display()
                 ));
             }
-            if state_path.as_deref() == Some(boox_path.as_str()) {
+            if let Some((reserved_path, _)) = state_paths.iter().find(|(_, state)| {
+                key_contains_path(state, &boox_path) || key_contains_path(&boox_path, state)
+            }) {
                 return Err(format!(
-                    "statePath {} collides with BOOX file {}",
-                    self.state_path.display(),
+                    "statePath or companion {} collides with BOOX file {}",
+                    reserved_path.display(),
                     document.boox_pdf.display()
                 ));
             }
@@ -128,13 +135,12 @@ impl TransportConfig {
                         directory.display()
                     ));
                 }
-                if state_path
-                    .as_deref()
-                    .is_some_and(|state| key_contains_path(&key, state))
-                {
+                if let Some((reserved_path, _)) = state_paths.iter().find(|(_, state)| {
+                    key_contains_path(&key, state) || key_contains_path(state, &key)
+                }) {
                     return Err(format!(
-                        "statePath {} must be outside Supernote {direction} directory {}",
-                        self.state_path.display(),
+                        "statePath or companion {} must be outside Supernote {direction} directory {}",
+                        reserved_path.display(),
                         directory.display()
                     ));
                 }
@@ -142,6 +148,15 @@ impl TransportConfig {
         }
         Ok(())
     }
+}
+
+fn state_reserved_paths(path: &Path) -> [PathBuf; 4] {
+    [
+        path.to_path_buf(),
+        path.with_extension("json.next"),
+        path.with_extension("json.previous"),
+        path.with_extension("json.lock"),
+    ]
 }
 
 fn resolve_path(base: &Path, value: &mut PathBuf) {
@@ -186,6 +201,24 @@ fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
                 return Ok(lexical_normalize(&resolved));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "mapped path {} contains dangling symlink {}",
+                            path.display(),
+                            ancestor.display()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(metadata_error) => {
+                        return Err(format!(
+                            "could not inspect mapped path component {}: {metadata_error}",
+                            ancestor.display()
+                        ));
+                    }
+                }
                 let component = ancestor.components().next_back().ok_or_else(|| {
                     format!("could not find an existing ancestor for {}", path.display())
                 })?;
@@ -310,10 +343,8 @@ impl TransportState {
             }
             return Err(format!("could not publish {}: {error}", path.display()));
         }
-        if had_current {
-            remove_file_if_exists(&previous)
-                .map_err(|error| format!("could not retire previous state: {error}"))?;
-        }
+        remove_file_if_exists(&previous)
+            .map_err(|error| format!("could not retire previous state: {error}"))?;
         Ok(())
     }
 
@@ -608,6 +639,50 @@ mod tests {
     }
 
     #[test]
+    fn configuration_rejects_checkpoint_companion_collisions() {
+        for companion in ["state.json.next", "state.json.previous", "state.json.lock"] {
+            let config = TransportConfig {
+                schema_version: CONFIG_SCHEMA_VERSION,
+                bucket: "bucket".to_owned(),
+                gcloud_command: default_gcloud(),
+                poll_seconds: 1,
+                settle_seconds: 0,
+                state_path: PathBuf::from("state.json"),
+                documents: vec![DocumentFolders {
+                    document_id: "inkbridge-doc-v1-test".to_owned(),
+                    original_file_name: "book.pdf".to_owned(),
+                    boox_pdf: PathBuf::from(companion),
+                    supernote_export_directory: PathBuf::from("supernote/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+                }],
+            };
+
+            assert!(config.validate().unwrap_err().contains("collides"));
+        }
+    }
+
+    #[test]
+    fn configuration_rejects_state_path_above_a_mapped_directory() {
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::from("supernote"),
+            documents: vec![DocumentFolders {
+                document_id: "inkbridge-doc-v1-test".to_owned(),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: PathBuf::from("boox/book.pdf"),
+                supernote_export_directory: PathBuf::from("supernote/outgoing"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+        };
+
+        assert!(config.validate().unwrap_err().contains("must be outside"));
+    }
+
+    #[test]
     fn failed_state_publication_does_not_delete_the_recovery_checkpoint() {
         let directory = tempdir().unwrap();
         let state_path = directory.path().join("state.json");
@@ -634,5 +709,20 @@ mod tests {
             normalized_path_key(&real.join("missing/book.pdf")).unwrap(),
             normalized_path_key(&alias.join("missing/book.pdf")).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_ancestors_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("missing-target");
+        let alias = directory.path().join("alias");
+        symlink(&target, &alias).unwrap();
+
+        assert!(normalized_path_key(&alias.join("book.pdf"))
+            .unwrap_err()
+            .contains("dangling symlink"));
     }
 }
