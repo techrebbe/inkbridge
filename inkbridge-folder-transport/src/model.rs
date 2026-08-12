@@ -74,8 +74,8 @@ impl TransportConfig {
             return Err("at least one document mapping is required".to_owned());
         }
         let mut ids = BTreeSet::new();
-        let mut boox_paths = BTreeSet::new();
-        let mut supernote_paths = BTreeSet::new();
+        let mut boox_paths = BTreeSet::<String>::new();
+        let mut supernote_paths = BTreeSet::<String>::new();
         let state_paths = if self.state_path.as_os_str().is_empty() {
             Vec::new()
         } else {
@@ -100,6 +100,14 @@ impl TransportConfig {
             if !boox_paths.insert(boox_path.clone()) {
                 return Err(format!(
                     "duplicate booxPdf mapping {}",
+                    document.boox_pdf.display()
+                ));
+            }
+            if supernote_paths.iter().any(|directory| {
+                key_contains_path(directory, &boox_path) || key_contains_path(&boox_path, directory)
+            }) {
+                return Err(format!(
+                    "BOOX file {} overlaps a mapped Supernote directory",
                     document.boox_pdf.display()
                 ));
             }
@@ -132,6 +140,15 @@ impl TransportConfig {
                 if !supernote_paths.insert(key.clone()) {
                     return Err(format!(
                         "Supernote {direction} directory {} is shared by multiple mappings or directions",
+                        directory.display()
+                    ));
+                }
+                if boox_paths
+                    .iter()
+                    .any(|boox| key_contains_path(&key, boox) || key_contains_path(boox, &key))
+                {
+                    return Err(format!(
+                        "Supernote {direction} directory {} overlaps a mapped BOOX file",
                         directory.display()
                     ));
                 }
@@ -680,26 +697,64 @@ mod tests {
     }
 
     #[test]
-    fn configuration_rejects_state_below_a_filesystem_root_mapping() {
+    fn filesystem_root_contains_descendant_paths() {
         let current = std::env::current_dir().unwrap();
         let root = current.ancestors().last().unwrap();
+        let root_key = normalized_path_key(root).unwrap();
+        let state_key = normalized_path_key(&root.join("inkbridge-state.json")).unwrap();
+
+        assert!(key_contains_path(&root_key, &state_key));
+    }
+
+    #[test]
+    fn configuration_rejects_overlap_between_boox_and_supernote_paths() {
         let config = TransportConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             bucket: "bucket".to_owned(),
             gcloud_command: default_gcloud(),
             poll_seconds: 1,
             settle_seconds: 0,
-            state_path: root.join("inkbridge-state.json"),
+            state_path: PathBuf::from("state.json"),
             documents: vec![DocumentFolders {
                 document_id: "inkbridge-doc-v1-test".to_owned(),
                 original_file_name: "book.pdf".to_owned(),
-                boox_pdf: root.join("inkbridge-boox-book.pdf"),
-                supernote_export_directory: root.to_path_buf(),
-                supernote_incoming_directory: root.join("inkbridge-supernote-incoming"),
+                boox_pdf: PathBuf::from("shared/book.pdf"),
+                supernote_export_directory: PathBuf::from("shared"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
             }],
         };
 
-        assert!(config.validate().unwrap_err().contains("must be outside"));
+        assert!(config.validate().unwrap_err().contains("overlaps"));
+    }
+
+    #[test]
+    fn configuration_rejects_cross_document_boox_supernote_overlap() {
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::from("state.json"),
+            documents: vec![
+                DocumentFolders {
+                    document_id: "inkbridge-doc-v1-first".to_owned(),
+                    original_file_name: "first.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("first/book.pdf"),
+                    supernote_export_directory: PathBuf::from("shared"),
+                    supernote_incoming_directory: PathBuf::from("first/incoming"),
+                },
+                DocumentFolders {
+                    document_id: "inkbridge-doc-v1-second".to_owned(),
+                    original_file_name: "second.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("shared/second.pdf"),
+                    supernote_export_directory: PathBuf::from("second/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("second/incoming"),
+                },
+            ],
+        };
+
+        assert!(config.validate().unwrap_err().contains("overlaps"));
     }
 
     #[test]

@@ -365,6 +365,61 @@ fn boox_update_uploads_compact_manifest_instead_of_large_pdf() {
 }
 
 #[test]
+fn boox_upload_waits_when_an_accepted_baseline_file_is_missing() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    fs::write(&document.boox_pdf, b"edited BOOX view").unwrap();
+    let present = document.supernote_export_directory.join("page-1.json");
+    let missing = document.supernote_export_directory.join("page-2.json");
+    let present_bytes = native_export();
+    let missing_bytes = native_export();
+    fs::write(&present, &present_bytes).unwrap();
+    fs::write(&missing, &missing_bytes).unwrap();
+    let present_key = path_key(&present);
+    let missing_key = path_key(&missing);
+    fs::remove_file(&missing).unwrap();
+    let accepted = BTreeMap::from([
+        (present_key.clone(), sha256_hex(&present_bytes)),
+        (missing_key.clone(), sha256_hex(&missing_bytes)),
+    ]);
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            supernote: SideTransportState {
+                uploaded_local_hashes: accepted.clone(),
+                accepted_local_hashes: accepted,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let cloud = FakeCloud::default();
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("accepted Supernote baseline files are missing")
+            && reason.contains(&missing_key)
+    )));
+    assert!(!cloud.objects.lock().unwrap().iter().any(|(object, _)| {
+        object
+            .path
+            .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
+    }));
+}
+
+#[test]
 fn boox_skip_rehashes_a_settled_file_when_size_and_mtime_look_unchanged() {
     let root = tempdir().unwrap();
     let document = mapping(root.path());

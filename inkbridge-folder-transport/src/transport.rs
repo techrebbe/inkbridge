@@ -450,6 +450,25 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             .document_mut(&document.document_id)
             .supernote
             .accepted_local_hashes;
+        let current_baseline_keys = baseline_candidates
+            .iter()
+            .map(|candidate| canonical_path_key(candidate))
+            .collect::<std::collections::BTreeSet<_>>();
+        let missing_accepted = accepted
+            .keys()
+            .filter(|key| !current_baseline_keys.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_accepted.is_empty() {
+            report.actions.push(TransportAction::Deferred {
+                side: DeviceSide::Boox,
+                reason: format!(
+                    "BOOX edit is ready, but accepted Supernote baseline files are missing: {}",
+                    missing_accepted.join(", ")
+                ),
+            });
+            return Ok(());
+        }
         let mut baselines = Vec::new();
         let mut baseline_hashes = Vec::new();
         let mut unaccepted = Vec::new();
