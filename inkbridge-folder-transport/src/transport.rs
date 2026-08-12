@@ -361,13 +361,28 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             .observations
             .get(&local_key)
             .and_then(|observation| observation.content_sha256.clone());
-        if let Some(source_hash) = cached_source_hash.as_deref() {
+        if cached_source_hash.is_some() {
+            // Size and mtime establish that a file has settled, but they are not
+            // a content identity: sync tools can replace a file while preserving
+            // both. Verify the bytes before suppressing a potentially large BOOX
+            // conversion as already delivered or uploaded.
+            let source_hash = sha256_file(&document.boox_pdf)?;
+            state
+                .observations
+                .get_mut(&local_key)
+                .ok_or_else(|| {
+                    format!(
+                        "settled observation disappeared for {}",
+                        document.boox_pdf.display()
+                    )
+                })?
+                .content_sha256 = Some(source_hash.clone());
             let side = &state.document_mut(&document.document_id).boox;
-            if side.delivered_content_sha256.as_deref() == Some(source_hash)
+            if side.delivered_content_sha256.as_deref() == Some(source_hash.as_str())
                 || side
                     .uploaded_local_hashes
                     .get(&local_key)
-                    .is_some_and(|hash| hash == source_hash)
+                    .is_some_and(|hash| hash == &source_hash)
             {
                 return Ok(());
             }

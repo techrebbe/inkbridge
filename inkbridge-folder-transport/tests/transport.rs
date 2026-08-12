@@ -5,8 +5,8 @@ use inkbridge_broker::{
 use inkbridge_convert::{geometry_fingerprint, Manifest, Operation, StrokeSnapshot};
 use inkbridge_folder_transport::{
     BooxManifestBuilder, BuiltBooxManifest, CloudFolder, CloudObject, DocumentFolders,
-    DocumentTransportState, FolderTransport, NativeBooxManifestBuilder, PendingUpload,
-    SideTransportState, TransportAction, TransportState,
+    DocumentTransportState, FileObservation, FolderTransport, NativeBooxManifestBuilder,
+    PendingUpload, SideTransportState, TransportAction, TransportState,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -93,6 +93,17 @@ impl BooxManifestBuilder for FakeBuilder {
         Ok(BuiltBooxManifest {
             bytes: b"{\"schemaVersion\":1}\n".to_vec(),
             source_pdf_sha256: "f".repeat(64),
+        })
+    }
+}
+
+struct HashingBuilder;
+
+impl BooxManifestBuilder for HashingBuilder {
+    fn build(&self, pdf: &Path, _baselines: &[PathBuf]) -> Result<BuiltBooxManifest, String> {
+        Ok(BuiltBooxManifest {
+            bytes: b"{\"schemaVersion\":1}\n".to_vec(),
+            source_pdf_sha256: sha256_hex(&fs::read(pdf).unwrap()),
         })
     }
 }
@@ -299,6 +310,86 @@ fn boox_update_uploads_compact_manifest_instead_of_large_pdf() {
         Some("boox_operation_manifest")
     );
     assert_eq!(objects[0].1, b"{\"schemaVersion\":1}\n");
+}
+
+#[test]
+fn boox_skip_rehashes_a_settled_file_when_size_and_mtime_look_unchanged() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let old_bytes = b"old BOOX bytes";
+    let new_bytes = b"new BOOX bytes";
+    assert_eq!(old_bytes.len(), new_bytes.len());
+    fs::write(&document.boox_pdf, new_bytes).unwrap();
+    let export = document.supernote_export_directory.join("page.json");
+    let export_bytes = native_export();
+    fs::write(&export, &export_bytes).unwrap();
+
+    let old_hash = sha256_hex(old_bytes);
+    let new_hash = sha256_hex(new_bytes);
+    let boox_key = path_key(&document.boox_pdf);
+    let export_key = path_key(&export);
+    let export_hash = sha256_hex(&export_bytes);
+    let metadata = fs::metadata(&document.boox_pdf).unwrap();
+    let modified_millis = metadata
+        .modified()
+        .unwrap()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut state = TransportState {
+        documents: BTreeMap::from([(
+            document.document_id.clone(),
+            DocumentTransportState {
+                boox: SideTransportState {
+                    uploaded_local_hashes: BTreeMap::from([(boox_key.clone(), old_hash.clone())]),
+                    ..Default::default()
+                },
+                supernote: SideTransportState {
+                    uploaded_local_hashes: BTreeMap::from([(
+                        export_key.clone(),
+                        export_hash.clone(),
+                    )]),
+                    accepted_local_hashes: BTreeMap::from([(export_key, export_hash)]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]),
+        ..TransportState::empty()
+    };
+    state.observations.insert(
+        boox_key,
+        FileObservation {
+            size: metadata.len(),
+            modified_unix_millis: modified_millis,
+            first_seen_unix_millis: 0,
+            content_sha256: Some(old_hash),
+        },
+    );
+    let cloud = FakeCloud::default();
+    let builder = HashingBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            source_revision: 1,
+            ..
+        }
+    )));
+    assert_eq!(
+        state.documents[&document.document_id]
+            .boox
+            .uploaded_local_hashes[&path_key(&document.boox_pdf)],
+        new_hash
+    );
 }
 
 #[test]
