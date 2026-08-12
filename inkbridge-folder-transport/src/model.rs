@@ -141,12 +141,15 @@ impl TransportConfig {
                 ("incoming", &document.supernote_incoming_directory),
             ] {
                 let key = normalized_path_key(directory)?;
-                if !supernote_paths.insert(key.clone()) {
+                if supernote_paths.iter().any(|existing| {
+                    key_contains_path(existing, &key) || key_contains_path(&key, existing)
+                }) {
                     return Err(format!(
-                        "Supernote {direction} directory {} is shared by multiple mappings or directions",
+                        "Supernote {direction} directory {} overlaps a directory used by another mapping or direction",
                         directory.display()
                     ));
                 }
+                supernote_paths.insert(key.clone());
                 if boox_paths
                     .iter()
                     .any(|boox| boox_mapping_overlaps_path(boox, &key))
@@ -837,7 +840,45 @@ mod tests {
             ],
         };
 
-        assert!(config.validate().unwrap_err().contains("is shared"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("overlaps a directory"));
+    }
+
+    #[test]
+    fn configuration_rejects_nested_supernote_directories() {
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::new(),
+            documents: vec![
+                DocumentFolders {
+                    document_id: test_document_id('a'),
+                    original_file_name: "first.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("first/book.pdf"),
+                    supernote_export_directory: PathBuf::from("supernote/root"),
+                    supernote_incoming_directory: PathBuf::from("first/incoming"),
+                },
+                DocumentFolders {
+                    document_id: test_document_id('b'),
+                    original_file_name: "second.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("second/book.pdf"),
+                    supernote_export_directory: PathBuf::from("second/outgoing"),
+                    supernote_incoming_directory: PathBuf::from(
+                        "supernote/root/.event.operations.json.g7.part/incoming",
+                    ),
+                },
+            ],
+        };
+
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("overlaps a directory"));
     }
 
     #[test]

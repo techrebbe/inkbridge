@@ -20,6 +20,7 @@ const DOCUMENT_ID: &str = "inkbridge-document-id";
 const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
 const SOURCE_REVISION: &str = "inkbridge-source-revision";
 const SOURCE_VIEW_SHA256: &str = "inkbridge-source-view-sha256";
+const SOURCE_LOCAL_ID: &str = "inkbridge-source-local-id";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 
 #[derive(Default)]
@@ -485,6 +486,64 @@ fn lost_checkpoint_recovery_preserves_an_unmatched_accepted_baseline() {
             .path
             .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
     }));
+}
+
+#[test]
+fn recovery_replaces_a_stale_accepted_path_after_export_rename() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let old_path = document.supernote_export_directory.join("old-page.json");
+    let new_path = document
+        .supernote_export_directory
+        .join("renamed-page.json");
+    let bytes = native_export();
+    fs::write(&old_path, &bytes).unwrap();
+    let old_key = path_key(&old_path);
+    fs::rename(&old_path, &new_path).unwrap();
+    let new_key = path_key(&new_path);
+    let content_hash = sha256_hex(&bytes);
+    let cloud = FakeCloud::default();
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/uploads/supernote-r1.json",
+            document.document_id
+        ),
+        bytes,
+        BTreeMap::from([
+            (DOCUMENT_ID.to_owned(), document.document_id.clone()),
+            (SOURCE_REVISION.to_owned(), "1".to_owned()),
+            (SOURCE_VIEW_SHA256.to_owned(), content_hash.clone()),
+            (SOURCE_LOCAL_ID.to_owned(), sha256_hex(old_key.as_bytes())),
+        ]),
+    );
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+            supernote: SideTransportState {
+                accepted_local_hashes: BTreeMap::from([(old_key.clone(), content_hash.clone())]),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    let accepted = &state.documents[&document.document_id]
+        .supernote
+        .accepted_local_hashes;
+    assert!(!accepted.contains_key(&old_key));
+    assert_eq!(accepted.get(&new_key), Some(&content_hash));
 }
 
 #[test]

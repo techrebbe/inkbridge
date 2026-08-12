@@ -226,7 +226,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .document_mut(&document.document_id)
                     .supernote
                     .accepted_local_hashes
-                    .retain(|key, _| !key.starts_with(RECOVERED_MISSING_PREFIX));
+                    .clear();
             }
             for (source_local_id, (source_revision, source_hash)) in accepted_hashes {
                 let local_keys = match side {
