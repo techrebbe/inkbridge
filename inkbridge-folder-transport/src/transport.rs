@@ -16,7 +16,9 @@ const DOCUMENT_ID: &str = "inkbridge-document-id";
 const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
 const SOURCE_REVISION: &str = "inkbridge-source-revision";
 const SOURCE_VIEW_SHA256: &str = "inkbridge-source-view-sha256";
+const SOURCE_LOCAL_ID: &str = "inkbridge-source-local-id";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
+const RECOVERED_MISSING_PREFIX: &str = "inkbridge-missing-accepted://";
 
 pub trait BooxManifestBuilder {
     fn build(&self, pdf: &Path, baselines: &[PathBuf]) -> Result<BuiltBooxManifest, String>;
@@ -168,7 +170,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 DeviceSide::Boox => "BOOX_Folder",
                 DeviceSide::Supernote => "Supernote_Folder",
             };
-            let mut accepted_hashes = BTreeMap::<u64, String>::new();
+            let mut accepted_hashes = BTreeMap::<String, (u64, String)>::new();
             for object in self
                 .cloud
                 .list(&format!("{root}/{}/uploads/", document.document_id))?
@@ -196,17 +198,37 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 else {
                     continue;
                 };
-                if let Some(previous) = accepted_hashes.insert(source_revision, source_hash.clone())
+                let source_local_id = object
+                    .metadata
+                    .get(SOURCE_LOCAL_ID)
+                    .filter(|identity| is_sha256(identity))
+                    .cloned()
+                    .unwrap_or_else(|| format!("legacy-revision-{source_revision}"));
+                if let Some((previous_revision, previous_hash)) =
+                    accepted_hashes.get(&source_local_id)
                 {
-                    if previous != source_hash {
+                    if *previous_revision == source_revision && previous_hash != &source_hash {
                         return Err(format!(
                             "accepted {side:?} revision {source_revision} has multiple immutable source views; preserve both inputs before resuming"
                         ));
                     }
                 }
+                if accepted_hashes
+                    .get(&source_local_id)
+                    .is_none_or(|(revision, _)| *revision <= source_revision)
+                {
+                    accepted_hashes.insert(source_local_id, (source_revision, source_hash));
+                }
             }
 
-            for source_hash in accepted_hashes.into_values() {
+            if side == DeviceSide::Supernote {
+                state
+                    .document_mut(&document.document_id)
+                    .supernote
+                    .accepted_local_hashes
+                    .retain(|key, _| !key.starts_with(RECOVERED_MISSING_PREFIX));
+            }
+            for (source_local_id, (source_revision, source_hash)) in accepted_hashes {
                 let local_keys = match side {
                     DeviceSide::Boox => vec![canonical_path_key(&document.boox_pdf)],
                     DeviceSide::Supernote => supernote_files
@@ -215,6 +237,19 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                         .map(|(_, key)| key.clone())
                         .collect(),
                 };
+                if side == DeviceSide::Supernote && local_keys.is_empty() {
+                    state
+                        .document_mut(&document.document_id)
+                        .supernote
+                        .accepted_local_hashes
+                        .insert(
+                            format!(
+                                "{RECOVERED_MISSING_PREFIX}{source_local_id}/{source_revision}"
+                            ),
+                            source_hash,
+                        );
+                    continue;
+                }
                 for local_key in local_keys {
                     let side_state = state.document_mut(&document.document_id).side_mut(side);
                     side_state
@@ -757,6 +792,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             ("inkbridge-sync-ready".to_owned(), "true".to_owned()),
             ("inkbridge-payload-kind".to_owned(), payload_kind.to_owned()),
             (SOURCE_VIEW_SHA256.to_owned(), local_hash.to_owned()),
+            (SOURCE_LOCAL_ID.to_owned(), sha256_hex(local_key.as_bytes())),
         ]);
         let object = self
             .cloud

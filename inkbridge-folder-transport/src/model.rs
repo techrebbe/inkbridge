@@ -210,7 +210,9 @@ fn key_contains_path(directory: &str, candidate: &str) -> bool {
 }
 
 fn boox_paths_conflict(left: &str, right: &str) -> bool {
-    left == right || is_boox_temporary_for(left, right) || is_boox_temporary_for(right, left)
+    left == right
+        || is_at_or_below_boox_temporary(left, right)
+        || is_at_or_below_boox_temporary(right, left)
 }
 
 fn boox_mapping_overlaps_path(boox: &str, other: &str) -> bool {
@@ -219,7 +221,7 @@ fn boox_mapping_overlaps_path(boox: &str, other: &str) -> bool {
         || boox_static_temporary_keys(boox).iter().any(|temporary| {
             key_contains_path(other, temporary) || key_contains_path(temporary, other)
         })
-        || is_boox_temporary_for(other, boox)
+        || is_at_or_below_boox_temporary(other, boox)
 }
 
 fn boox_static_temporary_keys(boox: &str) -> [String; 2] {
@@ -263,6 +265,12 @@ fn is_boox_temporary_for(candidate: &str, boox: &str) -> bool {
         .is_some_and(|generation| {
             !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit())
         })
+}
+
+fn is_at_or_below_boox_temporary(candidate: &str, boox: &str) -> bool {
+    Path::new(candidate)
+        .ancestors()
+        .any(|ancestor| is_boox_temporary_for(&ancestor.to_string_lossy().replace('\\', "/"), boox))
 }
 
 fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, String> {
@@ -683,6 +691,7 @@ mod tests {
             "boox/.book.pdf.compact-upload.part",
             "boox/.book.pdf.previous.part",
             "boox/.book.pdf.g42.part",
+            "boox/.book.pdf.g42.part/nested.pdf",
         ] {
             let config = TransportConfig {
                 schema_version: CONFIG_SCHEMA_VERSION,
@@ -744,9 +753,25 @@ mod tests {
                 supernote_export_directory: PathBuf::from("boox/.book.pdf.compact-upload.part"),
                 supernote_incoming_directory: PathBuf::from("supernote/incoming"),
             }],
-            ..state_collision
+            ..state_collision.clone()
         };
         assert!(supernote_collision
+            .validate()
+            .unwrap_err()
+            .contains("overlaps"));
+
+        let generation_descendant_collision = TransportConfig {
+            state_path: PathBuf::new(),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: PathBuf::from("boox/book.pdf"),
+                supernote_export_directory: PathBuf::from("boox/.book.pdf.g7.part/incoming"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+            ..state_collision
+        };
+        assert!(generation_descendant_collision
             .validate()
             .unwrap_err()
             .contains("overlaps"));

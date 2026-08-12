@@ -18,6 +18,8 @@ use tempfile::tempdir;
 const GENERATED_BY: &str = "inkbridge-generated-by";
 const DOCUMENT_ID: &str = "inkbridge-document-id";
 const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
+const SOURCE_REVISION: &str = "inkbridge-source-revision";
+const SOURCE_VIEW_SHA256: &str = "inkbridge-source-view-sha256";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 
 #[derive(Default)]
@@ -412,6 +414,72 @@ fn boox_upload_waits_when_an_accepted_baseline_file_is_missing() {
         } if reason.contains("accepted Supernote baseline files are missing")
             && reason.contains(&missing_key)
     )));
+    assert!(!cloud.objects.lock().unwrap().iter().any(|(object, _)| {
+        object
+            .path
+            .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
+    }));
+}
+
+#[test]
+fn lost_checkpoint_recovery_preserves_an_unmatched_accepted_baseline() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    fs::write(&document.boox_pdf, b"edited BOOX view").unwrap();
+    let present = document.supernote_export_directory.join("page-1.json");
+    let present_bytes = native_export();
+    fs::write(&present, &present_bytes).unwrap();
+    let present_hash = sha256_hex(&present_bytes);
+    let missing_hash = sha256_hex(b"accepted page that disappeared");
+    let cloud = FakeCloud::default();
+    for (revision, hash) in [(1_u64, missing_hash.clone()), (2, present_hash)] {
+        cloud.put(
+            &format!(
+                "Supernote_Folder/{}/uploads/supernote-r{revision}.json",
+                document.document_id
+            ),
+            b"accepted export".to_vec(),
+            BTreeMap::from([
+                (DOCUMENT_ID.to_owned(), document.document_id.clone()),
+                (SOURCE_REVISION.to_owned(), revision.to_string()),
+                (SOURCE_VIEW_SHA256.to_owned(), hash),
+            ]),
+        );
+    }
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 2,
+            },
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("accepted Supernote baseline files are missing")
+            && reason.contains("inkbridge-missing-accepted://legacy-revision-1/1")
+    )));
+    assert_eq!(
+        state.documents[&document.document_id]
+            .supernote
+            .accepted_local_hashes["inkbridge-missing-accepted://legacy-revision-1/1"],
+        missing_hash
+    );
     assert!(!cloud.objects.lock().unwrap().iter().any(|(object, _)| {
         object
             .path
