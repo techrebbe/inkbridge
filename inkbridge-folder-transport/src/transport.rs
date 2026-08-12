@@ -291,6 +291,9 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 ),
             };
             let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
+            if side == DeviceSide::Boox {
+                reconcile_staged_backup(&local_path, &expected_hash)?;
+            }
             let boox_destination_identity = (side == DeviceSide::Boox)
                 .then(|| file_identity(&local_path))
                 .transpose()?;
@@ -1153,11 +1156,8 @@ fn replace_existing_file_conditionally(
 }
 
 fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String> {
-    match fs::hard_link(source, destination) {
-        Ok(()) => {
-            remove_file_if_exists(source)?;
-            Ok(true)
-        }
+    match rename_create_only(source, destination) {
+        Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             remove_file_if_exists(source)?;
             Ok(false)
@@ -1166,6 +1166,83 @@ fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String
             "could not publish {} as new destination {}: {error}",
             source.display(),
             destination.display()
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn rename_create_only(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileW;
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers for the
+    // duration of the call. MoveFileW has create-only destination semantics.
+    if unsafe { MoveFileW(source.as_ptr(), destination.as_ptr()) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "redox"
+))]
+fn rename_create_only(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(Into::into)
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "redox"
+)))]
+fn rename_create_only(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is not available on this platform",
+    ))
+}
+
+fn reconcile_staged_backup(destination: &Path, published_hash: &str) -> Result<(), String> {
+    let backup = sibling_temporary(destination, "previous");
+    match metadata_if_exists(&backup)? {
+        None => return Ok(()),
+        Some(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "staged BOOX backup {} is not a regular file",
+                backup.display()
+            ));
+        }
+        Some(_) => {}
+    }
+    match file_identity(destination)? {
+        FileIdentity::Missing => restore_staged_file(&backup, destination),
+        FileIdentity::Sha256(current_hash) if current_hash == published_hash => {
+            remove_file_if_exists(&backup)
+        }
+        FileIdentity::Sha256(_) => Err(format!(
+            "both BOOX destination {} and interrupted staged backup {} contain distinct data; preserved both",
+            destination.display(),
+            backup.display()
         )),
     }
 }
@@ -1279,5 +1356,36 @@ mod snapshot_tests {
         assert!(!replace_file(&source, &destination, Some(&FileIdentity::Missing),).unwrap());
         assert_eq!(fs::read(&destination).unwrap(), b"new local edit");
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn interrupted_staged_backup_is_restored_when_destination_is_missing() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("book.pdf");
+        let backup = sibling_temporary(&destination, "previous");
+        fs::write(&backup, b"local file staged before crash").unwrap();
+
+        reconcile_staged_backup(&destination, &sha256_hex(b"broker view")).unwrap();
+
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"local file staged before crash"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn completed_publication_retires_an_interrupted_staged_backup() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("book.pdf");
+        let backup = sibling_temporary(&destination, "previous");
+        let published = b"broker view";
+        fs::write(&destination, published).unwrap();
+        fs::write(&backup, b"previous broker view").unwrap();
+
+        reconcile_staged_backup(&destination, &sha256_hex(published)).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), published);
+        assert!(!backup.exists());
     }
 }
