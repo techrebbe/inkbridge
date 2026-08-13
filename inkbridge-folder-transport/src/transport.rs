@@ -3,7 +3,7 @@ use crate::{
     TransportAction, TransportState,
 };
 use inkbridge_broker::{sha256_hex, DeviceSide, RevisionPair, BROKER_PRODUCER};
-use inkbridge_convert::{build_manifest, parse_baseline_bytes};
+use inkbridge_convert::{build_manifest, parse_baseline_bytes, BaselineExport};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -20,6 +20,8 @@ const SOURCE_LOCAL_ID: &str = "inkbridge-source-local-id";
 const SOURCE_PAGE_INDEX: &str = "inkbridge-source-page-index";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 const RECOVERED_MISSING_PREFIX: &str = "inkbridge-missing-accepted://";
+const MAX_SUPERNOTE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SUPERNOTE_ACK_BYTES: u64 = 256 * 1024;
 
 pub trait BooxManifestBuilder {
     fn build(&self, pdf: &Path, baselines: &[PathBuf]) -> Result<BuiltBooxManifest, String>;
@@ -164,6 +166,14 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 .document_mut(&document.document_id)
                 .revisions
                 .get(side);
+            let side_state = state.document_mut(&document.document_id).side_mut(side);
+            if accepted_revision == 0 {
+                side_state.accepted_source_revisions.clear();
+            } else {
+                side_state
+                    .accepted_source_revisions
+                    .retain(|_, revision| *revision <= accepted_revision);
+            }
             if accepted_revision == 0 {
                 continue;
             }
@@ -235,6 +245,13 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .clear();
             }
             for (source_local_id, (source_revision, source_hash)) in accepted_hashes {
+                let entry = state
+                    .document_mut(&document.document_id)
+                    .side_mut(side)
+                    .accepted_source_revisions
+                    .entry(source_local_id.clone())
+                    .or_insert(source_revision);
+                *entry = (*entry).max(source_revision);
                 let local_keys = match side {
                     DeviceSide::Boox => vec![canonical_path_key(&document.boox_pdf)],
                     DeviceSide::Supernote => supernote_files
@@ -320,12 +337,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 ));
             }
             let parsed = parse_baseline_bytes(&bytes, &object.path)?;
-            if parsed.source_file_name.as_deref() != Some(document.original_file_name.as_str()) {
-                return Err(format!(
-                    "legacy Supernote upload {} targets {:?}, not configured document {}",
-                    object.path, parsed.source_file_name, document.original_file_name
-                ));
-            }
+            validate_supernote_export_identity(&parsed, document, &object.path)?;
             Ok(supernote_page_identity(
                 &document.document_id,
                 parsed.page_index,
@@ -372,18 +384,62 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .get(DOCUMENT_ID)
                     .is_some_and(|id| id == &document.document_id)
         });
-        candidates.sort_by_key(|(_, object)| object.generation);
+        let mut candidates = candidates
+            .into_iter()
+            .map(|(side, object)| {
+                let revisions = parse_revision_metadata(&object)?;
+                Ok((side, object, revisions))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        candidates.sort_by_key(|(_, object, revisions)| {
+            (
+                u128::from(revisions.boox) + u128::from(revisions.supernote),
+                revisions.boox,
+                revisions.supernote,
+                object.generation,
+            )
+        });
 
-        for (side, object) in candidates {
+        for (side, object, revisions) in candidates {
             let generation_key = object.generation_key();
+            let local_path = match side {
+                DeviceSide::Boox => document.boox_pdf.clone(),
+                DeviceSide::Supernote => {
+                    let remote_name = Path::new(&object.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| format!("remote path {} has no file name", object.path))?;
+                    document.supernote_incoming_directory.join(format!(
+                        "r{:020}-r{:020}-g{:020}-{remote_name}",
+                        revisions.boox, revisions.supernote, object.generation
+                    ))
+                }
+            };
+            let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
             if state
                 .document_mut(&document.document_id)
                 .delivered_generations
                 .contains(&generation_key)
             {
+                if side == DeviceSide::Supernote
+                    && !supernote_delivery_is_acknowledged(document, &expected_hash)?
+                {
+                    let installed = metadata_if_exists(&local_path)?
+                        .is_some_and(|metadata| metadata.is_file())
+                        && sha256_file(&local_path).is_ok_and(|hash| hash == expected_hash);
+                    if !installed {
+                        self.download_verified(&object, &local_path, None)?;
+                        remember_file_hash(&local_path, state, SystemTime::now(), &expected_hash)?;
+                        report.actions.push(TransportAction::Delivered {
+                            side,
+                            object_path: object.path,
+                            local_path,
+                            generation: object.generation,
+                        });
+                    }
+                }
                 continue;
             }
-            let revisions = parse_revision_metadata(&object)?;
             let current = state.document_mut(&document.document_id).revisions;
             if !dominates(revisions, current) {
                 state
@@ -392,16 +448,24 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .insert(generation_key);
                 continue;
             }
+            if side == DeviceSide::Supernote
+                && revisions != current
+                && (revisions.boox != current.boox + 1 || revisions.supernote != current.supernote)
+            {
+                report.actions.push(TransportAction::Deferred {
+                    side,
+                    reason: format!(
+                        "broker manifest {} at revisions {}:{} is waiting for predecessor {}:{}",
+                        object.path,
+                        revisions.boox,
+                        revisions.supernote,
+                        current.boox + 1,
+                        current.supernote,
+                    ),
+                });
+                continue;
+            }
 
-            let local_path = match side {
-                DeviceSide::Boox => document.boox_pdf.clone(),
-                DeviceSide::Supernote => document.supernote_incoming_directory.join(
-                    Path::new(&object.path)
-                        .file_name()
-                        .ok_or_else(|| format!("remote path {} has no file name", object.path))?,
-                ),
-            };
-            let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
             if side == DeviceSide::Boox {
                 reconcile_staged_backup(&local_path, &expected_hash)?;
             }
@@ -722,7 +786,21 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         {
             return Ok(());
         }
-        for export in supernote_export_files(&document.supernote_export_directory)? {
+        let exports = supernote_export_files(&document.supernote_export_directory)?;
+        if exports.is_empty() {
+            return Ok(());
+        }
+        if let Some(waiting) = first_unacknowledged_supernote_delivery(document)? {
+            report.actions.push(TransportAction::Deferred {
+                side: DeviceSide::Supernote,
+                reason: format!(
+                    "Supernote export upload is paused until the downloaded manifest {} is applied and acknowledged",
+                    waiting.display()
+                ),
+            });
+            return Ok(());
+        }
+        for export in exports {
             if !file_is_settled(&export, state, now, self.settle)? {
                 continue;
             }
@@ -770,14 +848,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 .ok_or_else(|| format!("settled observation disappeared for {}", export.display()))?
                 .content_sha256 = Some(content_hash.clone());
             let parsed = parse_baseline_bytes(&bytes, &export.to_string_lossy())?;
-            if parsed.source_file_name.as_deref() != Some(document.original_file_name.as_str()) {
-                return Err(format!(
-                    "{} targets {:?}, not configured document {}",
-                    export.display(),
-                    parsed.source_file_name,
-                    document.original_file_name
-                ));
-            }
+            validate_supernote_export_identity(&parsed, document, &export.to_string_lossy())?;
             if state
                 .document_mut(&document.document_id)
                 .supernote
@@ -787,11 +858,59 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             {
                 continue;
             }
+            let current = state.document_mut(&document.document_id).revisions;
+            let exported_at = parsed.based_on.map(|based_on| RevisionPair {
+                boox: based_on.boox,
+                supernote: based_on.supernote,
+            });
             // A Supernote page is the logical local source. Its identity must
             // survive export-file renames so accepted revisions supersede the
             // earlier revision instead of leaving an obsolete missing-path
             // sentinel that blocks later BOOX updates.
             let source_local_id = supernote_page_identity(&document.document_id, parsed.page_index);
+            if exported_at.is_none() && current != RevisionPair::default() {
+                report.actions.push(TransportAction::Deferred {
+                    side: DeviceSide::Supernote,
+                    reason: format!(
+                        "Supernote export {} has no revision frontier but the broker is already at {}:{}; export the page again with the current plugin",
+                        export.display(), current.boox, current.supernote,
+                    ),
+                });
+                return Ok(());
+            }
+            if let Some(exported_at) = exported_at {
+                let same_page_revision = state
+                    .document_mut(&document.document_id)
+                    .supernote
+                    .accepted_source_revisions
+                    .get(&source_local_id)
+                    .copied()
+                    .unwrap_or(0);
+                let unsafe_to_rebase = exported_at.boox != current.boox
+                    || exported_at.supernote > current.supernote
+                    || same_page_revision > exported_at.supernote;
+                if unsafe_to_rebase {
+                    let cause = if exported_at.boox != current.boox {
+                        "the BOOX revision changed"
+                    } else if exported_at.supernote > current.supernote {
+                        "the export is ahead of the current Supernote revision"
+                    } else {
+                        "the same Supernote page changed after this export was captured"
+                    };
+                    report.actions.push(TransportAction::Deferred {
+                        side: DeviceSide::Supernote,
+                        reason: format!(
+                            "Supernote export {} was captured at revisions {}:{} but the current broker frontier is {}:{} and {cause}; export the page again after applying all incoming updates",
+                            export.display(),
+                            exported_at.boox,
+                            exported_at.supernote,
+                            current.boox,
+                            current.supernote,
+                        ),
+                    });
+                    return Ok(());
+                }
+            }
             let temporary = sibling_temporary(&export, "native-upload");
             fs::write(&temporary, &bytes)
                 .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
@@ -1039,6 +1158,114 @@ fn supernote_export_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+pub(crate) fn first_unacknowledged_supernote_delivery(
+    document: &DocumentFolders,
+) -> Result<Option<PathBuf>, String> {
+    let incoming = &document.supernote_incoming_directory;
+    let Some(metadata) = symlink_metadata_if_exists(incoming)? else {
+        return Ok(None);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "configured Supernote incoming path {} is not a regular directory",
+            incoming.display()
+        ));
+    }
+    let mut deliveries = Vec::new();
+    for entry in fs::read_dir(incoming)
+        .map_err(|error| format!("could not read {}: {error}", incoming.display()))?
+    {
+        let path = entry
+            .map_err(|error| {
+                format!(
+                    "could not enumerate an entry in {}: {error}",
+                    incoming.display()
+                )
+            })?
+            .path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| !name.starts_with('.') && name.ends_with(".operations.json"))
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "Supernote incoming delivery {} is not a regular file",
+                path.display()
+            ));
+        }
+        if metadata.len() > MAX_SUPERNOTE_MANIFEST_BYTES {
+            return Err(format!(
+                "Supernote incoming delivery {} exceeds {} bytes",
+                path.display(),
+                MAX_SUPERNOTE_MANIFEST_BYTES
+            ));
+        }
+        deliveries.push(path);
+    }
+    deliveries.sort();
+    for delivery in deliveries {
+        let bytes = fs::read(&delivery)
+            .map_err(|error| format!("could not read {}: {error}", delivery.display()))?;
+        let delivery_id = sha256_hex(&bytes);
+        if !supernote_delivery_is_acknowledged(document, &delivery_id)? {
+            return Ok(Some(delivery));
+        }
+    }
+    Ok(None)
+}
+
+fn supernote_delivery_is_acknowledged(
+    document: &DocumentFolders,
+    delivery_id: &str,
+) -> Result<bool, String> {
+    if !is_sha256(delivery_id) {
+        return Err(format!("invalid Supernote delivery identity {delivery_id}"));
+    }
+    let ack = document
+        .supernote_acknowledged_directory()
+        .join(format!("{delivery_id}.ack.json"));
+    let Some(metadata) = symlink_metadata_if_exists(&ack)? else {
+        return Ok(false);
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_SUPERNOTE_ACK_BYTES
+    {
+        return Err(format!(
+            "Supernote acknowledgement {} is not a valid regular file",
+            ack.display()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(&ack).map_err(|error| format!("could not read {}: {error}", ack.display()))?,
+    )
+    .map_err(|error| {
+        format!(
+            "invalid Supernote acknowledgement {}: {error}",
+            ack.display()
+        )
+    })?;
+    if value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || value.get("deliveryId").and_then(serde_json::Value::as_str) != Some(delivery_id)
+        || value.get("documentId").and_then(serde_json::Value::as_str)
+            != Some(document.document_id.as_str())
+    {
+        return Err(format!(
+            "Supernote acknowledgement {} does not match its delivery and document",
+            ack.display()
+        ));
+    }
+    Ok(true)
+}
+
 fn file_is_settled(
     path: &Path,
     state: &mut TransportState,
@@ -1133,6 +1360,29 @@ fn validate_unique_baseline_pages(paths: &[PathBuf]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_supernote_export_identity(
+    export: &BaselineExport,
+    document: &DocumentFolders,
+    source: &str,
+) -> Result<(), String> {
+    if let Some(document_id) = export.document_id.as_deref() {
+        if document_id == document.document_id {
+            return Ok(());
+        }
+        return Err(format!(
+            "{source} targets stable document {document_id}, not {}",
+            document.document_id
+        ));
+    }
+    if export.source_file_name.as_deref() == Some(document.original_file_name.as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "legacy Supernote export {source} targets {:?}, not configured document {}",
+        export.source_file_name, document.original_file_name
+    ))
 }
 
 fn unix_millis(value: SystemTime) -> Result<u64, String> {
@@ -1688,6 +1938,46 @@ fn replace_file_unconditionally(source: &Path, destination: &Path) -> Result<(),
 mod snapshot_tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn configured_document(root: &Path) -> DocumentFolders {
+        DocumentFolders {
+            document_id: format!("inkbridge-doc-v1-{}", "a".repeat(64)),
+            original_file_name: "Configured.pdf".to_owned(),
+            boox_pdf: root.join("boox/Configured.pdf"),
+            supernote_export_directory: root.join("supernote/outgoing"),
+            supernote_incoming_directory: root.join("supernote/incoming"),
+        }
+    }
+
+    #[test]
+    fn stable_document_identity_allows_device_specific_filenames() {
+        let directory = tempdir().unwrap();
+        let document = configured_document(directory.path());
+        let export = BaselineExport {
+            source_file_name: Some("Supernote Copy.pdf".to_owned()),
+            document_id: Some(document.document_id.clone()),
+            based_on: None,
+            page_index: 0,
+            strokes: Vec::new(),
+        };
+        validate_supernote_export_identity(&export, &document, "page-0001.json").unwrap();
+    }
+
+    #[test]
+    fn legacy_export_without_document_identity_still_requires_the_configured_filename() {
+        let directory = tempdir().unwrap();
+        let document = configured_document(directory.path());
+        let export = BaselineExport {
+            source_file_name: Some("Different.pdf".to_owned()),
+            document_id: None,
+            based_on: None,
+            page_index: 0,
+            strokes: Vec::new(),
+        };
+        let error =
+            validate_supernote_export_identity(&export, &document, "page-0001.json").unwrap_err();
+        assert!(error.contains("legacy Supernote export"));
+    }
 
     #[test]
     fn snapshot_hash_detects_same_length_replacement_after_read() {

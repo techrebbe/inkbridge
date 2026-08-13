@@ -69,7 +69,9 @@ supernote-poc/build.sh inkbridge-manifest.json
 ```
 
 Install the resulting `.snplg`, open the target document, and tap **Apply
-InkBridge Sync**. The plugin refuses to apply a baseline-backed manifest when a
+Embedded Test**. That action is registered only when `build.sh` receives a
+manifest; ordinary folder-sync packages continue to use **Apply InkBridge Sync**.
+The plugin refuses to apply a baseline-backed manifest when a
 different filename is open.
 
 The plugin resolves an existing native stroke by:

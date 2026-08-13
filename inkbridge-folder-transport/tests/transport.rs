@@ -187,6 +187,13 @@ fn native_export_page(page_index: u32, source_uuid: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+fn native_export_at(page_index: u32, source_uuid: &str, boox: u64, supernote: u64) -> Vec<u8> {
+    format!(
+        r#"{{"sourceFileName":"book.pdf","basedOn":{{"boox":{boox},"supernote":{supernote}}},"pageIndex":{page_index},"strokes":[{{"sourceUuid":"{source_uuid}","sourceKey":"{source_uuid}","layerNum":0,"thickness":2,"penColor":0,"penType":16,"samples":[[0.1,0.2,900],[0.2,0.3,1000]]}}]}}"#
+    )
+    .into_bytes()
+}
+
 fn generated_metadata(
     document_id: &str,
     revisions: &str,
@@ -213,13 +220,44 @@ fn path_key(path: &Path) -> String {
     }
 }
 
+fn supernote_page_id(document_id: &str, page_index: u32) -> String {
+    sha256_hex(format!("{document_id}\0supernote-page\0{page_index}").as_bytes())
+}
+
+fn accepted_supernote_upload(
+    cloud: &FakeCloud,
+    document: &DocumentFolders,
+    page_index: u32,
+    revision: u64,
+    bytes: Vec<u8>,
+) {
+    let source_hash = sha256_hex(&bytes);
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/uploads/supernote-r{revision}.json",
+            document.document_id
+        ),
+        bytes,
+        BTreeMap::from([
+            (DOCUMENT_ID.to_owned(), document.document_id.clone()),
+            (SOURCE_REVISION.to_owned(), revision.to_string()),
+            (SOURCE_VIEW_SHA256.to_owned(), source_hash),
+            (
+                SOURCE_LOCAL_ID.to_owned(),
+                supernote_page_id(&document.document_id, page_index),
+            ),
+            (SOURCE_PAGE_INDEX.to_owned(), page_index.to_string()),
+        ]),
+    );
+}
+
 #[test]
 fn supernote_export_upload_is_revisioned_and_duplicate_scan_is_idempotent() {
     let root = tempdir().unwrap();
     let document = mapping(root.path());
     fs::create_dir_all(&document.supernote_export_directory).unwrap();
     let export = document.supernote_export_directory.join("page-1.json");
-    fs::write(&export, native_export()).unwrap();
+    fs::write(&export, native_export_at(0, "s1", 0, 0)).unwrap();
     let cloud = FakeCloud::default();
     let builder = FakeBuilder;
     let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
@@ -266,6 +304,115 @@ fn supernote_export_upload_is_revisioned_and_duplicate_scan_is_idempotent() {
 }
 
 #[test]
+fn sibling_page_export_rebases_across_a_supernote_only_revision() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let export = document.supernote_export_directory.join("page-0002.json");
+    fs::write(&export, native_export_at(1, "s2", 0, 0)).unwrap();
+
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(&cloud, &document, 0, 1, native_export_at(0, "s1", 0, 0));
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Supernote,
+            source_revision: 2,
+            ..
+        }
+    )));
+    let objects = cloud.objects.lock().unwrap();
+    let uploaded = objects
+        .iter()
+        .map(|(object, _)| object)
+        .find(|object| {
+            object
+                .metadata
+                .get(SOURCE_REVISION)
+                .is_some_and(|value| value == "2")
+        })
+        .unwrap();
+    assert_eq!(
+        uploaded
+            .metadata
+            .get("inkbridge-based-on-supernote")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        uploaded.metadata.get(SOURCE_PAGE_INDEX).map(String::as_str),
+        Some("1")
+    );
+}
+
+#[test]
+fn stale_same_page_export_does_not_rebase_across_a_newer_revision() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let export = document.supernote_export_directory.join("page-0001.json");
+    fs::write(&export, native_export_at(0, "stale", 0, 0)).unwrap();
+
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(
+        &cloud,
+        &document,
+        0,
+        1,
+        native_export_at(0, "accepted", 0, 0),
+    );
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Supernote,
+            reason,
+        } if reason.contains("same Supernote page changed")
+    )));
+    assert!(cloud.objects.lock().unwrap().iter().all(|(object, _)| {
+        object
+            .metadata
+            .get(SOURCE_REVISION)
+            .is_none_or(|revision| revision != "2")
+    }));
+}
+
+#[test]
 fn broker_manifest_delivery_advances_revision_and_clears_pending() {
     let root = tempdir().unwrap();
     let document = mapping(root.path());
@@ -304,22 +451,20 @@ fn broker_manifest_delivery_advances_revision_and_clears_pending() {
     let report = transport
         .sync_document(&document, &mut state, SystemTime::now())
         .unwrap();
-    assert!(matches!(
-        report.actions.first(),
+    let delivered_path = match report.actions.first() {
         Some(TransportAction::Delivered {
             side: DeviceSide::Supernote,
+            local_path,
             ..
-        })
-    ));
-    assert_eq!(
-        fs::read(
-            document
-                .supernote_incoming_directory
-                .join("event.operations.json")
-        )
-        .unwrap(),
-        manifest
-    );
+        }) => local_path,
+        other => panic!("expected Supernote delivery, got {other:?}"),
+    };
+    assert_eq!(fs::read(delivered_path).unwrap(), manifest);
+    assert!(delivered_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("r00000000000000000001-r00000000000000000000-g"));
     let current = &state.documents[&document.document_id];
     assert_eq!(
         current.revisions,
@@ -335,6 +480,253 @@ fn broker_manifest_delivery_advances_revision_and_clears_pending() {
         .sync_document(&document, &mut state, SystemTime::now())
         .unwrap();
     assert!(again.actions.is_empty());
+}
+
+#[test]
+fn missing_unacknowledged_manifest_is_redelivered_from_cloud() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let manifest = b"{\"manifestId\":\"recover-me\",\"operations\":[]}".to_vec();
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/incoming/recover.operations.json",
+            document.document_id
+        ),
+        manifest.clone(),
+        generated_metadata(&document.document_id, "1:0", &manifest),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let mut state = TransportState::empty();
+
+    let first = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    let delivered_path = first
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            TransportAction::Delivered {
+                side: DeviceSide::Supernote,
+                local_path,
+                ..
+            } => Some(local_path.clone()),
+            _ => None,
+        })
+        .unwrap();
+    fs::remove_file(&delivered_path).unwrap();
+
+    let recovered = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(recovered.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Supernote,
+            local_path,
+            ..
+        } if local_path == &delivered_path
+    )));
+    assert_eq!(fs::read(&delivered_path).unwrap(), manifest);
+    assert_eq!(*cloud.downloads.lock().unwrap(), 2);
+
+    let delivery_id = sha256_hex(&manifest);
+    let acknowledgements = document.supernote_acknowledged_directory();
+    fs::create_dir_all(&acknowledgements).unwrap();
+    fs::write(
+        acknowledgements.join(format!("{delivery_id}.ack.json")),
+        format!(
+            "{{\"schemaVersion\":1,\"deliveryId\":\"{delivery_id}\",\"documentId\":\"{}\"}}\n",
+            document.document_id
+        ),
+    )
+    .unwrap();
+    fs::remove_file(&delivered_path).unwrap();
+
+    let acknowledged = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(!acknowledged
+        .actions
+        .iter()
+        .any(|action| matches!(action, TransportAction::Delivered { .. })));
+    assert!(!delivered_path.exists());
+    assert_eq!(*cloud.downloads.lock().unwrap(), 2);
+}
+
+#[test]
+fn unacknowledged_supernote_delivery_blocks_page_export_upload() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let export = document.supernote_export_directory.join("page-0001.json");
+    fs::write(&export, native_export_at(0, "s1", 0, 0)).unwrap();
+
+    let cloud = FakeCloud::default();
+    let manifest = b"{\"manifestId\":\"from-boox\",\"operations\":[]}".to_vec();
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/incoming/from-boox.operations.json",
+            document.document_id
+        ),
+        manifest.clone(),
+        generated_metadata(&document.document_id, "1:0", &manifest),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let mut state = TransportState::empty();
+
+    let blocked = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(blocked.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Supernote,
+            reason,
+        } if reason.contains("applied and acknowledged")
+    )));
+    assert!(cloud.objects.lock().unwrap().iter().all(|(object, _)| {
+        !object.path.starts_with(&format!(
+            "Supernote_Folder/{}/uploads/",
+            document.document_id
+        ))
+    }));
+
+    let delivery_id = sha256_hex(&manifest);
+    let acknowledgements = document.supernote_acknowledged_directory();
+    fs::create_dir_all(&acknowledgements).unwrap();
+    fs::write(
+        acknowledgements.join(format!("{delivery_id}.ack.json")),
+        format!(
+            "{{\"schemaVersion\":1,\"deliveryId\":\"{delivery_id}\",\"documentId\":\"{}\"}}\n",
+            document.document_id
+        ),
+    )
+    .unwrap();
+
+    let stale = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(stale.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Supernote,
+            reason,
+        } if reason.contains("captured at revisions 0:0")
+    )));
+    assert!(cloud.objects.lock().unwrap().iter().all(|(object, _)| {
+        !object.path.starts_with(&format!(
+            "Supernote_Folder/{}/uploads/",
+            document.document_id
+        ))
+    }));
+
+    fs::write(&export, native_export_at(0, "s1", 1, 0)).unwrap();
+    // The first scan observes the replacement; the second sees the finalized
+    // export at its new causal frontier.
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    let resumed = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(resumed.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Supernote,
+            source_revision: 1,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn broker_manifest_delivery_names_preserve_causal_revision_order() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let first = b"{\"manifestId\":\"first\",\"operations\":[]}".to_vec();
+    let second = b"{\"manifestId\":\"second\",\"operations\":[]}".to_vec();
+    // Cloud generations are intentionally reversed relative to broker
+    // revisions. Delivery must still preserve causal revision order.
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/incoming/a-newer-generation-first.operations.json",
+            document.document_id
+        ),
+        second.clone(),
+        generated_metadata(&document.document_id, "2:0", &second),
+    );
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/incoming/z-older-generation-second.operations.json",
+            document.document_id
+        ),
+        first.clone(),
+        generated_metadata(&document.document_id, "1:0", &first),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let mut state = TransportState::empty();
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    let mut delivered = fs::read_dir(&document.supernote_incoming_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    delivered.sort();
+    assert_eq!(delivered.len(), 2);
+    assert_eq!(fs::read(&delivered[0]).unwrap(), first);
+    assert_eq!(fs::read(&delivered[1]).unwrap(), second);
+}
+
+#[test]
+fn broker_manifest_delivery_waits_for_a_missing_predecessor() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let second = b"{\"manifestId\":\"second\",\"operations\":[]}".to_vec();
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/incoming/second.operations.json",
+            document.document_id
+        ),
+        second,
+        generated_metadata(
+            &document.document_id,
+            "2:0",
+            b"{\"manifestId\":\"second\",\"operations\":[]}",
+        ),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let mut state = TransportState::empty();
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Supernote,
+            reason,
+        } if reason.contains("waiting for predecessor 1:0")
+    )));
+    assert!(fs::read_dir(&document.supernote_incoming_directory)
+        .unwrap()
+        .next()
+        .is_none());
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair::default()
+    );
 }
 
 #[test]

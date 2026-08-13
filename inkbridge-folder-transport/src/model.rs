@@ -33,6 +33,15 @@ pub struct DocumentFolders {
     pub supernote_incoming_directory: PathBuf,
 }
 
+impl DocumentFolders {
+    pub fn supernote_acknowledged_directory(&self) -> PathBuf {
+        self.supernote_incoming_directory
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("acknowledged")
+    }
+}
+
 impl TransportConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path)
@@ -184,6 +193,7 @@ impl TransportConfig {
             for (direction, directory) in [
                 ("outgoing", &document.supernote_export_directory),
                 ("incoming", &document.supernote_incoming_directory),
+                ("acknowledged", &document.supernote_acknowledged_directory()),
             ] {
                 let directory_paths = path_key_variants(directory)?;
                 if directory_paths.iter().any(|key| {
@@ -599,6 +609,8 @@ pub struct SideTransportState {
     pub accepted_local_hashes: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub recovered_source_identities: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accepted_source_revisions: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_content_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

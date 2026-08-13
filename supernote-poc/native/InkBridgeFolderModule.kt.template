@@ -1,0 +1,806 @@
+package __PACKAGE__
+
+import android.os.Environment
+import android.system.Os
+import android.system.OsConstants
+import android.util.Log
+import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.ReactContextBaseJavaModule
+import com.facebook.react.bridge.ReactMethod
+import org.json.JSONObject
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.time.Instant
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.Executors
+
+class InkBridgeFolderModule(
+    reactContext: ReactApplicationContext,
+) : ReactContextBaseJavaModule(reactContext) {
+
+    companion object {
+        private const val LOG_TAG = "INKBRIDGE_FOLDER"
+        private const val MODULE_NAME = "InkBridgeFolderModule"
+        private const val DOCUMENT_ID_PREFIX = "inkbridge-doc-v1-"
+        private const val EXPORT_SCHEMA_VERSION = 2
+        private const val MANIFEST_SCHEMA_VERSION = 1
+        private const val ACK_SCHEMA_VERSION = 1
+        private const val MAX_EXPORT_BYTES = 32 * 1024 * 1024
+        private const val MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+        private const val ROOT_DIRECTORY = "EXPORT/InkBridge/Supernote_Folder"
+        private val DELIVERY_ID = Regex("^[0-9a-f]{64}$")
+        private val ORDERED_MANIFEST = Regex(
+            "^r([0-9]{20})-r([0-9]{20})-g([0-9]{20})-.+\\.operations\\.json$",
+        )
+    }
+
+    private data class DocumentContext(
+        val pdf: File,
+        val documentId: String,
+        val directory: File,
+        val outgoing: File,
+        val incoming: File,
+        val acknowledged: File,
+        val failures: File,
+    )
+
+    private data class PendingManifest(
+        val file: File,
+        val bytes: ByteArray,
+        val deliveryId: String,
+        val manifest: JSONObject,
+        val orderKey: String?,
+        val revisions: RevisionFrontier?,
+    )
+
+    private data class RevisionFrontier(
+        val boox: Long,
+        val supernote: Long,
+    ) {
+        fun toJson(): JSONObject = JSONObject()
+            .put("boox", boox)
+            .put("supernote", supernote)
+    }
+
+    private data class RawDelivery(
+        val file: File,
+        val bytes: ByteArray,
+        val deliveryId: String,
+    )
+
+    private val worker = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "InkBridgeFolderWorker").apply { isDaemon = true }
+    }
+    override fun getName(): String = MODULE_NAME
+
+    override fun invalidate() {
+        worker.shutdownNow()
+        super.invalidate()
+    }
+
+    @ReactMethod
+    fun publishPageExport(
+        filePath: String,
+        expectedDocumentId: String,
+        payloadJson: String,
+        promise: Promise,
+    ) {
+        onWorker(promise, "INKBRIDGE_EXPORT_FAILED") {
+            require(expectedDocumentId.startsWith(DOCUMENT_ID_PREFIX)) {
+                "Invalid expected InkBridge document ID"
+            }
+            val context = documentContext(filePath)
+            require(context.documentId == expectedDocumentId) {
+                "The PDF bytes changed while this page's native ink was collected; reopen the intended document and export again"
+            }
+            val pending = pendingManifests(context)
+            require(pending.isEmpty()) {
+                "Apply the ${pending.size} pending InkBridge update(s) before exporting this page"
+            }
+            require(payloadJson.toByteArray(StandardCharsets.UTF_8).size <= MAX_EXPORT_BYTES) {
+                "Native page export exceeds $MAX_EXPORT_BYTES bytes"
+            }
+            val payload = JSONObject(payloadJson)
+            require(payload.optInt("schemaVersion", -1) == EXPORT_SCHEMA_VERSION) {
+                "Unsupported Supernote export schema"
+            }
+            require(payload.optString("sourceFileName") == context.pdf.name) {
+                "Export targets ${payload.optString("sourceFileName")}, not ${context.pdf.name}"
+            }
+            val pageIndex = payload.optInt("pageIndex", -1)
+            require(pageIndex >= 0) { "Export has no valid pageIndex" }
+            val strokes = payload.optJSONArray("strokes")
+                ?: throw IllegalArgumentException("Export has no strokes array")
+            payload.put("documentId", context.documentId)
+            payload.put("basedOn", exportRevisionFrontier(context).toJson())
+            val bytes = payload.toString().toByteArray(StandardCharsets.UTF_8)
+            require(bytes.size <= MAX_EXPORT_BYTES) {
+                "Final native page export exceeds $MAX_EXPORT_BYTES bytes"
+            }
+            val destination = File(context.outgoing, "page-%04d.json".format(pageIndex + 1))
+            atomicWrite(destination, appendNewline(bytes))
+            Log.i(
+                LOG_TAG,
+                "INKBRIDGE_FOLDER_EXPORT document=${context.documentId} page=${pageIndex + 1} strokes=${strokes.length()} path=${destination.absolutePath}",
+            )
+            JSONObject()
+                .put("status", "pending")
+                .put("documentId", context.documentId)
+                .put("pageIndex", pageIndex)
+                .put("strokeCount", strokes.length())
+                .put("outgoingPath", destination.absolutePath)
+                .put("pendingCount", 0)
+                .toString()
+        }
+    }
+
+    @ReactMethod
+    fun getDocumentIdentity(filePath: String, promise: Promise) {
+        onWorker(promise, "INKBRIDGE_DOCUMENT_IDENTITY_FAILED") {
+            val context = documentContext(filePath)
+            JSONObject()
+                .put("status", "ready")
+                .put("documentId", context.documentId)
+                .toString()
+        }
+    }
+
+    @ReactMethod
+    fun loadNextManifest(filePath: String, promise: Promise) {
+        onWorker(promise, "INKBRIDGE_MANIFEST_LOAD_FAILED") {
+            val context = documentContext(filePath)
+            conflictMessage(context)?.let { conflict ->
+                return@onWorker JSONObject()
+                    .put("status", "conflict")
+                    .put("documentId", context.documentId)
+                    .put("message", conflict)
+                    .toString()
+            }
+            transportConflictStatus(context)?.let { conflict ->
+                return@onWorker conflict.toString()
+            }
+            val pending = pendingManifests(context)
+            if (pending.isEmpty()) {
+                return@onWorker statusJson(context).toString()
+            }
+            val next = pending.first()
+            JSONObject()
+                .put("status", "pending")
+                .put("documentId", context.documentId)
+                .put("deliveryId", next.deliveryId)
+                .put("fileName", next.file.name)
+                .put("pendingCount", pending.size)
+                .put("manifest", next.manifest)
+                .toString()
+        }
+    }
+
+    @ReactMethod
+    fun validateDocumentIdentity(
+        filePath: String,
+        expectedDocumentId: String,
+        promise: Promise,
+    ) {
+        onWorker(promise, "INKBRIDGE_DOCUMENT_REVALIDATION_FAILED") {
+            require(expectedDocumentId.startsWith(DOCUMENT_ID_PREFIX)) {
+                "Invalid expected InkBridge document ID"
+            }
+            val context = documentContext(filePath)
+            require(context.documentId == expectedDocumentId) {
+                "The PDF bytes changed after this InkBridge update was loaded; reopen the intended document and retry"
+            }
+            JSONObject()
+                .put("status", "ready")
+                .put("documentId", context.documentId)
+                .toString()
+        }
+    }
+
+    @ReactMethod
+    fun acknowledgeManifest(
+        filePath: String,
+        deliveryId: String,
+        manifestId: String,
+        summaryJson: String,
+        promise: Promise,
+    ) {
+        onWorker(promise, "INKBRIDGE_ACK_FAILED") {
+            requireDeliveryId(deliveryId)
+            require(manifestId.isNotBlank() && manifestId.length <= 512) {
+                "Invalid manifestId"
+            }
+            val context = documentContext(filePath)
+            val ack = acknowledgementFile(context, deliveryId)
+            if (ack.isFile) {
+                val existing = validAcknowledgement(context, deliveryId)
+                    ?: throw IllegalStateException("Acknowledgement $deliveryId is invalid")
+                require(existing.optString("manifestId") == manifestId) {
+                    "Acknowledged manifest identity does not match"
+                }
+                runCatching {
+                    val staleFailure = failureFile(context, deliveryId)
+                    if (staleFailure.exists()) {
+                        check(staleFailure.delete()) {
+                            "Could not retire stale failure for $deliveryId"
+                        }
+                        syncDirectory(context.failures)
+                    }
+                }
+                    .onFailure { error ->
+                        Log.w(LOG_TAG, "Could not retire stale failure for $deliveryId", error)
+                    }
+                return@onWorker JSONObject()
+                    .put("status", "synced")
+                    .put("documentId", context.documentId)
+                    .put("deliveryId", deliveryId)
+                    .put("manifestId", manifestId)
+                    .put("pendingCount", 0)
+                    .toString()
+            }
+
+            // Complete every fallible queue read and response construction
+            // before the acknowledgement becomes durable. Nothing after
+            // atomicWrite may turn a committed acknowledgement into a
+            // retryable JavaScript failure.
+            val unacknowledged = pendingManifests(context)
+            val pending = unacknowledged.firstOrNull { it.deliveryId == deliveryId }
+                ?: throw IllegalStateException(
+                    "Incoming manifest $deliveryId is no longer present",
+                )
+            require(pending.manifest.optString("manifestId") == manifestId) {
+                "Manifest identity changed before acknowledgement"
+            }
+            val summary = JSONObject(summaryJson)
+            val acknowledgement = JSONObject()
+                .put("schemaVersion", ACK_SCHEMA_VERSION)
+                .put("deliveryId", deliveryId)
+                .put("manifestId", manifestId)
+                .put("sourceFileName", context.pdf.name)
+                .put("documentId", context.documentId)
+                .put("appliedAt", Instant.now().toString())
+                .put("summary", summary)
+            pending.revisions?.let { revisions ->
+                acknowledgement.put("sourceRevisions", revisions.toJson())
+            }
+            val remaining = (unacknowledged.size - 1).coerceAtLeast(0)
+            val responseJson = JSONObject()
+                .put("status", if (remaining > 0) "pending" else "synced")
+                .put("documentId", context.documentId)
+                .put("deliveryId", deliveryId)
+                .put("manifestId", manifestId)
+                .put("pendingCount", remaining)
+                .toString()
+            atomicWrite(
+                ack,
+                appendNewline(acknowledgement.toString().toByteArray(StandardCharsets.UTF_8)),
+            )
+            runCatching {
+                val priorFailure = failureFile(context, deliveryId)
+                if (priorFailure.exists()) {
+                    check(priorFailure.delete()) {
+                        "Could not retire prior failure for $deliveryId"
+                    }
+                    syncDirectory(context.failures)
+                }
+            }.onFailure { error ->
+                // The acknowledgement is already committed. A later status
+                // scan will reconcile this failure record using that ack.
+                Log.w(LOG_TAG, "Could not retire prior failure for $deliveryId", error)
+            }
+            Log.i(
+                LOG_TAG,
+                "INKBRIDGE_FOLDER_ACK document=${context.documentId} manifest=$manifestId delivery=$deliveryId remaining=$remaining",
+            )
+            responseJson
+        }
+    }
+
+    @ReactMethod
+    fun recordManifestFailure(
+        filePath: String,
+        deliveryId: String,
+        message: String,
+        promise: Promise,
+    ) {
+        onWorker(promise, "INKBRIDGE_FAILURE_RECORD_FAILED") {
+            requireDeliveryId(deliveryId)
+            val context = documentContext(filePath)
+            recordNativeFailure(context, deliveryId, message)
+            Log.e(LOG_TAG, "INKBRIDGE_FOLDER_APPLY_ERROR delivery=$deliveryId ${message.take(512)}")
+            JSONObject()
+                .put("status", "error")
+                .put("documentId", context.documentId)
+                .put("deliveryId", deliveryId)
+                .toString()
+        }
+    }
+
+    @ReactMethod
+    fun getStatus(filePath: String, promise: Promise) {
+        onWorker(promise, "INKBRIDGE_STATUS_FAILED") {
+            statusJson(documentContext(filePath)).toString()
+        }
+    }
+
+    private fun statusJson(context: DocumentContext): JSONObject {
+        conflictMessage(context)?.let { conflict ->
+            return JSONObject()
+                .put("status", "conflict")
+                .put("documentId", context.documentId)
+                .put("message", conflict)
+        }
+        transportConflictStatus(context)?.let { return it }
+        val pending = pendingManifests(context)
+        val failures = regularFiles(context.failures)
+        if (failures.isNotEmpty()) {
+            return JSONObject()
+                .put("status", "error")
+                .put("documentId", context.documentId)
+                .put("message", "An incoming update failed and remains available for retry.")
+                .put("failureCount", failures.size)
+        }
+        if (pending.isNotEmpty()) {
+            return JSONObject()
+                .put("status", "pending")
+                .put("documentId", context.documentId)
+                .put("pendingCount", pending.size)
+        }
+        val outgoing = outgoingPageFiles(context)
+        transportStatus(context, outgoing)?.let { return it }
+        val outgoingCount = outgoing.size
+        return JSONObject()
+            .put("status", if (outgoingCount > 0) "pending" else "synced")
+            .put("documentId", context.documentId)
+            .put("pendingCount", 0)
+            .put("outgoingPageCount", outgoingCount)
+    }
+
+    private fun transportStatus(context: DocumentContext, outgoing: List<File>): JSONObject? {
+        val value = readTransportCheckpoint(context) ?: return null
+        if (value.optString("status") in setOf("conflict", "error")) return value
+        val accepted = value.optJSONArray("supernoteAcceptedContentSha256") ?: return null
+        val acceptedHashes = mutableSetOf<String>()
+        for (index in 0 until accepted.length()) {
+            accepted.optString(index)
+                .takeIf { it.matches(DELIVERY_ID) }
+                ?.let(acceptedHashes::add)
+        }
+        if (outgoing.any { file -> sha256(readBytes(file, MAX_EXPORT_BYTES)) !in acceptedHashes }) {
+            return null
+        }
+        return value
+    }
+
+    private fun transportConflictStatus(context: DocumentContext): JSONObject? =
+        readTransportCheckpoint(context)?.takeIf { it.optString("status") == "conflict" }
+
+    private fun readTransportCheckpoint(context: DocumentContext): JSONObject? {
+        val file = File(context.incoming, "inkbridge-status.json")
+        if (!file.exists()) return null
+        val metadata = Os.lstat(file.absolutePath)
+        require(
+            file.isFile &&
+                file.length() <= 256 * 1024 &&
+                OsConstants.S_ISREG(metadata.st_mode) &&
+                !OsConstants.S_ISLNK(metadata.st_mode),
+        ) {
+            "Transport checkpoint ${file.name} is not a valid regular file"
+        }
+        val value = try {
+            JSONObject(readUtf8(file, 256 * 1024))
+        } catch (error: Exception) {
+            throw IllegalArgumentException(
+                "Transport checkpoint ${file.name} is incomplete or invalid; allow the folder mirror to finish or repair it",
+                error,
+            )
+        }
+        require(value.optInt("schemaVersion", -1) == 1) {
+            "Transport checkpoint ${file.name} has an unsupported schema"
+        }
+        require(value.optString("documentId") == context.documentId) {
+            "Transport checkpoint ${file.name} does not match the open document"
+        }
+        require(value.optString("status") in setOf("synced", "pending", "conflict", "error")) {
+            "Transport checkpoint ${file.name} has an invalid status"
+        }
+        return value
+    }
+
+    private fun pendingManifests(
+        context: DocumentContext,
+        includeAcknowledged: Boolean = false,
+    ): List<PendingManifest> {
+        val result = mutableListOf<PendingManifest>()
+        val deliveries = regularFiles(context.incoming).sortedBy { it.name }
+            .filter { !it.name.startsWith(".") && it.name.endsWith(".operations.json") }
+            .map { file ->
+                val bytes = readBytes(file, MAX_MANIFEST_BYTES)
+                RawDelivery(file, bytes, sha256(bytes))
+            }
+        val liveDeliveryIds = deliveries.mapTo(mutableSetOf()) { it.deliveryId }
+        reconcileFailureRecords(context, liveDeliveryIds)
+        for ((file, bytes, deliveryId) in deliveries) {
+            if (!includeAcknowledged && isValidAcknowledgement(context, deliveryId)) continue
+            val manifest = try {
+                JSONObject(String(bytes, StandardCharsets.UTF_8)).also { value ->
+                    require(value.optInt("schemaVersion", -1) == MANIFEST_SCHEMA_VERSION) {
+                        "Unsupported incoming manifest schema in ${file.name}"
+                    }
+                    require(value.optString("manifestId").isNotBlank()) {
+                        "Incoming manifest ${file.name} has no manifestId"
+                    }
+                    require(value.optJSONArray("operations") != null) {
+                        "Incoming manifest ${file.name} has no operations array"
+                    }
+                }
+            } catch (error: Exception) {
+                recordNativeFailure(
+                    context,
+                    deliveryId,
+                    "Could not read ${file.name}: ${error.message ?: error.javaClass.simpleName}",
+                )
+                throw IllegalArgumentException(
+                    "Incoming manifest ${file.name} is invalid; fix or remove it before newer revisions can be applied",
+                    error,
+                )
+            }
+            val order = ORDERED_MANIFEST.matchEntire(file.name)
+            val revisions = order?.let { match ->
+                RevisionFrontier(
+                    match.groupValues[1].toLongOrNull()
+                        ?: throw IllegalArgumentException("Invalid BOOX revision in ${file.name}"),
+                    match.groupValues[2].toLongOrNull()
+                        ?: throw IllegalArgumentException("Invalid Supernote revision in ${file.name}"),
+                )
+            }
+            result += PendingManifest(
+                file,
+                bytes,
+                deliveryId,
+                manifest,
+                order?.groupValues?.drop(1)?.take(3)?.joinToString(":"),
+                revisions,
+            )
+        }
+        val unordered = result.count { it.orderKey == null }
+        require(unordered == 0 || result.size == 1) {
+            "Multiple incoming manifests lack broker revision order; preserve them and process the oldest separately"
+        }
+        val sorted = result.sortedWith(
+            compareBy<PendingManifest>({ it.orderKey == null }, { it.orderKey ?: it.file.name }),
+        )
+        if (!includeAcknowledged) {
+            sorted.firstOrNull()?.revisions?.let { next ->
+                val current = appliedRevisionFrontier(context)
+                require(
+                    next.boox == current.boox + 1L &&
+                        next.supernote >= current.supernote,
+                ) {
+                    "Incoming InkBridge revision ${next.boox}:${next.supernote} cannot be applied after ${current.boox}:${current.supernote}; wait for the missing predecessor delivery"
+                }
+            }
+        }
+        return sorted
+    }
+
+    private fun appliedRevisionFrontier(context: DocumentContext): RevisionFrontier {
+        val acknowledged = acknowledgedRevisionFrontier(context)
+        val checkpoint = checkpointRevisionFrontier(context)
+        val acceptedSupernote = if (checkpoint != null && checkpoint.boox <= acknowledged.boox) {
+            maxOf(acknowledged.supernote, checkpoint.supernote)
+        } else {
+            acknowledged.supernote
+        }
+        return RevisionFrontier(
+            acknowledged.boox,
+            acceptedSupernote,
+        )
+    }
+
+    private fun exportRevisionFrontier(context: DocumentContext): RevisionFrontier {
+        val applied = appliedRevisionFrontier(context)
+        val checkpoint = checkpointRevisionFrontier(context)
+        require(checkpoint == null || checkpoint.boox <= applied.boox) {
+            "The broker has finalized BOOX revision ${checkpoint?.boox}, but its incoming manifest has not been applied; wait for the folder mirror and apply it before exporting"
+        }
+        return applied
+    }
+
+    private fun checkpointRevisionFrontier(context: DocumentContext): RevisionFrontier? {
+        val revisions = readTransportCheckpoint(context)?.optJSONObject("revisions") ?: return null
+        val boox = revisions.optLong("boox", -1L)
+        val supernote = revisions.optLong("supernote", -1L)
+        if (boox < 0L || supernote < 0L) return null
+        return RevisionFrontier(boox, supernote)
+    }
+
+    private fun acknowledgedRevisionFrontier(context: DocumentContext): RevisionFrontier {
+        val acknowledged = mutableListOf<RevisionFrontier>()
+        for (file in regularFiles(context.acknowledged)) {
+            val deliveryId = file.name.removeSuffix(".ack.json")
+            if (
+                file.name != "$deliveryId.ack.json" ||
+                !deliveryId.matches(DELIVERY_ID)
+            ) {
+                continue
+            }
+            val value = validAcknowledgement(context, deliveryId) ?: continue
+            val revisions = value.optJSONObject("sourceRevisions") ?: continue
+            val boox = revisions.optLong("boox", -1L)
+            val supernote = revisions.optLong("supernote", -1L)
+            if (boox >= 0L && supernote >= 0L) {
+                acknowledged += RevisionFrontier(boox, supernote)
+            }
+        }
+        // Compatibility with acknowledgements created before sourceRevisions
+        // was added: recover the revision pair from the retained delivery name.
+        for (file in regularFiles(context.incoming)) {
+            val match = ORDERED_MANIFEST.matchEntire(file.name) ?: continue
+            val bytes = readBytes(file, MAX_MANIFEST_BYTES)
+            val deliveryId = sha256(bytes)
+            if (!isValidAcknowledgement(context, deliveryId)) continue
+            val boox = match.groupValues[1].toLongOrNull() ?: continue
+            val supernote = match.groupValues[2].toLongOrNull() ?: continue
+            acknowledged += RevisionFrontier(boox, supernote)
+        }
+        acknowledged.sortWith(compareBy({ it.boox }, { it.supernote }))
+        var current = RevisionFrontier(0L, 0L)
+        for (candidate in acknowledged.distinct()) {
+            if (candidate.boox <= current.boox) continue
+            if (
+                candidate.boox != current.boox + 1L ||
+                candidate.supernote < current.supernote
+            ) {
+                break
+            }
+            current = candidate
+        }
+        return current
+    }
+
+    private fun reconcileFailureRecords(
+        context: DocumentContext,
+        liveDeliveryIds: Set<String>,
+    ) {
+        var removed = false
+        for (failure in regularFiles(context.failures)) {
+            val deliveryId = failure.name.removeSuffix(".error.json")
+            if (
+                failure.name == "$deliveryId.error.json" &&
+                deliveryId.matches(DELIVERY_ID) &&
+                (
+                    deliveryId !in liveDeliveryIds ||
+                        isValidAcknowledgement(context, deliveryId)
+                )
+            ) {
+                check(failure.delete()) { "Could not retire obsolete failure ${failure.name}" }
+                removed = true
+            }
+        }
+        if (removed) syncDirectory(context.failures)
+    }
+
+    private fun outgoingPageFiles(context: DocumentContext): List<File> =
+        regularFiles(context.outgoing)
+            .filter { it.name.matches(Regex("^page-[0-9]+\\.json$")) }
+            .sortedBy { it.name }
+
+    private fun recordNativeFailure(
+        context: DocumentContext,
+        deliveryId: String,
+        message: String,
+    ) {
+        val failure = JSONObject()
+            .put("schemaVersion", 1)
+            .put("deliveryId", deliveryId)
+            .put("documentId", context.documentId)
+            .put("failedAt", Instant.now().toString())
+            .put("message", message.take(4096))
+        atomicWrite(
+            failureFile(context, deliveryId),
+            appendNewline(failure.toString().toByteArray(StandardCharsets.UTF_8)),
+        )
+        Log.e(LOG_TAG, "INKBRIDGE_FOLDER_INPUT_ERROR delivery=$deliveryId ${message.take(512)}")
+    }
+
+    private fun conflictMessage(context: DocumentContext): String? {
+        val localMarkers = regularFiles(context.incoming).filter {
+            it.name.endsWith(".conflict.json") || it.name == "inkbridge-conflict.json"
+        }
+        val conflictDirectory = File(context.directory, "conflicts")
+        if (localMarkers.isEmpty() && regularFiles(conflictDirectory).isEmpty()) return null
+        return "Edits from both devices were preserved; automatic sync is paused."
+    }
+
+    private fun documentContext(filePath: String): DocumentContext {
+        val pdf = requirePdf(filePath)
+        val documentId = stableDocumentId(pdf)
+        val root = File(Environment.getExternalStorageDirectory(), ROOT_DIRECTORY)
+        requireDirectory(root)
+        val directory = File(root, documentId)
+        val outgoing = File(directory, "outgoing")
+        val incoming = File(directory, "incoming")
+        val acknowledged = File(directory, "acknowledged")
+        val failures = File(directory, "failures")
+        listOf(directory, outgoing, incoming, acknowledged, failures).forEach(::requireDirectory)
+        return DocumentContext(
+            pdf,
+            documentId,
+            directory,
+            outgoing,
+            incoming,
+            acknowledged,
+            failures,
+        )
+    }
+
+    private fun requirePdf(filePath: String): File {
+        val pdf = File(filePath).canonicalFile
+        require(pdf.isFile && pdf.extension.equals("pdf", ignoreCase = true)) {
+            "Current document is not an accessible PDF: $filePath"
+        }
+        val sharedRoot = Environment.getExternalStorageDirectory().canonicalFile
+        require(pdf.toPath().startsWith(sharedRoot.toPath())) {
+            "Current PDF is outside shared storage"
+        }
+        return pdf
+    }
+
+    private fun stableDocumentId(pdf: File): String {
+        // Mirroring tools can overwrite a PDF in place while preserving its
+        // pathname, length, mtime, and inode. None of that metadata proves
+        // content identity, so every user-initiated folder action rehashes the
+        // immutable PDF view before selecting its InkBridge directory.
+        val hash = FileInputStream(pdf).use { input -> sha256(input) }
+        return DOCUMENT_ID_PREFIX + hash
+    }
+
+    private fun requireDirectory(directory: File) {
+        if (!directory.isDirectory && !directory.mkdirs()) {
+            throw IllegalStateException("Could not create ${directory.absolutePath}")
+        }
+        val metadata = Os.lstat(directory.absolutePath)
+        require(OsConstants.S_ISDIR(metadata.st_mode) && !OsConstants.S_ISLNK(metadata.st_mode)) {
+            "InkBridge folder is not a regular directory: ${directory.absolutePath}"
+        }
+    }
+
+    private fun regularFiles(directory: File): List<File> =
+        directory.listFiles()?.filter { candidate ->
+            runCatching {
+                candidate.isFile &&
+                    OsConstants.S_ISREG(Os.lstat(candidate.absolutePath).st_mode) &&
+                    candidate.canonicalFile.parentFile == directory.canonicalFile
+            }.getOrDefault(false)
+        } ?: emptyList()
+
+    private fun acknowledgementFile(context: DocumentContext, deliveryId: String): File =
+        File(context.acknowledged, "$deliveryId.ack.json")
+
+    private fun isValidAcknowledgement(
+        context: DocumentContext,
+        deliveryId: String,
+    ): Boolean = validAcknowledgement(context, deliveryId) != null
+
+    private fun validAcknowledgement(
+        context: DocumentContext,
+        deliveryId: String,
+    ): JSONObject? {
+        val acknowledgement = acknowledgementFile(context, deliveryId)
+        if (!acknowledgement.isFile) return null
+        val value = try {
+            JSONObject(readUtf8(acknowledgement, 256 * 1024))
+        } catch (error: Exception) {
+            throw IllegalArgumentException(
+                "Acknowledgement ${acknowledgement.name} is invalid; allow the folder mirror to finish or remove it",
+                error,
+            )
+        }
+        require(value.optInt("schemaVersion", -1) == ACK_SCHEMA_VERSION) {
+            "Acknowledgement ${acknowledgement.name} has an unsupported schema"
+        }
+        require(value.optString("deliveryId") == deliveryId) {
+            "Acknowledgement ${acknowledgement.name} does not match its delivery"
+        }
+        require(value.optString("documentId") == context.documentId) {
+            "Acknowledgement ${acknowledgement.name} does not match the open document"
+        }
+        return value
+    }
+
+    private fun failureFile(context: DocumentContext, deliveryId: String): File =
+        File(context.failures, "$deliveryId.error.json")
+
+    private fun requireDeliveryId(deliveryId: String) {
+        require(deliveryId.matches(DELIVERY_ID)) { "Invalid deliveryId" }
+    }
+
+    private fun readBytes(file: File, limit: Int): ByteArray {
+        require(file.length() >= 0L && file.length() <= limit.toLong()) {
+            "${file.name} exceeds the $limit byte limit"
+        }
+        return FileInputStream(file).use { input ->
+            val bytes = input.readBytes()
+            require(bytes.size <= limit) { "${file.name} changed while it was read" }
+            bytes
+        }
+    }
+
+    private fun readUtf8(file: File, limit: Int): String =
+        String(readBytes(file, limit), StandardCharsets.UTF_8)
+
+    private fun atomicWrite(destination: File, bytes: ByteArray) {
+        requireDirectory(destination.parentFile!!)
+        val temporary = File(
+            destination.parentFile,
+            ".${destination.name}.${UUID.randomUUID()}.part",
+        )
+        try {
+            FileOutputStream(temporary).use { output ->
+                output.write(bytes)
+                output.flush()
+                output.fd.sync()
+            }
+            Os.rename(temporary.absolutePath, destination.absolutePath)
+            syncDirectory(destination.parentFile!!)
+        } finally {
+            if (temporary.exists()) temporary.delete()
+        }
+    }
+
+    private fun syncDirectory(directory: File) {
+        var descriptor: java.io.FileDescriptor? = null
+        try {
+            descriptor = Os.open(
+                directory.absolutePath,
+                OsConstants.O_RDONLY,
+                0,
+            )
+            Os.fsync(descriptor)
+        } catch (error: Throwable) {
+            // Nomad shared storage can reject directory fsync even though the
+            // file fsync + same-directory rename is complete. The desktop
+            // transport's settle window still refuses a partial publication.
+            Log.w(LOG_TAG, "Directory fsync unavailable for ${directory.absolutePath}", error)
+        } finally {
+            descriptor?.let { runCatching { Os.close(it) } }
+        }
+    }
+
+    private fun appendNewline(bytes: ByteArray): ByteArray =
+        if (bytes.lastOrNull() == '\n'.code.toByte()) bytes else bytes + '\n'.code.toByte()
+
+    private fun sha256(bytes: ByteArray): String =
+        sha256Hex(MessageDigest.getInstance("SHA-256").digest(bytes))
+
+    private fun sha256(input: FileInputStream): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(1024 * 1024)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            if (count > 0) digest.update(buffer, 0, count)
+        }
+        return sha256Hex(digest.digest())
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String = bytes.joinToString("") {
+        "%02x".format(Locale.ROOT, it.toInt() and 0xff)
+    }
+
+    private fun <T> onWorker(promise: Promise, code: String, action: () -> T) {
+        worker.execute {
+            try {
+                promise.resolve(action())
+            } catch (error: Throwable) {
+                Log.e(LOG_TAG, "$code ${error.message}", error)
+                promise.reject(code, error.message, error)
+            }
+        }
+    }
+}

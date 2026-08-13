@@ -7,6 +7,7 @@ import {
 } from 'sn-plugin-lib';
 import {BOOX_NATIVE_STROKE_FIXTURE} from './booxFixture';
 import {BOOX_RETURN_FIXTURE} from './booxReturnFixture';
+import {exportedStrokeIdentity} from './manifestCore';
 
 const OFFSET_X_PX = 80;
 const OFFSET_Y_PX = 50;
@@ -341,7 +342,7 @@ async function serializeSupernoteStroke(source, elementIndex, pageSize, page) {
     ];
   });
 
-  const sourceUuid = source.uuid ?? null;
+  const sourceUuid = exportedStrokeIdentity(source.uuid, source.userData);
   return {
     sourceUuid,
     sourceKey: sourceUuid ?? `supernote-page-${page}-element-${elementIndex}`,
@@ -355,7 +356,7 @@ async function serializeSupernoteStroke(source, elementIndex, pageSize, page) {
   };
 }
 
-export async function exportCurrentSupernotePage() {
+export async function collectCurrentSupernotePage() {
   const {filePath, page, pageSize} = await currentDocumentContext();
   const elements = await requireResult(
     PluginFileAPI.getElements(page, filePath),
@@ -365,10 +366,6 @@ export async function exportCurrentSupernotePage() {
   const nativeStrokes = (elements ?? [])
     .map((element, elementIndex) => ({element, elementIndex}))
     .filter(({element}) => element?.type === 0 && element?.stroke);
-  if (!nativeStrokes.length) {
-    throw new Error('No handwritten strokes found on the current page. Annotate the page first, then run Export Page Test.');
-  }
-
   const strokes = [];
   let totalSamples = 0;
   for (const {element, elementIndex} of nativeStrokes) {
@@ -378,10 +375,6 @@ export async function exportCurrentSupernotePage() {
       strokes.push(serialized);
     }
   }
-  if (!strokes.length) {
-    throw new Error('Handwriting elements were found, but none contained stroke points.');
-  }
-
   const slash = filePath.lastIndexOf('/');
   const sourceFileName = slash >= 0 ? filePath.slice(slash + 1) : filePath;
   const payload = {
@@ -396,6 +389,19 @@ export async function exportCurrentSupernotePage() {
     strokes,
   };
 
+  return {
+    filePath,
+    payload,
+    page,
+    strokeCount: strokes.length,
+    sampleCount: totalSamples,
+  };
+}
+
+export async function exportCurrentSupernotePage() {
+  const collected = await collectCurrentSupernotePage();
+  const {payload, page, strokeCount, sampleCount} = collected;
+
   const compactJson = JSON.stringify(payload);
   const chunkCount = Math.ceil(compactJson.length / LOG_CHUNK_SIZE);
   for (let i = 0; i < chunkCount; i += 1) {
@@ -405,8 +411,8 @@ export async function exportCurrentSupernotePage() {
 
   return {
     page,
-    strokeCount: strokes.length,
-    sampleCount: totalSamples,
+    strokeCount,
+    sampleCount,
     chunkCount,
   };
 }
@@ -414,9 +420,9 @@ export async function exportCurrentSupernotePage() {
 export default function App() {
   return (
     <View style={styles.root}>
-      <Text style={styles.title}>InkBridge Test</Text>
+      <Text style={styles.title}>InkBridge</Text>
       <Text style={styles.body}>
-        InkBridge proof actions run directly from the NOTE/DOC toolbar without opening a plugin panel.
+        InkBridge folder actions run directly from the NOTE/DOC toolbar without opening a plugin panel.
       </Text>
     </View>
   );

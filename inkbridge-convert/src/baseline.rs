@@ -9,8 +9,19 @@ use std::path::Path;
 struct ExportPage {
     #[serde(default)]
     source_file_name: Option<String>,
+    #[serde(default)]
+    document_id: Option<String>,
+    #[serde(default)]
+    based_on: Option<BaselineRevisions>,
     page_index: u32,
     strokes: Vec<ExportStroke>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineRevisions {
+    pub boox: u64,
+    pub supernote: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +40,8 @@ struct ExportStroke {
 #[derive(Clone, Debug)]
 pub struct BaselineExport {
     pub source_file_name: Option<String>,
+    pub document_id: Option<String>,
+    pub based_on: Option<BaselineRevisions>,
     pub page_index: u32,
     pub strokes: Vec<StrokeSnapshot>,
 }
@@ -85,6 +98,8 @@ fn parse_baseline_text(text: &str, source_name: &str) -> Result<BaselineExport, 
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BaselineExport {
         source_file_name,
+        document_id: page.document_id,
+        based_on: page.based_on,
         page_index: page.page_index,
         strokes,
     })
@@ -164,5 +179,33 @@ mod tests {
         let loaded = load_baseline(file.path()).unwrap();
         assert_eq!(loaded.strokes.len(), 1);
         assert_eq!(loaded.strokes[0].source_uuid, "abc");
+    }
+
+    #[test]
+    fn preserves_the_stable_document_identity_when_present() {
+        let id = format!("inkbridge-doc-v1-{}", "a".repeat(64));
+        let json = format!(
+            r#"{{"documentId":"{id}","pageIndex":0,"strokes":[{{"sourceKey":"abc","thickness":400,"penColor":0,"penType":16,"samples":[[0.1,0.2,1000],[0.2,0.3,1100]]}}]}}"#
+        );
+        let parsed = parse_baseline_bytes(json.as_bytes(), "page-0001.json").unwrap();
+        assert_eq!(parsed.document_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn preserves_the_export_revision_frontier_when_present() {
+        let json = r#"{
+            "sourceFileName":"book.pdf",
+            "basedOn":{"boox":4,"supernote":7},
+            "pageIndex":0,
+            "strokes":[]
+        }"#;
+        let parsed = parse_baseline_bytes(json.as_bytes(), "page-0001.json").unwrap();
+        assert_eq!(
+            parsed.based_on,
+            Some(BaselineRevisions {
+                boox: 4,
+                supernote: 7,
+            })
+        );
     }
 }

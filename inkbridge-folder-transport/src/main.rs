@@ -1,6 +1,6 @@
 use inkbridge_folder_transport::{
-    FolderTransport, GcloudFolder, NativeBooxManifestBuilder, TransportAction, TransportConfig,
-    TransportState,
+    publish_companion_status, FolderTransport, GcloudFolder, NativeBooxManifestBuilder,
+    TransportAction, TransportConfig, TransportState,
 };
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -58,6 +58,13 @@ fn run() -> Result<(), String> {
             let report = match transport.sync_document(document, &mut state, SystemTime::now()) {
                 Ok(report) => report,
                 Err(error) => {
+                    if let Err(status_error) =
+                        publish_companion_status(document, &state, SystemTime::now(), Some(&error))
+                    {
+                        eprintln!(
+                            "could not publish Supernote companion error status: {status_error}"
+                        );
+                    }
                     retry_or_fail(
                         &command,
                         format!("{} scan failed: {error}", document.document_id),
@@ -67,6 +74,14 @@ fn run() -> Result<(), String> {
             };
             if let Err(error) = state.save(&config.state_path) {
                 retry_or_fail(&command, format!("could not save transport state: {error}"))?;
+                continue;
+            }
+            if let Err(error) = publish_companion_status(document, &state, SystemTime::now(), None)
+            {
+                retry_or_fail(
+                    &command,
+                    format!("could not publish Supernote companion status: {error}"),
+                )?;
                 continue;
             }
             for action in report.actions {

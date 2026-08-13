@@ -11,7 +11,9 @@
 > is the local finalized-folder transport described in
 > [docs/INKBRIDGE_FOLDER_TRANSPORT.md](docs/INKBRIDGE_FOLDER_TRANSPORT.md). BOOX edits are converted
 > locally into compact operation manifests; broker outputs are delivered back into the two device
-> folders without making filename order or modification time authoritative.
+> folders without making filename order or modification time authoritative. InkBridge 0.2.0 now
+> connects the native Supernote plugin directly to that contract; see
+> [docs/INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md](docs/INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md).
 
 <p align="center">
   <strong>A Rust-core, e-ink-first document reader with first-class handwriting.</strong><br>

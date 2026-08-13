@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   descriptorMatches,
+  exportedStrokeIdentity,
   geometryFingerprint,
   liveSnapshotMatches,
   operationSafetyPhases,
@@ -27,6 +28,24 @@ test('geometry fingerprint is stable across Rust and JavaScript', () => {
     geometryFingerprint(style, samples),
     geometryFingerprint({...style, layerNum: 1}, samples),
   );
+});
+
+test('folder exports preserve canonical IDs of broker-created strokes', () => {
+  assert.equal(
+    exportedStrokeIdentity(
+      'supernote-host-uuid',
+      JSON.stringify({
+        inkBridgeOrigin: 'inkbridge-sync',
+        sourceUuid: 'canonical-broker-uuid',
+      }),
+    ),
+    'canonical-broker-uuid',
+  );
+  assert.equal(
+    exportedStrokeIdentity('native-supernote-uuid', JSON.stringify({note: 'local'})),
+    'native-supernote-uuid',
+  );
+  assert.equal(exportedStrokeIdentity('native-supernote-uuid', '{'), 'native-supernote-uuid');
 });
 
 test('descriptor matching tolerates tiny native coordinate round trips', () => {

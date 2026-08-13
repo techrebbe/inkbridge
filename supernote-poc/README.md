@@ -1,6 +1,14 @@
-# InkBridge Supernote native-stroke proofs
+# InkBridge Supernote native folder plugin
 
-This is a deliberately small official Supernote plugin proof-of-concept that now also supports the first real-document round-trip test.
+Version 0.2.0 turns the proven native-stroke proof into the Supernote endpoint for the finalized
+folder transport. **Export InkBridge** atomically writes the current page snapshot, **Apply
+InkBridge Sync** applies the next incoming manifest and durably acknowledges it, and **InkBridge
+Status** reports synced, pending, conflict, or error. No logcat capture or document-specific plugin
+package is required. See
+[`../docs/INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md`](../docs/INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md).
+
+The earlier hardware proofs and repair-build notes are retained below as the evidence behind the
+current converter and native manifest application.
 
 ## Proven hardware paths
 
@@ -26,7 +34,9 @@ This is a deliberately small official Supernote plugin proof-of-concept that now
 
 The page payload also includes the source filename, page index and page pixel size.
 
-For this proof the JSON is emitted to Android logcat as numbered `INKBRIDGE_EXPORT` chunks, followed by an `INKBRIDGE_EXPORT_DONE` summary. This keeps the plugin entirely on the already-proven `sn-plugin-lib` runtime path and avoids the native filesystem dependency that caused plugin 0.0.4 not to load in the document toolbar.
+The legacy `exportCurrentSupernotePage()` helper can still emit numbered `INKBRIDGE_EXPORT` logcat
+chunks for regression diagnosis. The installed 0.2.0 toolbar uses the packaged, fail-closed native
+folder module instead.
 
 The exported Supernote UUID is carried into the PDF annotation `/NM` identity. NeoReader preserved those values while editing imported `/Ink`, allowing the returned PDF to be matched back to the original Supernote elements.
 
@@ -36,12 +46,14 @@ The exported Supernote UUID is carried into the PDF annotation `/NM` identity. N
 document. A manifest can contain new, moved/changed, and deleted strokes across
 multiple pages. Re-running it does not duplicate already-current ink.
 
-The normal CI artifact contains no document manifest. To build a package for an
-actual round trip:
+The embedded-manifest build option remains only for reproducing the earlier proof:
 
 ```bash
 supernote-poc/build.sh path/to/inkbridge-manifest.json
 ```
+
+Only that document-specific regression package shows **Apply Embedded Test**. The normal CI/folder
+package has no embedded manifest and does not register that legacy action.
 
 See [`../docs/INKBRIDGE-MANIFEST-WORKFLOW.md`](../docs/INKBRIDGE-MANIFEST-WORKFLOW.md)
 for the complete flow.
@@ -103,7 +115,7 @@ supernote-poc/out/*.snplg
 
 GitHub Actions also uploads the `.snplg` as the `inkbridge-supernote-poc` artifact.
 
-## First real-document round-trip test
+## Legacy first real-document round-trip test
 
 Use a **copy** of a real PDF rather than an important original.
 
@@ -148,4 +160,5 @@ Then on BOOX:
 4. Verify the long line moved, the gray underline disappeared, the BOOX handwriting appeared, and the unchanged word was not duplicated.
 5. Verify all resulting handwriting remains lassoable, movable and erasable.
 
-The first real-document milestone is deliberately page-at-a-time and manually transferred. Automatic Syncthing/cloud transport and whole-document background synchronization come after this round-trip behavior is proven.
+This manual flow is retained for converter regression work. Normal 0.2.0 use follows the finalized
+folder workflow documented above.
