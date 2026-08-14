@@ -1170,11 +1170,7 @@ fn supernote_accepted_snapshot_path(
     source_revision: u64,
     source_hash: &str,
 ) -> PathBuf {
-    let root = document
-        .supernote_export_directory
-        .parent()
-        .unwrap_or(&document.supernote_export_directory)
-        .join(".inkbridge-accepted");
+    let root = document.supernote_accepted_directory();
     root.join(format!(
         "r{source_revision:020}-{source_local_id}-{source_hash}.json"
     ))

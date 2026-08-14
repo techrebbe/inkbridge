@@ -40,6 +40,13 @@ impl DocumentFolders {
             .unwrap_or_else(|| Path::new("."))
             .join("acknowledged")
     }
+
+    pub fn supernote_accepted_directory(&self) -> PathBuf {
+        self.supernote_export_directory
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".inkbridge-accepted")
+    }
 }
 
 impl TransportConfig {
@@ -94,6 +101,8 @@ impl TransportConfig {
             for directory in [
                 &document.supernote_export_directory,
                 &document.supernote_incoming_directory,
+                &document.supernote_acknowledged_directory(),
+                &document.supernote_accepted_directory(),
             ] {
                 let directory_paths = path_key_variants(directory)?;
                 if path_sets_overlap(&config_paths, &directory_paths) {
@@ -194,6 +203,7 @@ impl TransportConfig {
                 ("outgoing", &document.supernote_export_directory),
                 ("incoming", &document.supernote_incoming_directory),
                 ("acknowledged", &document.supernote_acknowledged_directory()),
+                ("accepted-cache", &document.supernote_accepted_directory()),
             ] {
                 let directory_paths = path_key_variants(directory)?;
                 if directory_paths.iter().any(|key| {
@@ -956,6 +966,73 @@ mod tests {
     }
 
     #[test]
+    fn configuration_reserves_accepted_cache_against_other_mappings() {
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::new(),
+            documents: vec![
+                DocumentFolders {
+                    document_id: test_document_id('a'),
+                    original_file_name: "first.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("first/book.pdf"),
+                    supernote_export_directory: PathBuf::from("shared/outgoing"),
+                    supernote_incoming_directory: PathBuf::from("shared/incoming"),
+                },
+                DocumentFolders {
+                    document_id: test_document_id('b'),
+                    original_file_name: "second.pdf".to_owned(),
+                    boox_pdf: PathBuf::from("second/book.pdf"),
+                    supernote_export_directory: PathBuf::from("shared/.inkbridge-accepted"),
+                    supernote_incoming_directory: PathBuf::from("second/incoming"),
+                },
+            ],
+        };
+
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("overlaps a directory"));
+    }
+
+    #[test]
+    fn configuration_reserves_accepted_cache_against_boox_and_state_paths() {
+        let document = DocumentFolders {
+            document_id: test_document_id('a'),
+            original_file_name: "book.pdf".to_owned(),
+            boox_pdf: PathBuf::from("supernote/.inkbridge-accepted/book.pdf"),
+            supernote_export_directory: PathBuf::from("supernote/outgoing"),
+            supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+        };
+        let boox_collision = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::new(),
+            documents: vec![document.clone()],
+        };
+        assert!(boox_collision.validate().unwrap_err().contains("BOOX"));
+
+        let state_collision = TransportConfig {
+            state_path: PathBuf::from("supernote/.inkbridge-accepted/state.json"),
+            documents: vec![DocumentFolders {
+                boox_pdf: PathBuf::from("boox/book.pdf"),
+                ..document
+            }],
+            ..boox_collision
+        };
+        assert!(state_collision
+            .validate()
+            .unwrap_err()
+            .contains("must be outside"));
+    }
+
+    #[test]
     fn configuration_rejects_nested_supernote_directories() {
         let config = TransportConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
@@ -996,6 +1073,35 @@ mod tests {
         let outgoing = directory.path().join("supernote/outgoing");
         std::fs::create_dir_all(&outgoing).unwrap();
         let config_path = outgoing.join("inkbridge-folder-transport.json");
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: directory.path().join("state.json"),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: directory.path().join("boox/book.pdf"),
+                supernote_export_directory: outgoing,
+                supernote_incoming_directory: directory.path().join("supernote/incoming"),
+            }],
+        };
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        assert!(TransportConfig::load(&config_path)
+            .unwrap_err()
+            .contains("configuration file"));
+    }
+
+    #[test]
+    fn configuration_load_rejects_its_file_inside_accepted_cache() {
+        let directory = tempdir().unwrap();
+        let outgoing = directory.path().join("supernote/outgoing");
+        let accepted = directory.path().join("supernote/.inkbridge-accepted");
+        std::fs::create_dir_all(&accepted).unwrap();
+        let config_path = accepted.join("inkbridge-folder-transport.json");
         let config = TransportConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             bucket: "bucket".to_owned(),
