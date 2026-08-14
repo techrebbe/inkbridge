@@ -14,6 +14,10 @@ import {
   strokeDescriptor,
   validateManifest,
 } from './manifestCore';
+import {
+  requireCompatibleTargetFileName,
+  requireSameDocumentPath,
+} from './folderCompanionCore';
 
 async function requireResult(promise, label) {
   const response = await promise;
@@ -369,19 +373,24 @@ async function applyPage({
   }
 }
 
-export async function applyEmbeddedManifest() {
-  const manifest = validateManifest(EMBEDDED_MANIFEST);
+export async function applyManifest(
+  inputManifest,
+  expectedFilePath = null,
+  stableIdentityValidated = false,
+) {
+  const manifest = validateManifest(inputManifest);
   const filePath = await requireResult(
     PluginCommAPI.getCurrentFilePath(),
     'getCurrentFilePath',
   );
+  requireSameDocumentPath(expectedFilePath, filePath);
   const targetNames = manifest.document?.targetFileNames ?? [];
   const openName = basename(filePath);
-  if (targetNames.length && !targetNames.includes(openName)) {
-    throw new Error(
-      `This sync package targets ${targetNames.join(', ')}, but ${openName} is open.`,
-    );
-  }
+  requireCompatibleTargetFileName(
+    targetNames,
+    openName,
+    stableIdentityValidated,
+  );
   const yOffset =
     manifest.coordinateTransform?.pdfToSupernoteNormalizedYOffset ?? 0;
   const counts = {added: 0, updated: 0, deleted: 0, skipped: 0};
@@ -403,10 +412,19 @@ export async function applyEmbeddedManifest() {
     }
   }
 
+  const currentBeforeReload = await requireResult(
+    PluginCommAPI.getCurrentFilePath(),
+    'getCurrentFilePath before reload',
+  );
+  requireSameDocumentPath(filePath, currentBeforeReload);
   await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
   return {
     manifestId: manifest.manifestId,
     operationCount: manifest.operations.length,
     ...counts,
   };
+}
+
+export async function applyEmbeddedManifest() {
+  return applyManifest(EMBEDDED_MANIFEST);
 }

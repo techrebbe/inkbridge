@@ -29,18 +29,37 @@ decide which device wins.
 Each configured document has three local paths:
 
     BOOX_Folder/Example.pdf
-    Supernote_Folder/Example/outgoing/page-0001.json
-    Supernote_Folder/Example/incoming/<event>.operations.json
+    Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/outgoing/page-0001.json
+    Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/incoming/r<revisions>-g<generation>-<event>.operations.json
+    Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/acknowledged/<delivery-sha256>.ack.json
 
 The Supernote adapter or companion writes an export to a temporary part file and renames it to
 JSON only after the complete native page export is durable. The folder transport ignores hidden
 files and part JSON files. Broker manifests are written only to the separate incoming directory,
 so a download cannot be mistaken for a new Supernote export.
 
-The current official proof plugin still emits native exports through logcat and embeds an incoming
-manifest at package time. This folder contract is the stable handoff for the next on-device
-companion integration: it removes manual cloud operations now without coupling cloud state to the
-experimental plugin UI or the RTL reader's active development tree.
+InkBridge 0.2.0 implements this handoff in the official Supernote plugin. The `.snplg` publishes
+native page exports atomically, consumes incoming manifests once, and records durable
+acknowledgements without changing the RTL reader's active development tree. See
+[`INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md`](INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md).
+
+After each successful scan, the transport also atomically publishes
+`incoming/inkbridge-status.json`. The plugin uses that checkpoint to distinguish accepted/synced
+exports from work that is still pending, and the transport publishes `conflict` or `error` status
+without treating either as a device update.
+
+Downloaded Supernote manifests are named
+`r<boox-revision>-r<supernote-revision>-g<generation>-<event>.operations.json`, with fixed-width
+numeric fields. This preserves causal application order even though event IDs themselves are
+unordered.
+
+The shared-folder mirror must include the sibling `acknowledged` directory. The transport will not
+upload a Supernote page snapshot while any downloaded operation manifest lacks its matching
+content-hash acknowledgement, so a merely delivered BOOX revision cannot be mistaken for an
+applied revision. Native exports also carry the revision pair at which they were captured; after a
+new manifest advances the transport frontier, an older snapshot is rejected until the user exports
+the page again. Manifest downloads require the next causal BOOX revision, so a mirror that exposes
+N+1 before N cannot advance local state or the plugin queue.
 
 ## Configuration
 
@@ -91,9 +110,15 @@ the complete editable PDF. The broker continues rebuilding that view from the im
 ## Failure behavior
 
 - Repeated scans do not duplicate uploads or downloaded manifests.
+- A downloaded Supernote manifest that disappears before its valid acknowledgement is restored
+  from the immutable cloud generation; an acknowledged delivery does not need to remain local.
 - A process crash after upload retries the same content/revision-stable object name.
 - A failed downloaded-content hash never replaces the local destination.
 - A pending BOOX edit prevents a broker PDF from overwriting it.
+- A stale same-page Supernote export and an out-of-order Supernote manifest are preserved but
+  deferred; no implicit latest-file-wins decision is made. A sibling page exported at the same
+  original frontier can safely rebase across accepted Supernote-only page revisions, while any
+  intervening BOOX revision or accepted revision of that same page requires a fresh export.
 - Simultaneous device edits are preserved by the broker under Conflicts; the transport reports
   the conflict and stops new source uploads instead of choosing a winner. It resumes only after an
   explicit reconciliation workflow has safely retired those conflict objects.

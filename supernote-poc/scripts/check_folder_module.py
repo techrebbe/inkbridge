@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Static fail-closed invariants for the native folder transaction boundary."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"check_folder_module.py: {message}")
+
+
+def ordered(text: str, markers: list[str], label: str) -> None:
+    positions = [text.find(marker) for marker in markers]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        fail(f"{label} markers are missing or out of order: {markers}")
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        fail("usage: check_folder_module.py <supernote-poc-root>")
+    root = Path(sys.argv[1]).resolve()
+    module = (root / "native" / "InkBridgeFolderModule.kt.template").read_text(
+        encoding="utf-8"
+    )
+    javascript = (root / "overlay" / "folderCompanionCore.js").read_text(
+        encoding="utf-8"
+    )
+    companion = (root / "overlay" / "folderCompanion.js").read_text(encoding="utf-8")
+    index = (root / "overlay" / "index.js").read_text(encoding="utf-8")
+
+    ordered(
+        module,
+        ["output.fd.sync()", "Os.rename(", "syncDirectory(destination.parentFile!!)"] ,
+        "atomic publication",
+    )
+    ordered(
+        javascript,
+        ["if (validate) await validate", "const applied = await apply", "const acknowledged = await acknowledge"],
+        "apply-before-acknowledge",
+    )
+    ordered(
+        companion,
+        ["getDocumentIdentity(filePath)", "collectCurrentSupernotePage()", "publishPageExport("],
+        "hash-before-collect-before-publish",
+    )
+    ordered(
+        module[module.find("fun loadNextManifest") : module.find("fun acknowledgeManifest")],
+        ["conflictMessage(context)", "transportConflictStatus(context)", "pendingManifests(context)"],
+        "conflict-before-delivery",
+    )
+    ordered(
+        module[module.find("fun publishPageExport") : module.find("fun loadNextManifest")],
+        ["context.documentId == expectedDocumentId", "pendingManifests(context)", "atomicWrite(destination"],
+        "reject-pending-before-export",
+    )
+    acknowledgement = module[
+        module.find("fun acknowledgeManifest") : module.find("fun recordManifestFailure")
+    ]
+    ordered(
+        acknowledgement,
+        ["pendingManifests(context)", "val responseJson", "atomicWrite("],
+        "acknowledgement-preflight-before-commit",
+    )
+    committed_acknowledgement = acknowledgement[acknowledgement.find("atomicWrite(") :]
+    for forbidden in ("pendingManifests(", "statusJson(", "recordNativeFailure("):
+        if forbidden in committed_acknowledgement:
+            fail(f"acknowledgement must not perform fallible {forbidden} work after commit")
+    for required in (
+        'it.name.endsWith(".operations.json")',
+        "recordManifestFailure",
+        'return "Edits from both devices were preserved; automatic sync is paused."',
+        "Executors.newSingleThreadExecutor",
+        "FileInputStream(pdf).use",
+        'payload.put("documentId", context.documentId)',
+        'value.optJSONArray("supernoteAcceptedContentSha256")',
+        "recordNativeFailure(",
+        "reconcileFailureRecords(context, liveDeliveryIds)",
+        "regularFiles(context.incoming).sortedBy { it.name }",
+        'value.optInt("schemaVersion", -1) == 1',
+        "fix or remove it before newer revisions can be applied",
+        "every user-initiated folder action rehashes",
+        "isValidAcknowledgement(context, deliveryId)",
+        "does not match its delivery",
+        "pending InkBridge update(s) before exporting this page",
+        "fun validateDocumentIdentity(",
+        "context.documentId == expectedDocumentId",
+        'payload.put("basedOn", exportRevisionFrontier(context).toJson())',
+        'acknowledgement.put("sourceRevisions", revisions.toJson())',
+        "wait for the missing predecessor delivery",
+        "checkpoint.boox <= applied.boox",
+        "fun getDocumentIdentity(",
+        "The PDF bytes changed while this page's native ink was collected",
+        "Transport checkpoint ${file.name} is incomplete or invalid",
+    ):
+        if required not in module:
+            fail(f"native module is missing required invariant: {required}")
+    manifest_scan = module[
+        module.find("private fun pendingManifests") : module.find("private fun conflictMessage")
+    ]
+    for forbidden in ("file.delete()", "context.incoming.delete", "deleteRecursively"):
+        if forbidden in manifest_scan:
+            fail("incoming-manifest scan must never delete source deliveries")
+    if "getSharedPreferences" in module or "cachedIdentity" in module:
+        fail("stable document identity must not trust a metadata-only PDF hash cache")
+    if "acknowledgementFile(context, deliveryId).isFile) continue" in module:
+        fail("incoming deliveries must not trust acknowledgement existence without validation")
+    for required in (
+        "if (EMBEDDED_MANIFEST)",
+        "name: 'Apply Embedded Test'",
+        "applyEmbeddedManifest()",
+    ):
+        if required not in index:
+            fail(f"embedded-manifest regression action is missing: {required}")
+    print("InkBridge native folder invariants passed")
+
+
+if __name__ == "__main__":
+    main()

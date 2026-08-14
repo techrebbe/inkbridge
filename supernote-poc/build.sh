@@ -3,8 +3,25 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST_PATH="${1:-}"
+OUTPUT_DIR="${INKBRIDGE_SN_OUTPUT_DIR:-$ROOT/out}"
 WORK_ROOT="$(mktemp -d)"
 trap 'rm -rf "$WORK_ROOT"' EXIT
+
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  if command -v cygpath >/dev/null 2>&1 && [[ "$PYTHON_BIN" =~ ^[A-Za-z]:[\\/] ]]; then
+    PYTHON_BIN="$(cygpath -u "$PYTHON_BIN")"
+  fi
+  PYTHON_CMD=("$PYTHON_BIN")
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_CMD=(python3)
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_CMD=(python)
+else
+  echo "Python 3 is required to build the native InkBridge plugin." >&2
+  exit 1
+fi
+
+"${PYTHON_CMD[@]}" "$ROOT/scripts/check_folder_module.py" "$ROOT"
 
 pushd "$WORK_ROOT" >/dev/null
 npx --yes @react-native-community/cli@18.0.0 init InkBridgePoc \
@@ -23,12 +40,17 @@ cp "$ROOT/overlay/booxReturnFixtureV4.js" "$PROJECT/booxReturnFixtureV4.js"
 cp "$ROOT/overlay/returnApplyV2.js" "$PROJECT/returnApplyV2.js"
 cp "$ROOT/overlay/manifestCore.js" "$PROJECT/manifestCore.js"
 cp "$ROOT/overlay/manifestApply.js" "$PROJECT/manifestApply.js"
+cp "$ROOT/overlay/folderCompanionCore.js" "$PROJECT/folderCompanionCore.js"
+cp "$ROOT/overlay/folderCompanion.js" "$PROJECT/folderCompanion.js"
 if [[ -n "$MANIFEST_PATH" ]]; then
   node "$ROOT/embed-manifest.mjs" "$MANIFEST_PATH" "$PROJECT/generatedManifest.js"
 else
   cp "$ROOT/overlay/generatedManifest.js" "$PROJECT/generatedManifest.js"
 fi
 cp "$ROOT/PluginConfig.json" "$PROJECT/PluginConfig.json"
+
+"${PYTHON_CMD[@]}" "$ROOT/scripts/install_native.py" "$PROJECT" "$ROOT"
+"${PYTHON_CMD[@]}" "$ROOT/scripts/patch_plugin_packager.py" "$PROJECT/buildPlugin.sh"
 
 mkdir -p "$PROJECT/assets"
 cat > "$PROJECT/assets/icon.png.b64" <<'B64'
@@ -45,9 +67,16 @@ chmod +x buildPlugin.sh
 MSYS2_ARG_CONV_EXCL='/icon.png' ./buildPlugin.sh
 popd >/dev/null
 
-mkdir -p "$ROOT/out"
-rm -f "$ROOT/out"/*.snplg
-cp "$PROJECT"/build/outputs/*.snplg "$ROOT/out/"
+mkdir -p "$OUTPUT_DIR"
+rm -f "$OUTPUT_DIR"/*.snplg
+cp "$PROJECT"/build/outputs/*.snplg "$OUTPUT_DIR/"
+
+mapfile -t PACKAGES < <(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.snplg' -print)
+if [[ "${#PACKAGES[@]}" -ne 1 ]]; then
+  echo "Expected exactly one generated .snplg, found ${#PACKAGES[@]}." >&2
+  exit 1
+fi
+"${PYTHON_CMD[@]}" "$ROOT/scripts/verify_plugin_package.py" "${PACKAGES[0]}" "$ROOT"
 
 echo "Built Supernote plugin:"
-ls -lh "$ROOT/out"/*.snplg
+ls -lh "$OUTPUT_DIR"/*.snplg

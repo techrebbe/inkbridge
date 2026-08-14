@@ -1,11 +1,11 @@
 {
-  "name": "InkBridge Test",
+  "name": "InkBridge",
   "pluginKey": "InkBridgePoc",
   "pluginID": "ibpoc20260724001",
   "iconPath": "assets/icon.png",
-  "desc": "Editable handwriting bridge for BOOX and Supernote",
-  "versionCode": "16",
-  "versionName": "0.1.4",
+  "desc": "Editable handwriting sync for BOOX and Supernote",
+  "versionCode": "17",
+  "versionName": "0.2.0",
   "jsMainPath": "index",
   "author": "InkBridge"
 }

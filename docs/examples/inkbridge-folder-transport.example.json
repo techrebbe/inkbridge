@@ -10,8 +10,8 @@
       "documentId": "inkbridge-doc-v1-REPLACE_WITH_ORIGINAL_PDF_SHA256",
       "originalFileName": "Example.pdf",
       "booxPdf": "BOOX_Folder/Example.pdf",
-      "supernoteExportDirectory": "Supernote_Folder/Example/outgoing",
-      "supernoteIncomingDirectory": "Supernote_Folder/Example/incoming"
+      "supernoteExportDirectory": "Supernote_Folder/inkbridge-doc-v1-REPLACE_WITH_ORIGINAL_PDF_SHA256/outgoing",
+      "supernoteIncomingDirectory": "Supernote_Folder/inkbridge-doc-v1-REPLACE_WITH_ORIGINAL_PDF_SHA256/incoming"
     }
   ]
 }

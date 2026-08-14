@@ -31,6 +31,9 @@ jobs:
       - name: Test InkBridge manifest logic
         run: npm test --prefix supernote-poc
 
+      - name: Verify native folder invariants
+        run: python3 supernote-poc/scripts/check_folder_module.py supernote-poc
+
       - name: Build .snplg
         run: |
           chmod +x supernote-poc/build.sh
@@ -41,7 +44,7 @@ jobs:
           test -n "$(find supernote-poc/out -maxdepth 1 -name '*.snplg' -print -quit)"
           ls -lh supernote-poc/out/*.snplg
 
-      - name: Upload Supernote proof plugin
+      - name: Upload Supernote InkBridge plugin
         uses: actions/upload-artifact@v4
         with:
           name: inkbridge-supernote-poc

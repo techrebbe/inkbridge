@@ -7,6 +7,18 @@ export function parseUserData(userData) {
   }
 }
 
+export function exportedStrokeIdentity(nativeUuid, userData) {
+  const tagged = parseUserData(userData);
+  if (
+    tagged?.inkBridgeOrigin === 'inkbridge-sync' &&
+    typeof tagged.sourceUuid === 'string' &&
+    tagged.sourceUuid.trim()
+  ) {
+    return tagged.sourceUuid;
+  }
+  return nativeUuid ?? null;
+}
+
 const SUPPORTED_SUPERNOTE_PEN_COLORS = new Set([0x00, 0x9d]);
 
 export function supernotePenColor(sourcePenColor) {
