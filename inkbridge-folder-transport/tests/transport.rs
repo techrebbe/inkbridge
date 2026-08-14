@@ -856,7 +856,7 @@ fn lost_checkpoint_recovery_restores_accepted_baselines_from_cloud() {
     let missing_hash = sha256_hex(&missing_bytes);
     let cloud = FakeCloud::default();
     for (revision, bytes, hash) in [
-        (1_u64, missing_bytes, missing_hash.clone()),
+        (1_u64, missing_bytes.clone(), missing_hash.clone()),
         (2, present_bytes, present_hash),
     ] {
         cloud.put(
@@ -872,6 +872,19 @@ fn lost_checkpoint_recovery_restores_accepted_baselines_from_cloud() {
             ]),
         );
     }
+    let missing_identity =
+        sha256_hex(format!("{}\0supernote-page\0{}", document.document_id, 1).as_bytes());
+    let corrupted_snapshot = document
+        .supernote_export_directory
+        .parent()
+        .unwrap()
+        .join(".inkbridge-accepted")
+        .join(format!(
+            "r{:020}-{missing_identity}-{missing_hash}.json",
+            1_u64
+        ));
+    fs::create_dir_all(corrupted_snapshot.parent().unwrap()).unwrap();
+    fs::write(&corrupted_snapshot, b"corrupted cache entry").unwrap();
     let mut state = TransportState::empty();
     state.documents.insert(
         document.document_id.clone(),
@@ -902,6 +915,7 @@ fn lost_checkpoint_recovery_restores_accepted_baselines_from_cloud() {
         .accepted_local_hashes;
     assert_eq!(accepted.len(), 2);
     assert!(accepted.values().any(|hash| hash == &missing_hash));
+    assert_eq!(fs::read(&corrupted_snapshot).unwrap(), missing_bytes);
     for (path, expected_hash) in accepted {
         assert!(path.contains(".inkbridge-accepted"));
         assert_eq!(sha256_hex(&fs::read(path).unwrap()), *expected_hash);

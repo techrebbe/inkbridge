@@ -306,8 +306,8 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             source_revision,
             source_hash,
         );
-        match metadata_if_exists(&destination)? {
-            Some(metadata) if !metadata.is_file() => {
+        match symlink_metadata_if_exists(&destination)? {
+            Some(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(format!(
                     "accepted Supernote snapshot {} is not a regular file",
                     destination.display()
@@ -315,13 +315,13 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
             Some(_) => {
                 let actual_hash = sha256_file(&destination)?;
-                if actual_hash != source_hash {
-                    return Err(format!(
-                        "accepted Supernote snapshot {} hash {actual_hash} does not match immutable source hash {source_hash}",
-                        destination.display()
-                    ));
+                if actual_hash == source_hash {
+                    return Ok(destination);
                 }
-                return Ok(destination);
+                // This directory is transport-managed cache data. A corrupt
+                // entry has no authority over the immutable accepted cloud
+                // generation, so discard it and reinstall the verified bytes.
+                remove_file_if_exists(&destination)?;
             }
             None => {}
         }
@@ -1195,8 +1195,8 @@ fn persist_supernote_snapshot_bytes(
     }
     let destination =
         supernote_accepted_snapshot_path(document, source_local_id, source_revision, expected_hash);
-    match metadata_if_exists(&destination)? {
-        Some(metadata) if !metadata.is_file() => {
+    match symlink_metadata_if_exists(&destination)? {
+        Some(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(format!(
                 "Supernote snapshot destination {} is not a regular file",
                 destination.display()
@@ -1204,13 +1204,10 @@ fn persist_supernote_snapshot_bytes(
         }
         Some(_) => {
             let installed_hash = sha256_file(&destination)?;
-            if installed_hash != expected_hash {
-                return Err(format!(
-                    "Supernote snapshot {} already exists with hash {installed_hash}, expected {expected_hash}",
-                    destination.display()
-                ));
+            if installed_hash == expected_hash {
+                return Ok(destination);
             }
-            return Ok(destination);
+            remove_file_if_exists(&destination)?;
         }
         None => {}
     }
