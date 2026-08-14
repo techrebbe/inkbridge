@@ -181,7 +181,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 DeviceSide::Boox => "BOOX_Folder",
                 DeviceSide::Supernote => "Supernote_Folder",
             };
-            let mut accepted_hashes = BTreeMap::<String, (u64, String)>::new();
+            let mut accepted_hashes = BTreeMap::<String, (u64, String, CloudObject)>::new();
             for object in self
                 .cloud
                 .list(&format!("{root}/{}/uploads/", document.document_id))?
@@ -220,7 +220,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                         self.recover_supernote_source_identity(document, state, &object)?
                     }
                 };
-                if let Some((previous_revision, previous_hash)) =
+                if let Some((previous_revision, previous_hash, _)) =
                     accepted_hashes.get(&source_local_id)
                 {
                     if *previous_revision == source_revision && previous_hash != &source_hash {
@@ -231,9 +231,9 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 }
                 if accepted_hashes
                     .get(&source_local_id)
-                    .is_none_or(|(revision, _)| *revision <= source_revision)
+                    .is_none_or(|(revision, _, _)| *revision <= source_revision)
                 {
-                    accepted_hashes.insert(source_local_id, (source_revision, source_hash));
+                    accepted_hashes.insert(source_local_id, (source_revision, source_hash, object));
                 }
             }
 
@@ -244,7 +244,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .accepted_local_hashes
                     .clear();
             }
-            for (source_local_id, (source_revision, source_hash)) in accepted_hashes {
+            for (source_local_id, (source_revision, source_hash, object)) in accepted_hashes {
                 let entry = state
                     .document_mut(&document.document_id)
                     .side_mut(side)
@@ -254,30 +254,35 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 *entry = (*entry).max(source_revision);
                 let local_keys = match side {
                     DeviceSide::Boox => vec![canonical_path_key(&document.boox_pdf)],
-                    DeviceSide::Supernote => supernote_files
+                    DeviceSide::Supernote => vec![canonical_path_key(
+                        &self.ensure_supernote_accepted_snapshot(
+                            document,
+                            &source_local_id,
+                            source_revision,
+                            &source_hash,
+                            &object,
+                        )?,
+                    )],
+                };
+                if side == DeviceSide::Supernote {
+                    for (_, current_key) in supernote_files
                         .iter()
                         .filter(|(hash, _)| hash == &source_hash)
-                        .map(|(_, key)| key.clone())
-                        .collect(),
-                };
-                if side == DeviceSide::Supernote && local_keys.is_empty() {
-                    state
-                        .document_mut(&document.document_id)
-                        .supernote
-                        .accepted_local_hashes
-                        .insert(
-                            format!(
-                                "{RECOVERED_MISSING_PREFIX}{source_local_id}/{source_revision}"
-                            ),
-                            source_hash,
-                        );
-                    continue;
+                    {
+                        state
+                            .document_mut(&document.document_id)
+                            .supernote
+                            .uploaded_local_hashes
+                            .insert(current_key.clone(), source_hash.clone());
+                    }
                 }
                 for local_key in local_keys {
                     let side_state = state.document_mut(&document.document_id).side_mut(side);
-                    side_state
-                        .uploaded_local_hashes
-                        .insert(local_key.clone(), source_hash.clone());
+                    if side == DeviceSide::Boox {
+                        side_state
+                            .uploaded_local_hashes
+                            .insert(local_key.clone(), source_hash.clone());
+                    }
                     side_state
                         .accepted_local_hashes
                         .insert(local_key, source_hash.clone());
@@ -285,6 +290,65 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
         }
         Ok(())
+    }
+
+    fn ensure_supernote_accepted_snapshot(
+        &self,
+        document: &DocumentFolders,
+        source_local_id: &str,
+        source_revision: u64,
+        source_hash: &str,
+        object: &CloudObject,
+    ) -> Result<PathBuf, String> {
+        let destination = supernote_accepted_snapshot_path(
+            document,
+            source_local_id,
+            source_revision,
+            source_hash,
+        );
+        match metadata_if_exists(&destination)? {
+            Some(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "accepted Supernote snapshot {} is not a regular file",
+                    destination.display()
+                ));
+            }
+            Some(_) => {
+                let actual_hash = sha256_file(&destination)?;
+                if actual_hash != source_hash {
+                    return Err(format!(
+                        "accepted Supernote snapshot {} hash {actual_hash} does not match immutable source hash {source_hash}",
+                        destination.display()
+                    ));
+                }
+                return Ok(destination);
+            }
+            None => {}
+        }
+
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+        let temporary = sibling_temporary(&destination, &format!("g{}", object.generation));
+        remove_file_if_exists(&temporary)?;
+        self.cloud.download(object, &temporary)?;
+        let downloaded_hash = sha256_file(&temporary)?;
+        if downloaded_hash != source_hash {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "accepted Supernote upload {} hash {downloaded_hash} does not match immutable source hash {source_hash}",
+                object.path
+            ));
+        }
+        let _ = publish_create_only(&temporary, &destination)?;
+        let installed_hash = sha256_file(&destination)?;
+        if installed_hash != source_hash {
+            return Err(format!(
+                "accepted Supernote snapshot {} changed while it was being installed",
+                destination.display()
+            ));
+        }
+        Ok(destination)
     }
 
     fn recover_supernote_source_identity(
@@ -620,20 +684,35 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 return Ok(());
             }
         }
-        let baseline_candidates = supernote_export_files(&document.supernote_export_directory)?;
-        let accepted = &state
+        let accepted = state
             .document_mut(&document.document_id)
             .supernote
-            .accepted_local_hashes;
-        let current_baseline_keys = baseline_candidates
-            .iter()
-            .map(|candidate| canonical_path_key(candidate))
-            .collect::<std::collections::BTreeSet<_>>();
-        let missing_accepted = accepted
-            .keys()
-            .filter(|key| !current_baseline_keys.contains(*key))
-            .cloned()
-            .collect::<Vec<_>>();
+            .accepted_local_hashes
+            .clone();
+        let mut missing_accepted = Vec::new();
+        let mut baselines = Vec::new();
+        let mut baseline_hashes = Vec::new();
+        for (key, expected_hash) in &accepted {
+            if key.starts_with(RECOVERED_MISSING_PREFIX) {
+                missing_accepted.push(key.clone());
+                continue;
+            }
+            let baseline = PathBuf::from(key);
+            if !metadata_if_exists(&baseline)?.is_some_and(|metadata| metadata.is_file()) {
+                missing_accepted.push(key.clone());
+                continue;
+            }
+            let actual_hash = sha256_file(&baseline)?;
+            if &actual_hash != expected_hash {
+                missing_accepted.push(format!(
+                    "{} (expected {expected_hash}, found {actual_hash})",
+                    baseline.display()
+                ));
+                continue;
+            }
+            baseline_hashes.push((baseline.clone(), expected_hash.clone()));
+            baselines.push(baseline);
+        }
         if !missing_accepted.is_empty() {
             report.actions.push(TransportAction::Deferred {
                 side: DeviceSide::Boox,
@@ -644,23 +723,12 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             });
             return Ok(());
         }
-        let mut baselines = Vec::new();
-        let mut baseline_hashes = Vec::new();
-        let mut unaccepted = Vec::new();
-        for candidate in baseline_candidates {
-            let key = canonical_path_key(&candidate);
-            let hash = sha256_file(&candidate)?;
-            if accepted.get(&key).is_some_and(|accepted| accepted == &hash) {
-                baseline_hashes.push((candidate.clone(), hash));
-                baselines.push(candidate);
-            } else {
-                unaccepted.push(candidate);
-            }
-        }
-        if baselines.is_empty() || !unaccepted.is_empty() {
+        if baselines.is_empty() {
             report.actions.push(TransportAction::Deferred {
                 side: DeviceSide::Boox,
-                reason: "BOOX edit is ready, but the current Supernote native exports have not all been accepted as its identity baseline".to_owned(),
+                reason:
+                    "BOOX edit is ready, but no accepted Supernote identity baseline is available"
+                        .to_owned(),
             });
             return Ok(());
         }
@@ -688,16 +756,6 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 side: DeviceSide::Boox,
                 reason: "the BOOX PDF content changed while its compact manifest was being built"
                     .to_owned(),
-            });
-            return Ok(());
-        }
-        let current_baselines = supernote_export_files(&document.supernote_export_directory)?;
-        if current_baselines != baselines {
-            report.actions.push(TransportAction::Deferred {
-                side: DeviceSide::Boox,
-                reason:
-                    "the Supernote baseline set changed while the compact manifest was being built"
-                        .to_owned(),
             });
             return Ok(());
         }
@@ -911,6 +969,15 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     return Ok(());
                 }
             }
+            let source_revision = current.supernote + 1;
+            let snapshot = persist_supernote_snapshot_bytes(
+                document,
+                &source_local_id,
+                source_revision,
+                &content_hash,
+                &bytes,
+            )?;
+            let snapshot_key = canonical_path_key(&snapshot);
             let temporary = sibling_temporary(&export, "native-upload");
             fs::write(&temporary, &bytes)
                 .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
@@ -919,7 +986,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 state,
                 DeviceSide::Supernote,
                 &temporary,
-                &local_key,
+                &snapshot_key,
                 &source_local_id,
                 Some(parsed.page_index),
                 &content_hash,
@@ -929,6 +996,12 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             );
             let _ = fs::remove_file(&temporary);
             let (object, source_revision) = result?;
+            if source_revision != current.supernote + 1 {
+                return Err(format!(
+                    "Supernote snapshot revision {} does not match uploaded revision {source_revision}",
+                    current.supernote + 1
+                ));
+            }
             state
                 .document_mut(&document.document_id)
                 .supernote
@@ -1089,6 +1162,75 @@ fn is_sha256(value: &str) -> bool {
 
 fn supernote_page_identity(document_id: &str, page_index: u32) -> String {
     sha256_hex(format!("{document_id}\0supernote-page\0{page_index}").as_bytes())
+}
+
+fn supernote_accepted_snapshot_path(
+    document: &DocumentFolders,
+    source_local_id: &str,
+    source_revision: u64,
+    source_hash: &str,
+) -> PathBuf {
+    let root = document
+        .supernote_export_directory
+        .parent()
+        .unwrap_or(&document.supernote_export_directory)
+        .join(".inkbridge-accepted");
+    root.join(format!(
+        "r{source_revision:020}-{source_local_id}-{source_hash}.json"
+    ))
+}
+
+fn persist_supernote_snapshot_bytes(
+    document: &DocumentFolders,
+    source_local_id: &str,
+    source_revision: u64,
+    expected_hash: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    let actual_hash = sha256_hex(bytes);
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "Supernote snapshot bytes hash {actual_hash} does not match expected hash {expected_hash}"
+        ));
+    }
+    let destination =
+        supernote_accepted_snapshot_path(document, source_local_id, source_revision, expected_hash);
+    match metadata_if_exists(&destination)? {
+        Some(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "Supernote snapshot destination {} is not a regular file",
+                destination.display()
+            ));
+        }
+        Some(_) => {
+            let installed_hash = sha256_file(&destination)?;
+            if installed_hash != expected_hash {
+                return Err(format!(
+                    "Supernote snapshot {} already exists with hash {installed_hash}, expected {expected_hash}",
+                    destination.display()
+                ));
+            }
+            return Ok(destination);
+        }
+        None => {}
+    }
+
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let temporary = sibling_temporary(&destination, "snapshot");
+    remove_file_if_exists(&temporary)?;
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+    let _ = publish_create_only(&temporary, &destination)?;
+    let installed_hash = sha256_file(&destination)?;
+    if installed_hash != expected_hash {
+        return Err(format!(
+            "Supernote snapshot {} changed while it was being installed",
+            destination.display()
+        ));
+    }
+    Ok(destination)
 }
 
 fn parse_revision_metadata(object: &CloudObject) -> Result<RevisionPair, String> {
@@ -1630,7 +1772,46 @@ fn rename_create_only(source: &Path, destination: &Path) -> std::io::Result<()> 
 fn rename_create_only(source: &Path, destination: &Path) -> std::io::Result<()> {
     use rustix::fs::{renameat_with, RenameFlags, CWD};
 
-    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(Into::into)
+    match renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let error: std::io::Error = error.into();
+            if create_only_rename_is_unsupported(&error) {
+                hard_link_create_only(source, destination)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "redox"
+))]
+fn create_only_rename_is_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::InvalidInput
+        || error.kind() == std::io::ErrorKind::Unsupported
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "redox"
+))]
+fn hard_link_create_only(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Some mounted filesystems (notably WSL DrvFs) reject renameat2 with
+    // RENAME_NOREPLACE even though they support atomic create-only hard links.
+    // Linking in the same directory preserves the no-overwrite guarantee. Once
+    // the destination exists, the hidden source name is only a disposable alias.
+    fs::hard_link(source, destination)?;
+    let _ = fs::remove_file(source);
+    Ok(())
 }
 
 #[cfg(not(any(
@@ -1964,6 +2145,23 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn accepted_snapshot_path_distinguishes_changed_retry_content() {
+        let directory = tempdir().unwrap();
+        let document = configured_document(directory.path());
+        let source_local_id = "b".repeat(64);
+        let first_hash = "c".repeat(64);
+        let changed_hash = "d".repeat(64);
+
+        let first = supernote_accepted_snapshot_path(&document, &source_local_id, 2, &first_hash);
+        let changed =
+            supernote_accepted_snapshot_path(&document, &source_local_id, 2, &changed_hash);
+
+        assert_ne!(first, changed);
+        assert!(first.to_string_lossy().contains(&first_hash));
+        assert!(changed.to_string_lossy().contains(&changed_hash));
+    }
+
+    #[test]
     fn legacy_export_without_document_identity_still_requires_the_configured_filename() {
         let directory = tempdir().unwrap();
         let document = configured_document(directory.path());
@@ -2027,6 +2225,37 @@ mod snapshot_tests {
         assert!(!replace_file(&source, &destination, Some(&FileIdentity::Missing),).unwrap());
         assert_eq!(fs::read(&destination).unwrap(), b"new local edit");
         assert!(!source.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_fallback_publishes_without_overwriting() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("broker.part");
+        let destination = directory.path().join("book.pdf");
+        fs::write(&source, b"broker view").unwrap();
+
+        hard_link_create_only(&source, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"broker view");
+        assert!(!source.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_fallback_rejects_an_existing_destination() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("broker.part");
+        let destination = directory.path().join("book.pdf");
+        fs::write(&source, b"broker view").unwrap();
+        fs::write(&destination, b"new local edit").unwrap();
+
+        let error = hard_link_create_only(&source, &destination)
+            .expect_err("the create-only fallback must not overwrite");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).unwrap(), b"broker view");
+        assert_eq!(fs::read(&destination).unwrap(), b"new local edit");
     }
 
     #[test]

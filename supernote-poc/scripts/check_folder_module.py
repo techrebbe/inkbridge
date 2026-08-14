@@ -29,6 +29,10 @@ def main() -> None:
     )
     companion = (root / "overlay" / "folderCompanion.js").read_text(encoding="utf-8")
     index = (root / "overlay" / "index.js").read_text(encoding="utf-8")
+    build_script = (root / "build.sh").read_text(encoding="utf-8")
+
+    if "MSYS2_ARG_CONV_EXCL='/icon.png;/app.npk'" not in build_script:
+        fail("Git Bash builds must preserve root-relative plugin payload paths")
 
     ordered(
         module,

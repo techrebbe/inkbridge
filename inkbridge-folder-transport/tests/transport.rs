@@ -842,7 +842,7 @@ fn boox_upload_waits_when_an_accepted_baseline_file_is_missing() {
 }
 
 #[test]
-fn lost_checkpoint_recovery_preserves_an_unmatched_accepted_baseline() {
+fn lost_checkpoint_recovery_restores_accepted_baselines_from_cloud() {
     let root = tempdir().unwrap();
     let document = mapping(root.path());
     fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
@@ -890,24 +890,23 @@ fn lost_checkpoint_recovery_preserves_an_unmatched_accepted_baseline() {
         .sync_document(&document, &mut state, SystemTime::now())
         .unwrap();
 
-    let missing_identity =
-        sha256_hex(format!("{}\0supernote-page\0{}", document.document_id, 1).as_bytes());
-    let missing_key = format!("inkbridge-missing-accepted://{missing_identity}/1");
-    assert!(report.actions.iter().any(|action| matches!(
+    assert!(!report.actions.iter().any(|action| matches!(
         action,
         TransportAction::Deferred {
             side: DeviceSide::Boox,
             reason,
         } if reason.contains("accepted Supernote baseline files are missing")
-            && reason.contains(&missing_key)
     )));
-    assert_eq!(
-        state.documents[&document.document_id]
-            .supernote
-            .accepted_local_hashes[&missing_key],
-        missing_hash
-    );
-    assert!(!cloud.objects.lock().unwrap().iter().any(|(object, _)| {
+    let accepted = &state.documents[&document.document_id]
+        .supernote
+        .accepted_local_hashes;
+    assert_eq!(accepted.len(), 2);
+    assert!(accepted.values().any(|hash| hash == &missing_hash));
+    for (path, expected_hash) in accepted {
+        assert!(path.contains(".inkbridge-accepted"));
+        assert_eq!(sha256_hex(&fs::read(path).unwrap()), *expected_hash);
+    }
+    assert!(cloud.objects.lock().unwrap().iter().any(|(object, _)| {
         object
             .path
             .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
@@ -935,7 +934,7 @@ fn recovery_replaces_a_stale_accepted_path_after_export_rename() {
             "Supernote_Folder/{}/uploads/supernote-r1.json",
             document.document_id
         ),
-        bytes,
+        bytes.clone(),
         BTreeMap::from([
             (DOCUMENT_ID.to_owned(), document.document_id.clone()),
             (SOURCE_REVISION.to_owned(), "1".to_owned()),
@@ -969,7 +968,12 @@ fn recovery_replaces_a_stale_accepted_path_after_export_rename() {
         .supernote
         .accepted_local_hashes;
     assert!(!accepted.contains_key(&old_key));
-    assert_eq!(accepted.get(&new_key), Some(&content_hash));
+    assert!(!accepted.contains_key(&new_key));
+    assert_eq!(accepted.len(), 1);
+    let (snapshot, snapshot_hash) = accepted.first_key_value().unwrap();
+    assert!(snapshot.contains(".inkbridge-accepted"));
+    assert_eq!(snapshot_hash, &content_hash);
+    assert_eq!(fs::read(snapshot).unwrap(), bytes);
 }
 
 #[test]
@@ -1008,7 +1012,7 @@ fn recovery_retires_an_older_page_identity_after_rename_and_edit() {
         ),
         (
             2_u64,
-            new_bytes,
+            new_bytes.clone(),
             new_hash.clone(),
             page_identity.clone(),
             Some("0".to_owned()),
@@ -1057,7 +1061,12 @@ fn recovery_retires_an_older_page_identity_after_rename_and_edit() {
     let accepted = &state.documents[&document.document_id]
         .supernote
         .accepted_local_hashes;
-    assert_eq!(accepted, &BTreeMap::from([(new_key, new_hash)]));
+    assert!(!accepted.contains_key(&new_key));
+    assert_eq!(accepted.len(), 1);
+    let (snapshot, snapshot_hash) = accepted.first_key_value().unwrap();
+    assert!(snapshot.contains(".inkbridge-accepted"));
+    assert_eq!(snapshot_hash, &new_hash);
+    assert_eq!(fs::read(snapshot).unwrap(), new_bytes);
     assert!(!accepted.contains_key(&old_key));
     assert!(report.actions.iter().any(|action| matches!(
         action,
@@ -1066,16 +1075,71 @@ fn recovery_retires_an_older_page_identity_after_rename_and_edit() {
             ..
         }
     )));
-    assert_eq!(*cloud.downloads.lock().unwrap(), 1);
+    assert_eq!(*cloud.downloads.lock().unwrap(), 2);
 
     transport
         .sync_document(&document, &mut state, SystemTime::now())
         .unwrap();
     assert_eq!(
         *cloud.downloads.lock().unwrap(),
-        1,
+        2,
         "the checkpointed legacy page identity should avoid another download"
     );
+}
+
+#[test]
+fn simultaneous_local_edits_use_the_cached_accepted_supernote_baseline() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(document.boox_pdf.parent().unwrap()).unwrap();
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    fs::write(&document.boox_pdf, b"concurrent BOOX edit").unwrap();
+    let accepted_bytes = native_export_at(0, "accepted", 0, 0);
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(&cloud, &document, 0, 1, accepted_bytes);
+    let current_export = document.supernote_export_directory.join("page-0001.json");
+    fs::write(&current_export, native_export_at(0, "concurrent", 1, 1)).unwrap();
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 1,
+                supernote: 1,
+            },
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            source_revision: 2,
+            ..
+        }
+    )));
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Supernote,
+            source_revision: 2,
+            ..
+        }
+    )));
+    let accepted = &state.documents[&document.document_id]
+        .supernote
+        .accepted_local_hashes;
+    assert_eq!(accepted.len(), 1);
+    assert!(accepted
+        .keys()
+        .all(|path| path.contains(".inkbridge-accepted")));
 }
 
 #[test]

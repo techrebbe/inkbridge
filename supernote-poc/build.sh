@@ -61,10 +61,10 @@ rm "$PROJECT/assets/icon.png.b64"
 
 pushd "$PROJECT" >/dev/null
 chmod +x buildPlugin.sh
-# Git Bash otherwise rewrites the package's root-relative icon path to a
-# Windows installation path. Exclude only that value so real temp paths still
-# reach the Windows-hosted Node/JQ tools correctly.
-MSYS2_ARG_CONV_EXCL='/icon.png' ./buildPlugin.sh
+# Git Bash otherwise rewrites the package's root-relative payload paths to
+# Windows installation paths. Exclude only those two archive-relative values
+# so real temp paths still reach the Windows-hosted Node/JQ tools correctly.
+MSYS2_ARG_CONV_EXCL='/icon.png;/app.npk' ./buildPlugin.sh
 popd >/dev/null
 
 mkdir -p "$OUTPUT_DIR"
