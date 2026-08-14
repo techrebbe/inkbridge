@@ -12,6 +12,8 @@ The transport deliberately does less than the broker:
 - it runs the existing Rust NeoReader converter locally and uploads a compact BOOX operation
   manifest instead of the complete PDF;
 - it uploads finalized Supernote native page exports;
+- it keeps an immutable local cache of accepted Supernote page snapshots so a newer page export
+  cannot erase the identity baseline needed to interpret a simultaneous BOOX edit;
 - it downloads only objects carrying a valid InkBridge broker producer marker;
 - it installs BOOX PDF views and Supernote operation manifests through a temporary sibling file;
 - it persists local hashes, source revisions, pending uploads, delivered generations, and observed
@@ -32,11 +34,17 @@ Each configured document has three local paths:
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/outgoing/page-0001.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/incoming/r<revisions>-g<generation>-<event>.operations.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/acknowledged/<delivery-sha256>.ack.json
+    Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/.inkbridge-accepted/r<revision>-<page-id>-<content-sha256>.json
 
 The Supernote adapter or companion writes an export to a temporary part file and renames it to
 JSON only after the complete native page export is durable. The folder transport ignores hidden
 files and part JSON files. Broker manifests are written only to the separate incoming directory,
 so a download cannot be mistaken for a new Supernote export.
+
+`.inkbridge-accepted` is transport-managed cache data, not a device-authored update. Each entry is
+content-hash verified and created without overwriting an existing snapshot. The cache is rebuilt
+from the broker's immutable accepted upload objects after checkpoint loss, so replacing
+`outgoing/page-0001.json` with a newer export does not destroy the earlier baseline.
 
 InkBridge 0.2.0 implements this handoff in the official Supernote plugin. The `.snplg` publishes
 native page exports atomically, consumes incoming manifests once, and records durable
@@ -97,8 +105,22 @@ Inspect the durable local checkpoint without contacting the cloud:
 
 For a new document, place current Supernote native page exports in its outgoing directory first.
 They are uploaded and acknowledged one revision at a time. Only acknowledged exports become the
-identity baseline for compact BOOX conversion; a concurrent unacknowledged Supernote change makes
-the BOOX upload wait rather than diffing against the wrong state.
+identity baseline for compact BOOX conversion. A concurrent unacknowledged Supernote change is
+uploaded as its own revision while BOOX conversion continues against the immutable accepted cache;
+the broker can therefore preserve both inputs and report the intended simultaneous-edit conflict.
+
+## BOOX NeoReader handoff constraint
+
+Real Note Air 4C testing confirmed that NeoReader associates imported annotation state with the
+file path. Replacing the bytes of a PDF that is already known at the same path can display the new
+ink without making it lassoable. Opening the identical broker view under a fresh path triggers
+NeoReader's document-data import/merge flow and makes the strokes editable.
+
+The production BOOX adapter must therefore expose one authoritative active device view and perform
+an explicit versioned-path/import handoff. It must not leave both the stable-name copy and an
+import copy active: NeoReader may later embed edits into the other path. The current folder
+transport preserves unpublished edits and never guesses which of two device copies is newer; the
+automated NeoReader handoff remains the next BOOX-adapter milestone.
 
 ## Large PDFs
 
@@ -122,6 +144,9 @@ the complete editable PDF. The broker continues rebuilding that view from the im
 - Simultaneous device edits are preserved by the broker under Conflicts; the transport reports
   the conflict and stops new source uploads instead of choosing a winner. It resumes only after an
   explicit reconciliation workflow has safely retired those conflict objects.
+- Accepted Supernote baselines survive working-file replacement and checkpoint loss through the
+  immutable `.inkbridge-accepted` cache; a missing or hash-mismatched cache entry is recovered from
+  its accepted cloud generation before BOOX conversion proceeds.
 - State publication keeps the prior checkpoint until the replacement is complete and recovers from
   a staged prior checkpoint after interruption.
 - Windows crash recovery safely retires a staged BOOX predecessor while holding a handle that blocks
@@ -135,6 +160,7 @@ the complete editable PDF. The broker continues rebuilding that view from the im
     cargo clippy -p inkbridge-folder-transport --all-targets -- -D warnings
     cargo test -p inkbridge-folder-transport
 
-The tests cover duplicate scans, revision acknowledgement, broker-manifest delivery, compact BOOX
-uploads, unpublished-edit protection, and conflict blocking. Broker and converter suites remain
-the authority for stroke parity, malformed NeoReader recovery, moves, and deletions.
+The tests cover duplicate scans, revision acknowledgement, broker-manifest delivery, immutable
+baseline recovery, simultaneous local edits, compact BOOX uploads, unpublished-edit protection,
+and conflict blocking. Broker and converter suites remain the authority for stroke parity,
+malformed NeoReader recovery, moves, and deletions.
