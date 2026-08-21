@@ -7,6 +7,7 @@ import java.security.MessageDigest
 
 internal const val BROKER_PRODUCER = "inkbridge-broker"
 internal const val DESCRIPTOR_SCHEMA_VERSION = 1
+internal const val MAX_DESCRIPTOR_BYTES = 256 * 1024L
 internal const val SAFE_FILE_NAME_MAX_BYTES = 180
 private val DOCUMENT_ID = Regex("inkbridge-doc-v1-[0-9a-f]{64}")
 private val SHA256 = Regex("[0-9a-f]{64}")
@@ -189,6 +190,45 @@ data class InstallIntent(
         ).also { it.validate(documentId) }
     }
 }
+data class RetiredPredecessorWatch(
+    val schemaVersion: Int = 1,
+    val previousState: HandoffState,
+    val retiredFileName: String,
+    val observedSha256: String,
+    val localGeneration: Long,
+) {
+    fun validate(documentId: String) {
+        require(schemaVersion == 1) { "Unsupported retired predecessor watch version" }
+        previousState.validate()
+        require(previousState.documentId == documentId) { "Retired predecessor watch belongs elsewhere" }
+        requireSafeFileName(retiredFileName, "retired predecessor file name")
+        require(retiredFileName == previousState.activeFileName) {
+            "Retired predecessor watch does not match its handoff state"
+        }
+        require(SHA256.matches(observedSha256)) { "Invalid retired predecessor hash" }
+        require(localGeneration >= previousState.localGeneration) {
+            "Retired predecessor generation predates its handoff state"
+        }
+    }
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("schemaVersion", schemaVersion)
+        .put("previousState", previousState.toJson())
+        .put("retiredFileName", retiredFileName)
+        .put("observedSha256", observedSha256)
+        .put("localGeneration", localGeneration)
+
+    companion object {
+        fun fromJson(value: JSONObject, documentId: String) = RetiredPredecessorWatch(
+            schemaVersion = value.getInt("schemaVersion"),
+            previousState = HandoffState.fromJson(value.getJSONObject("previousState")),
+            retiredFileName = value.getString("retiredFileName"),
+            observedSha256 = value.getString("observedSha256"),
+            localGeneration = value.getLong("localGeneration"),
+        ).also { it.validate(documentId) }
+    }
+}
+
 data class FinalizeIntent(
     val schemaVersion: Int = 1,
     val previousState: HandoffState,

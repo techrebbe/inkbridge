@@ -55,14 +55,14 @@ class BooxHandoffStore(
     internal var beforePreservedDescriptorForTest: ((File) -> Unit)? = null
     internal var afterPredecessorRetirementForTest: ((File) -> Unit)? = null
     fun install(descriptorFile: File): InstallResult {
-        val delivery = BrokerDelivery.fromJson(JSONObject(descriptorFile.readText()))
+        val delivery = readDelivery(descriptorFile)
         val documentRoot = documentRoot(delivery.documentId)
         val incomingPdf = File(descriptorFile.parentFile, delivery.pdfFileName)
         require(incomingPdf.isFile) { "Incoming PDF is missing" }
         val incomingHash = sha256Hex(incomingPdf)
         require(incomingHash == delivery.contentSha256) { "Incoming PDF hash does not match its descriptor" }
 
-        recover(documentRoot)
+        recover(documentRoot, verifyRetiredPredecessors = true)
         var previous = readState(documentRoot)
         val previousActive = previous?.let { File(activeDir(documentRoot), it.activeFileName) }
         val activeHash = previousActive?.takeIf(File::isFile)?.let(::sha256Hex)
@@ -89,7 +89,7 @@ class BooxHandoffStore(
     fun finalize(documentId: String): FinalizeResult {
         requireDocumentId(documentId)
         val documentRoot = documentRoot(documentId)
-        recover(documentRoot)
+        recover(documentRoot, verifyRetiredPredecessors = true)
         val state = readState(documentRoot) ?: error("No active InkBridge document")
         val active = File(activeDir(documentRoot), state.activeFileName)
         require(active.isFile) { "The active PDF is missing" }
@@ -140,7 +140,7 @@ class BooxHandoffStore(
         .sortedBy { it.absolutePath }
         .firstOrNull { descriptor ->
             runCatching {
-                val delivery = BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
+                val delivery = readDelivery(descriptor)
                 val deliveryRoot = documentRoot(delivery.documentId)
                 recover(deliveryRoot)
                 val state = readState(deliveryRoot)
@@ -344,6 +344,8 @@ class BooxHandoffStore(
     private fun activeDir(documentRoot: File) = File(documentRoot, "active").also(File::mkdirs)
     private fun incomingDir(documentRoot: File) = File(documentRoot, "incoming")
     private fun retiredDir(documentRoot: File) = File(documentRoot, ".retired").also(File::mkdirs)
+    private fun retiredWatchDir(documentRoot: File) =
+        File(retiredDir(documentRoot), ".watches").also(File::mkdirs)
     private fun outgoingDir(documentRoot: File) = File(documentRoot, "outgoing").also(File::mkdirs)
     private fun stateFile(documentRoot: File) = File(documentRoot, ".inkbridge-state.json")
     private fun installIntentFile(documentRoot: File) = File(documentRoot, ".inkbridge-install.json")
@@ -438,12 +440,13 @@ class BooxHandoffStore(
         }
     }
 
-    private fun recover(documentRoot: File) {
+    private fun recover(documentRoot: File, verifyRetiredPredecessors: Boolean = false) {
         recoverState(documentRoot)
         recoverFinalize(documentRoot)
         recoverMissingActive(documentRoot)
         recoverInstall(documentRoot)
         recoverMissingActive(documentRoot)
+        if (verifyRetiredPredecessors) recoverRetiredPredecessors(documentRoot)
         requireStateForActiveFiles(documentRoot)
     }
 
@@ -487,7 +490,7 @@ class BooxHandoffStore(
             .filter { it.isFile && it.name.endsWith(".inkbridge.json") }
             .mapNotNull { descriptor ->
                 runCatching {
-                    val delivery = BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
+                    val delivery = readDelivery(descriptor)
                     if (
                         delivery.eventId != state.brokerEventId ||
                         delivery.documentId != state.documentId ||
@@ -501,6 +504,14 @@ class BooxHandoffStore(
                 }.getOrNull()
             }
             .firstOrNull()
+
+    private fun readDelivery(descriptor: File): BrokerDelivery {
+        require(descriptor.isFile) { "Incoming descriptor is missing" }
+        require(descriptor.length() <= MAX_DESCRIPTOR_BYTES) {
+            "Incoming descriptor ${descriptor.name} exceeds $MAX_DESCRIPTOR_BYTES bytes"
+        }
+        return BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
+    }
 
     private fun writeFinalizeIntent(documentRoot: File, intent: FinalizeIntent) {
         intent.validate(documentRoot.name)
@@ -665,6 +676,7 @@ class BooxHandoffStore(
                 activePrevious,
                 retiredPrevious,
                 commitHash,
+                previousState.localGeneration,
             )
             return
         }
@@ -700,6 +712,7 @@ class BooxHandoffStore(
                 activePrevious,
                 retiredPrevious,
                 commitHash,
+                nextLocalGeneration,
             )
         }
     }
@@ -711,6 +724,7 @@ class BooxHandoffStore(
         activePrevious: File,
         retiredPrevious: File,
         expectedHash: String,
+        observedGeneration: Long,
     ) {
         beforePreservedDescriptorForTest?.invoke(previous)
         require(sha256Hex(previous) == expectedHash) {
@@ -725,6 +739,15 @@ class BooxHandoffStore(
         require(sha256Hex(retiredPrevious) == expectedHash) {
             "NeoReader changed the retired predecessor; retry the update"
         }
+        writeRetiredPredecessorWatch(
+            documentRoot,
+            RetiredPredecessorWatch(
+                previousState = requireNotNull(intent.previousState),
+                retiredFileName = retiredPrevious.name,
+                observedSha256 = expectedHash,
+                localGeneration = observedGeneration,
+            ),
+        )
     }
 
     private fun awaitRetiredPredecessorQuiet(retired: File) {
@@ -762,6 +785,107 @@ class BooxHandoffStore(
                 deleted = true
             }
         if (deleted) syncDirectory(directory)
+    }
+
+    private fun recoverRetiredPredecessors(documentRoot: File) {
+        val watches = retiredWatchDir(documentRoot)
+            .listFiles()
+            .orEmpty()
+            .asSequence()
+            .filter { it.isFile && it.name.endsWith(".json") }
+            .map { watchFile ->
+                require(watchFile.length() <= MAX_DESCRIPTOR_BYTES) {
+                    "Retired predecessor watch ${watchFile.name} exceeds $MAX_DESCRIPTOR_BYTES bytes"
+                }
+                RetiredPredecessorWatch.fromJson(
+                    JSONObject(watchFile.readText()),
+                    documentRoot.name,
+                )
+            }
+            .groupBy(RetiredPredecessorWatch::retiredFileName)
+
+        watches.values.forEach { versions ->
+            val latestGeneration = versions.maxOf(RetiredPredecessorWatch::localGeneration)
+            val latest = versions.filter { it.localGeneration == latestGeneration }.distinct()
+            require(latest.size == 1) { "Conflicting retired predecessor watch records" }
+            val watch = latest.single()
+            val retired = File(retiredDir(documentRoot), watch.retiredFileName)
+            require(retired.isFile) {
+                "Watched retired predecessor ${watch.retiredFileName} is missing"
+            }
+            val currentHash = sha256Hex(retired)
+            if (currentHash == watch.observedSha256) return@forEach
+
+            val nextLocalGeneration = Math.addExact(watch.localGeneration, 1)
+            val outputName = retired.nameWithoutExtension +
+                "__boox-finalized-g" + nextLocalGeneration + "-" + currentHash.take(12) + ".pdf"
+            val outgoing = outgoingDir(documentRoot)
+            cleanupSupersededPredecessorPublications(
+                outgoing,
+                watch.previousState,
+                outputName,
+                nextLocalGeneration,
+            )
+            cleanupStagedPublications(outgoing, outputName, "late predecessor PDF")
+            cleanupStagedPublications(
+                outgoing,
+                "$outputName.inkbridge.json",
+                "late predecessor descriptor",
+            )
+            ensureFinalizedArtifacts(
+                documentRoot,
+                watch.previousState,
+                retired,
+                currentHash,
+                outputName,
+                nextLocalGeneration,
+            )
+            writeRetiredPredecessorWatch(
+                documentRoot,
+                watch.copy(
+                    observedSha256 = currentHash,
+                    localGeneration = nextLocalGeneration,
+                ),
+            )
+        }
+    }
+
+    private fun writeRetiredPredecessorWatch(
+        documentRoot: File,
+        watch: RetiredPredecessorWatch,
+    ) {
+        watch.validate(documentRoot.name)
+        val watches = retiredWatchDir(documentRoot)
+        val watchKey = sha256Hex(watch.retiredFileName.toByteArray()).take(16)
+        val destination = File(
+            watches,
+            "watch-$watchKey-g${watch.localGeneration}-${watch.observedSha256.take(12)}.json",
+        )
+        publishBytesOrVerify(watch.toJson().toString(2).toByteArray(), destination)
+
+        var deleted = false
+        watches.listFiles().orEmpty()
+            .filter { it.isFile && it != destination && it.name.endsWith(".json") }
+            .forEach { candidate ->
+                val older = runCatching {
+                    require(candidate.length() <= MAX_DESCRIPTOR_BYTES)
+                    RetiredPredecessorWatch.fromJson(
+                        JSONObject(candidate.readText()),
+                        documentRoot.name,
+                    )
+                }.getOrNull()
+                if (
+                    older != null &&
+                    older.retiredFileName == watch.retiredFileName &&
+                    older.localGeneration < watch.localGeneration
+                ) {
+                    require(candidate.delete()) {
+                        "Could not remove obsolete retired predecessor watch " + candidate.name
+                    }
+                    deleted = true
+                }
+            }
+        if (deleted) syncDirectory(watches)
     }
 
     private fun cleanupSupersededPredecessorPublications(

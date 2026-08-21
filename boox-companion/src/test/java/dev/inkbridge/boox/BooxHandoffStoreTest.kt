@@ -640,6 +640,37 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun installedUpdate_preservesWriteAfterRetiredPredecessorWasPublished() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val second = store.install(
+            delivery(root, "event-2", RevisionPair(0, 2), 11, "two".toByteArray()),
+        ) as InstallResult.Installed
+        val documentRoot = File(root, documentId)
+        val retired = File(File(documentRoot, ".retired"), first.activeFile.name)
+        assertTrue(retired.isFile)
+        retired.appendText("-late-open-handle-edit")
+
+        assertTrue(store.finalize(documentId) is FinalizeResult.NoChanges)
+
+        assertEquals("two", second.activeFile.readText())
+        val outgoing = File(documentRoot, "outgoing")
+        val preserved = outgoing.listFiles().orEmpty().single { it.extension == "pdf" }
+        assertEquals("one-late-open-handle-edit", preserved.readText())
+        assertTrue(File(outgoing, preserved.name + ".inkbridge.json").isFile)
+        assertTrue(store.finalize(documentId) is FinalizeResult.NoChanges)
+        assertEquals(1, outgoing.listFiles().orEmpty().count { it.extension == "pdf" })
+        assertEquals(
+            1,
+            File(File(documentRoot, ".retired"), ".watches")
+                .listFiles().orEmpty().count { it.extension == "json" },
+        )
+    }
+
+    @Test
     fun interruptedInstall_preservesFirstEditFlushedAtRetirementBoundary() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
@@ -956,6 +987,9 @@ class BooxHandoffStoreTest {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
         val incoming = File(File(root, documentId), "incoming").also(File::mkdirs)
+        val oversized = File(incoming, "a-oversized.inkbridge.json").apply {
+            writeBytes(ByteArray((MAX_DESCRIPTOR_BYTES + 1).toInt()) { 'x'.code.toByte() })
+        }
         File(incoming, "a-malformed.inkbridge.json").writeText("{not-json")
         File(incoming, "b-missing.inkbridge.json").writeText(
             brokerDelivery(
@@ -979,6 +1013,8 @@ class BooxHandoffStoreTest {
         val valid = delivery(root, "z-valid", RevisionPair(0, 1), 2, "valid".toByteArray())
 
         assertEquals(valid.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+        val error = runCatching { store.install(oversized) }.exceptionOrNull()
+        assertTrue(error!!.message!!.contains("exceeds $MAX_DESCRIPTOR_BYTES bytes"))
     }
 
     @Test
