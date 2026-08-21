@@ -148,26 +148,33 @@ data class HandoffState(
 
 
 data class InstallIntent(
-    val schemaVersion: Int = 1,
+    val schemaVersion: Int = 2,
     val previousActiveFileName: String?,
+    val previousActiveSha256: String?,
     val nextState: HandoffState,
 ) {
     fun validate(documentId: String) {
-        require(schemaVersion == 1) { "Unsupported install intent version" }
+        require(schemaVersion == 2) { "Unsupported install intent version" }
         nextState.validate()
         require(nextState.documentId == documentId) { "Install intent belongs to a different document" }
         previousActiveFileName?.let { requireSafeFileName(it, "previous active file name") }
+        previousActiveSha256?.let { require(SHA256.matches(it)) { "Invalid previous active PDF hash" } }
+        require((previousActiveFileName == null) == (previousActiveSha256 == null)) {
+            "Install intent predecessor file and hash must be recorded together"
+        }
     }
 
     fun toJson(): JSONObject = JSONObject()
         .put("schemaVersion", schemaVersion)
         .putOpt("previousActiveFileName", previousActiveFileName)
+        .putOpt("previousActiveSha256", previousActiveSha256)
         .put("nextState", nextState.toJson())
 
     companion object {
         fun fromJson(value: JSONObject, documentId: String) = InstallIntent(
             schemaVersion = value.getInt("schemaVersion"),
             previousActiveFileName = value.optNullableString("previousActiveFileName"),
+            previousActiveSha256 = value.optNullableString("previousActiveSha256"),
             nextState = HandoffState.fromJson(value.getJSONObject("nextState")),
         ).also { it.validate(documentId) }
     }

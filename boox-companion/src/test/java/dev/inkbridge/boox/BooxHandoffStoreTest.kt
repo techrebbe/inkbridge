@@ -126,6 +126,36 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun install_preservesEditFlushedWhileReplacementIsCopied() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        var injected = false
+        store.beforeInstallCommitForTest = { previous ->
+            if (!injected) {
+                injected = true
+                requireNotNull(previous).appendText("-late-neo-reader-edit")
+            }
+        }
+        val next = delivery(root, "event-2", RevisionPair(0, 2), 11, "two".toByteArray())
+
+        val error = runCatching { store.install(next) }.exceptionOrNull()
+
+        assertTrue(error!!.message!!.contains("edits were preserved"))
+        assertEquals("one-late-neo-reader-edit", first.activeFile.readText())
+        val state = store.state(documentId)!!
+        assertEquals(RevisionPair(0, 1), state.activeRevisions)
+        assertEquals(sha256Hex(first.activeFile), state.finalizedLocalSha256)
+        assertFalse(File(File(root, documentId), ".inkbridge-install.json").exists())
+        assertEquals(listOf(first.activeFile.name), first.activeFile.parentFile!!.listFiles()!!.map(File::getName))
+        val finalizedPdf = File(File(root, documentId), "outgoing")
+            .listFiles().orEmpty().single { it.name.endsWith(".pdf") }
+        assertEquals(first.activeFile.readBytes().toList(), finalizedPdf.readBytes().toList())
+    }
+
+    @Test
     fun finalizedChangeRequiresBrokerAcknowledgementBeforeRetirement() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
@@ -414,7 +444,7 @@ class BooxHandoffStoreTest {
         val active = File(File(documentRoot, "active").also(File::mkdirs), next.activeFileName)
         active.writeBytes(bytes)
         File(documentRoot, ".inkbridge-install.json").writeText(
-            InstallIntent(previousActiveFileName = null, nextState = next).toJson().toString(2),
+            InstallIntent(previousActiveFileName = null, previousActiveSha256 = null, nextState = next).toJson().toString(2),
         )
 
         assertEquals(next, store.state(documentId))
@@ -441,7 +471,7 @@ class BooxHandoffStoreTest {
         val active = File(documentRoot, "active").also(File::mkdirs)
         val staged = File(active, ".${next.activeFileName}.123.tmp").apply { writeText("partial") }
         File(documentRoot, ".inkbridge-install.json").writeText(
-            InstallIntent(previousActiveFileName = null, nextState = next).toJson().toString(2),
+            InstallIntent(previousActiveFileName = null, previousActiveSha256 = null, nextState = next).toJson().toString(2),
         )
 
         assertEquals(null, store.state(documentId))
@@ -766,6 +796,7 @@ class BooxHandoffStoreTest {
         File(documentRoot, ".inkbridge-install.json").writeText(
             InstallIntent(
                 previousActiveFileName = first.activeFile.name,
+                previousActiveSha256 = sha256Hex(first.activeFile),
                 nextState = next,
             ).toJson().toString(2),
         )

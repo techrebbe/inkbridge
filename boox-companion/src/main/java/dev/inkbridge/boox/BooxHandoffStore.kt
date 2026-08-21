@@ -34,6 +34,7 @@ private data class FinalizationCommit(
 )
 
 class BooxHandoffStore(val root: File) {
+    internal var beforeInstallCommitForTest: ((File?) -> Unit)? = null
     fun install(descriptorFile: File): InstallResult {
         val delivery = BrokerDelivery.fromJson(JSONObject(descriptorFile.readText()))
         val documentRoot = documentRoot(delivery.documentId)
@@ -61,6 +62,7 @@ class BooxHandoffStore(val root: File) {
                 documentRoot,
                 previous,
                 previousActive,
+                activeHash,
             )
         }
     }
@@ -250,6 +252,7 @@ class BooxHandoffStore(val root: File) {
         documentRoot: File,
         previous: HandoffState?,
         previousActive: File?,
+        previousActiveHash: String?,
     ): InstallResult.Installed {
         val active = activeDir(documentRoot)
         val stem = delivery.originalFileName.substringBeforeLast('.').sanitizeStem()
@@ -272,6 +275,7 @@ class BooxHandoffStore(val root: File) {
         next.validate()
         val intent = InstallIntent(
             previousActiveFileName = previousActive?.name,
+            previousActiveSha256 = previousActiveHash,
             nextState = next,
         )
         writeInstallIntent(documentRoot, intent)
@@ -280,6 +284,10 @@ class BooxHandoffStore(val root: File) {
         // state are committed. recoverInstall() completes or safely restarts each
         // intermediate state after process death or power loss.
         publishFileOrVerify(incomingPdf, destination, delivery.contentSha256)
+        beforeInstallCommitForTest?.invoke(previousActive)
+        if (preserveChangedPredecessor(documentRoot, previous, intent, destination)) {
+            error("The active PDF changed during installation; its edits were preserved. Retry the update")
+        }
         writeState(documentRoot, next)
         retirePreviousActive(documentRoot, intent)
         clearInstallIntent(documentRoot)
@@ -540,12 +548,47 @@ class BooxHandoffStore(val root: File) {
                 require(next.sourceGeneration > current.sourceGeneration) {
                     "Install intent generation is not newer"
                 }
+                if (preserveChangedPredecessor(documentRoot, current, intent, nextActive)) return
                 writeState(documentRoot, next)
             }
         }
 
         retirePreviousActive(documentRoot, intent)
         clearInstallIntent(documentRoot)
+    }
+
+    private fun preserveChangedPredecessor(
+        documentRoot: File,
+        current: HandoffState?,
+        intent: InstallIntent,
+        replacement: File,
+    ): Boolean {
+        val previousName = intent.previousActiveFileName ?: return false
+        val expectedHash = requireNotNull(intent.previousActiveSha256)
+        val previousState = requireNotNull(current) { "Install intent predecessor state is missing" }
+        require(previousState.activeFileName == previousName) {
+            "Install intent predecessor does not match the active handoff state"
+        }
+        val previous = File(activeDir(documentRoot), previousName)
+        val commitHash = previous.takeIf(File::isFile)?.let(::sha256Hex)
+        if (commitHash == expectedHash) return false
+
+        if (replacement.exists()) {
+            require(replacement.isFile) { "Replacement active path is not a PDF file" }
+            require(sha256Hex(replacement) == intent.nextState.installedBrokerSha256) {
+                "Replacement active PDF changed before install cancellation"
+            }
+            deleteAndSync(replacement, activeDir(documentRoot))
+        }
+        clearInstallIntent(documentRoot)
+        if (
+            commitHash != null &&
+            commitHash != previousState.installedBrokerSha256 &&
+            commitHash != previousState.finalizedLocalSha256
+        ) {
+            commitFinalization(documentRoot, previousState, previous, commitHash)
+        }
+        return true
     }
 
     private fun cleanupStagedPublications(directory: File, destinationName: String, description: String) {
