@@ -302,7 +302,12 @@ class BooxHandoffStore(val root: File) {
 
     private fun readState(documentRoot: File): HandoffState? = stateFile(documentRoot)
         .takeIf(File::isFile)
-        ?.let { HandoffState.fromJson(JSONObject(it.readText())) }
+        ?.let { parseState(it, documentRoot) }
+
+    private fun parseState(file: File, documentRoot: File): HandoffState =
+        HandoffState.fromJson(JSONObject(file.readText())).also { state ->
+            require(state.documentId == documentRoot.name) { "Handoff state belongs to a different document" }
+        }
 
     private fun writeState(documentRoot: File, state: HandoffState) {
         documentRoot.mkdirs()
@@ -332,16 +337,55 @@ class BooxHandoffStore(val root: File) {
         val current = stateFile(documentRoot)
         val next = File(documentRoot, ".inkbridge-state.next")
         val previous = File(documentRoot, ".inkbridge-state.previous")
+        val currentValid = current.takeIf(File::isFile)?.let {
+            runCatching { parseState(it, documentRoot) }.getOrNull()
+        }
+        if (currentValid != null) {
+            deleteAndSync(next, documentRoot)
+            deleteAndSync(previous, documentRoot)
+            return
+        }
+
+        val nextValid = next.takeIf(File::isFile)?.let {
+            runCatching { parseState(it, documentRoot) }.getOrNull()
+        }
+        val previousValid = previous.takeIf(File::isFile)?.let {
+            runCatching { parseState(it, documentRoot) }.getOrNull()
+        }
         when {
-            current.isFile -> {
-                next.delete()
-                previous.delete()
-            }
-            next.isFile -> {
+            current.isFile && nextValid != null -> {
+                preserveCorruptState(current, documentRoot)
                 moveNoReplace(next, current)
-                previous.delete()
+                deleteAndSync(previous, documentRoot)
             }
-            previous.isFile -> moveNoReplace(previous, current)
+            current.isFile && previousValid != null -> {
+                preserveCorruptState(current, documentRoot)
+                if (next.isFile) preserveCorruptState(next, documentRoot)
+                moveNoReplace(previous, current)
+            }
+            !current.exists() && nextValid != null -> {
+                moveNoReplace(next, current)
+                deleteAndSync(previous, documentRoot)
+            }
+            !current.exists() && previousValid != null -> {
+                if (next.isFile) preserveCorruptState(next, documentRoot)
+                moveNoReplace(previous, current)
+            }
+            current.isFile -> parseState(current, documentRoot)
+            current.exists() -> error("Handoff state path is not a file")
+            next.isFile -> parseState(next, documentRoot)
+            previous.isFile -> parseState(previous, documentRoot)
+        }
+    }
+
+    private fun preserveCorruptState(file: File, documentRoot: File) {
+        val contentHash = sha256Hex(file)
+        val preserved = File(documentRoot, file.name + ".corrupt-" + contentHash)
+        if (preserved.isFile) {
+            require(sha256Hex(preserved) == contentHash) { "Conflicting preserved corrupt state" }
+            deleteAndSync(file, documentRoot)
+        } else {
+            moveNoReplace(file, preserved)
         }
     }
 

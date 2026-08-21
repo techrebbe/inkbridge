@@ -354,6 +354,28 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun malformedCurrentState_restoresValidPreviousAndPreservesCorruptBytes() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val documentRoot = File(root, documentId)
+        val current = File(documentRoot, ".inkbridge-state.json")
+        val previous = File(documentRoot, ".inkbridge-state.previous")
+        previous.writeBytes(current.readBytes())
+        current.writeText("{")
+
+        assertEquals(installed.state, store.state(documentId))
+        assertEquals(installed.state, HandoffState.fromJson(JSONObject(current.readText())))
+        assertFalse(previous.exists())
+        val preserved = documentRoot.listFiles().orEmpty().single {
+            it.name.startsWith(".inkbridge-state.json.corrupt-")
+        }
+        assertEquals("{", preserved.readText())
+    }
+
+    @Test
     fun missingCommittedStateWithActivePdfFailsClosed() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
