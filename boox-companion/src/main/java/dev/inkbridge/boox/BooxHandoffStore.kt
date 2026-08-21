@@ -274,7 +274,7 @@ class BooxHandoffStore(val root: File) {
         )
         next.validate()
         val intent = InstallIntent(
-            previousActiveFileName = previousActive?.name,
+            previousState = previous,
             previousActiveSha256 = previousActiveHash,
             nextState = next,
         )
@@ -289,6 +289,7 @@ class BooxHandoffStore(val root: File) {
             error("The active PDF changed during installation; its edits were preserved. Retry the update")
         }
         writeState(documentRoot, next)
+        preserveCommittedPredecessorIfChanged(documentRoot, intent)
         retirePreviousActive(documentRoot, intent)
         clearInstallIntent(documentRoot)
         return InstallResult.Installed(destination, next)
@@ -539,7 +540,7 @@ class BooxHandoffStore(val root: File) {
                 error("Install intent does not match the committed handoff state")
             }
             else -> {
-                require(intent.previousActiveFileName == current.activeFileName) {
+                require(intent.previousState == current) {
                     "Install intent predecessor does not match the active handoff state"
                 }
                 require(next.activeRevisions.strictlyDominates(current.activeRevisions)) {
@@ -553,6 +554,7 @@ class BooxHandoffStore(val root: File) {
             }
         }
 
+        preserveCommittedPredecessorIfChanged(documentRoot, intent)
         retirePreviousActive(documentRoot, intent)
         clearInstallIntent(documentRoot)
     }
@@ -563,10 +565,11 @@ class BooxHandoffStore(val root: File) {
         intent: InstallIntent,
         replacement: File,
     ): Boolean {
-        val previousName = intent.previousActiveFileName ?: return false
+        val intentPrevious = intent.previousState ?: return false
+        val previousName = intentPrevious.activeFileName
         val expectedHash = requireNotNull(intent.previousActiveSha256)
         val previousState = requireNotNull(current) { "Install intent predecessor state is missing" }
-        require(previousState.activeFileName == previousName) {
+        require(previousState == intentPrevious) {
             "Install intent predecessor does not match the active handoff state"
         }
         val previous = File(activeDir(documentRoot), previousName)
@@ -591,6 +594,37 @@ class BooxHandoffStore(val root: File) {
         return true
     }
 
+    private fun preserveCommittedPredecessorIfChanged(
+        documentRoot: File,
+        intent: InstallIntent,
+    ) {
+        val previousState = intent.previousState ?: return
+        val previous = File(activeDir(documentRoot), previousState.activeFileName)
+        if (!previous.isFile) return
+        val expectedHash = requireNotNull(intent.previousActiveSha256)
+        val commitHash = sha256Hex(previous)
+        if (
+            commitHash == expectedHash ||
+            commitHash == previousState.installedBrokerSha256 ||
+            commitHash == previousState.finalizedLocalSha256
+        ) return
+
+        val nextLocalGeneration = previousState.localGeneration + 1
+        val outputName = previous.nameWithoutExtension +
+            "__boox-finalized-g" + nextLocalGeneration + "-" + commitHash.take(12) + ".pdf"
+        ensureFinalizedArtifacts(
+            documentRoot,
+            previousState,
+            previous,
+            commitHash,
+            outputName,
+            nextLocalGeneration,
+        )
+        require(sha256Hex(previous) == commitHash) {
+            "NeoReader continued changing the predecessor while it was being preserved; retry the update"
+        }
+    }
+
     private fun cleanupStagedPublications(directory: File, destinationName: String, description: String) {
         val prefix = ".$destinationName."
         var deleted = false
@@ -604,7 +638,7 @@ class BooxHandoffStore(val root: File) {
     }
 
     private fun retirePreviousActive(documentRoot: File, intent: InstallIntent) {
-        val previousName = intent.previousActiveFileName ?: return
+        val previousName = intent.previousState?.activeFileName ?: return
         if (previousName == intent.nextState.activeFileName) return
         val previous = File(activeDir(documentRoot), previousName)
         if (!previous.exists()) return

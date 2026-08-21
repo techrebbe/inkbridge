@@ -148,32 +148,41 @@ data class HandoffState(
 
 
 data class InstallIntent(
-    val schemaVersion: Int = 2,
-    val previousActiveFileName: String?,
+    val schemaVersion: Int = 3,
+    val previousState: HandoffState?,
     val previousActiveSha256: String?,
     val nextState: HandoffState,
 ) {
     fun validate(documentId: String) {
-        require(schemaVersion == 2) { "Unsupported install intent version" }
+        require(schemaVersion == 3) { "Unsupported install intent version" }
+        previousState?.validate()
         nextState.validate()
         require(nextState.documentId == documentId) { "Install intent belongs to a different document" }
-        previousActiveFileName?.let { requireSafeFileName(it, "previous active file name") }
         previousActiveSha256?.let { require(SHA256.matches(it)) { "Invalid previous active PDF hash" } }
-        require((previousActiveFileName == null) == (previousActiveSha256 == null)) {
-            "Install intent predecessor file and hash must be recorded together"
+        require((previousState == null) == (previousActiveSha256 == null)) {
+            "Install intent predecessor state and hash must be recorded together"
+        }
+        previousState?.let { previous ->
+            require(previous.documentId == documentId) { "Install intent predecessor belongs elsewhere" }
+            require(nextState.activeRevisions.strictlyDominates(previous.activeRevisions)) {
+                "Install intent revisions do not advance the predecessor"
+            }
+            require(nextState.sourceGeneration > previous.sourceGeneration) {
+                "Install intent generation is not newer than the predecessor"
+            }
         }
     }
 
     fun toJson(): JSONObject = JSONObject()
         .put("schemaVersion", schemaVersion)
-        .putOpt("previousActiveFileName", previousActiveFileName)
+        .putOpt("previousState", previousState?.toJson())
         .putOpt("previousActiveSha256", previousActiveSha256)
         .put("nextState", nextState.toJson())
 
     companion object {
         fun fromJson(value: JSONObject, documentId: String) = InstallIntent(
             schemaVersion = value.getInt("schemaVersion"),
-            previousActiveFileName = value.optNullableString("previousActiveFileName"),
+            previousState = value.optJSONObject("previousState")?.let(HandoffState::fromJson),
             previousActiveSha256 = value.optNullableString("previousActiveSha256"),
             nextState = HandoffState.fromJson(value.getJSONObject("nextState")),
         ).also { it.validate(documentId) }

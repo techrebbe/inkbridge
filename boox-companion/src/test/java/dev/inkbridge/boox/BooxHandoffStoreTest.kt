@@ -444,7 +444,7 @@ class BooxHandoffStoreTest {
         val active = File(File(documentRoot, "active").also(File::mkdirs), next.activeFileName)
         active.writeBytes(bytes)
         File(documentRoot, ".inkbridge-install.json").writeText(
-            InstallIntent(previousActiveFileName = null, previousActiveSha256 = null, nextState = next).toJson().toString(2),
+            InstallIntent(previousState = null, previousActiveSha256 = null, nextState = next).toJson().toString(2),
         )
 
         assertEquals(next, store.state(documentId))
@@ -471,7 +471,7 @@ class BooxHandoffStoreTest {
         val active = File(documentRoot, "active").also(File::mkdirs)
         val staged = File(active, ".${next.activeFileName}.123.tmp").apply { writeText("partial") }
         File(documentRoot, ".inkbridge-install.json").writeText(
-            InstallIntent(previousActiveFileName = null, previousActiveSha256 = null, nextState = next).toJson().toString(2),
+            InstallIntent(previousState = null, previousActiveSha256 = null, nextState = next).toJson().toString(2),
         )
 
         assertEquals(null, store.state(documentId))
@@ -524,7 +524,7 @@ class BooxHandoffStoreTest {
     }
 
     @Test
-    fun interruptedInstall_afterStateCommit_retiresPredecessorAndClearsIntent() {
+    fun interruptedInstall_afterStateCommit_preservesEditedPredecessorBeforeRetirement() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
         val first = store.install(
@@ -536,10 +536,15 @@ class BooxHandoffStoreTest {
         File(File(documentRoot, "active"), next.activeFileName).writeBytes(secondBytes)
         writeIntent(documentRoot, first, next)
         File(documentRoot, ".inkbridge-state.json").writeText(next.toJson().toString(2))
+        first.activeFile.appendText("-late-neoreader-edit")
 
         assertEquals(next, store.state(documentId))
         assertFalse(first.activeFile.exists())
         assertTrue(File(File(documentRoot, ".retired"), first.activeFile.name).isFile)
+        val outgoing = File(documentRoot, "outgoing")
+        val preserved = outgoing.listFiles().orEmpty().single { it.extension == "pdf" }
+        assertEquals("one-late-neoreader-edit", preserved.readText())
+        assertTrue(File(outgoing, preserved.name + ".inkbridge.json").isFile)
         assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
     }
 
@@ -795,7 +800,7 @@ class BooxHandoffStoreTest {
     ) {
         File(documentRoot, ".inkbridge-install.json").writeText(
             InstallIntent(
-                previousActiveFileName = first.activeFile.name,
+                previousState = first.state,
                 previousActiveSha256 = sha256Hex(first.activeFile),
                 nextState = next,
             ).toJson().toString(2),
