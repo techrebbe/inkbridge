@@ -9,6 +9,8 @@ internal const val BROKER_PRODUCER = "inkbridge-broker"
 internal const val DESCRIPTOR_SCHEMA_VERSION = 1
 internal const val MAX_DESCRIPTOR_BYTES = 256 * 1024L
 internal const val SAFE_FILE_NAME_MAX_BYTES = 180
+internal const val MAX_PROCESSED_EVENT_IDS = 64
+private const val MAX_EVENT_ID_BYTES = 256
 private val DOCUMENT_ID = Regex("inkbridge-doc-v1-[0-9a-f]{64}")
 private val SHA256 = Regex("[0-9a-f]{64}")
 
@@ -46,7 +48,7 @@ data class BrokerDelivery(
     fun validate() {
         require(schemaVersion == DESCRIPTOR_SCHEMA_VERSION) { "Unsupported descriptor version" }
         require(producer == BROKER_PRODUCER) { "Not an InkBridge broker output" }
-        require(eventId.isNotBlank() && eventId.length <= 256) { "Invalid event ID" }
+        requireEventId(eventId, "event ID")
         require(DOCUMENT_ID.matches(documentId)) { "Invalid stable document ID" }
         require(sourceGeneration >= 1) { "Invalid source generation" }
         require(SHA256.matches(contentSha256)) { "Invalid content hash" }
@@ -103,7 +105,7 @@ data class HandoffState(
         requireSafeFileName(originalFileName, "original file name")
         requireSafeFileName(activeFileName, "active file name")
         require(sourceGeneration >= 1) { "Invalid source generation" }
-        require(brokerEventId.isNotBlank() && brokerEventId.length <= 256) { "Invalid broker event ID" }
+        requireEventId(brokerEventId, "broker event ID")
         require(SHA256.matches(installedBrokerSha256)) { "Invalid installed PDF hash" }
         finalizedLocalSha256?.let { require(SHA256.matches(it)) { "Invalid finalized PDF hash" } }
         finalizedOutputFileName?.let { requireSafeFileName(it, "finalized output file name") }
@@ -111,9 +113,9 @@ data class HandoffState(
             "Finalized PDF hash and file name must be recorded together"
         }
         require(localGeneration >= 0) { "Invalid local generation" }
-        require(processedEventIds.all { it.isNotBlank() && it.length <= 256 }) {
-            "Invalid processed event ID"
-        }
+        require(processedEventIds.size <= MAX_PROCESSED_EVENT_IDS) { "Too many processed event IDs" }
+        processedEventIds.forEach { requireEventId(it, "processed event ID") }
+        require(retiredPredecessors.size <= 1) { "Too many retired predecessor watches" }
         retiredPredecessors.forEach { it.validate(documentId) }
         require(retiredPredecessors.map { it.retiredFileName }.distinct().size == retiredPredecessors.size) {
             "Duplicate retired predecessor watch"
@@ -155,7 +157,8 @@ data class HandoffState(
                 finalizedLocalSha256 = value.optNullableString("finalizedLocalSha256"),
                 finalizedOutputFileName = value.optNullableString("finalizedOutputFileName"),
                 localGeneration = value.optLong("localGeneration", 0),
-                processedEventIds = List(eventIds.length()) { eventIds.getString(it) },
+                processedEventIds = List(eventIds.length()) { eventIds.getString(it) }
+                    .takeLast(MAX_PROCESSED_EVENT_IDS),
                 retiredPredecessors = List(retiredPredecessors.length()) { index ->
                     RetiredPredecessorWatch.fromJson(retiredPredecessors.getJSONObject(index), documentId)
                 },
@@ -219,6 +222,9 @@ data class RetiredPredecessorWatch(
         previousState.validate()
         require(previousState.retiredPredecessors.isEmpty()) {
             "Retired predecessor watches cannot contain nested watch history"
+        }
+        require(previousState.processedEventIds.isEmpty()) {
+            "Retired predecessor watches cannot contain replay history"
         }
         require(previousState.documentId == documentId) { "Retired predecessor watch belongs elsewhere" }
         requireSafeFileName(retiredFileName, "retired predecessor file name")
@@ -348,6 +354,12 @@ internal fun sha256Hex(file: File): String {
         }
     }
     return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+private fun requireEventId(value: String, label: String) {
+    require(value.isNotBlank() && value.toByteArray(Charsets.UTF_8).size <= MAX_EVENT_ID_BYTES) {
+        "Invalid $label"
+    }
 }
 
 internal fun requireSafeFileName(value: String, label: String) {

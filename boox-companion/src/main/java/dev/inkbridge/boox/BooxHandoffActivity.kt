@@ -23,11 +23,16 @@ class BooxHandoffActivity : Activity() {
     private lateinit var store: BooxHandoffStore
     private lateinit var status: TextView
     private val actionButtons = mutableListOf<Button>()
-    private val neoReaderHandoff = NeoReaderHandoffTracker()
+    private lateinit var neoReaderHandoff: NeoReaderHandoffTracker
     private var operationRunning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        neoReaderHandoff = NeoReaderHandoffTracker(
+            SharedPreferencesNeoReaderHandoffPersistence(
+                getSharedPreferences(NEOREADER_HANDOFF_PREFERENCES, MODE_PRIVATE),
+            ),
+        )
         store = BooxHandoffStore(
             File(Environment.getExternalStorageDirectory(), "Documents/InkBridge"),
             predecessorQuietPeriodMillis = 1_500,
@@ -325,36 +330,10 @@ class BooxHandoffActivity : Activity() {
     companion object {
         private val STORAGE_EXECUTOR = Executors.newSingleThreadExecutor()
         private const val TAG = "INKBRIDGE_BOOX_HANDOFF"
+        private const val NEOREADER_HANDOFF_PREFERENCES = "inkbridge-neoreader-handoff"
         private const val EXTRA_DOCUMENT_ID = "documentId"
         private const val ACTION_INSTALL_NEXT = "dev.inkbridge.boox.action.INSTALL_NEXT"
         private const val ACTION_OPEN_ACTIVE = "dev.inkbridge.boox.action.OPEN_ACTIVE"
         private const val ACTION_FINALIZE_ACTIVE = "dev.inkbridge.boox.action.FINALIZE_ACTIVE"
-    }
-}
-
-internal class NeoReaderHandoffTracker {
-    private var pending: HandoffState? = null
-    private var observedPause = false
-
-    fun launchStarted(state: HandoffState) {
-        pending = state
-        observedPause = false
-    }
-
-    fun launchFailed() {
-        pending = null
-        observedPause = false
-    }
-
-    fun activityPaused() {
-        if (pending != null) observedPause = true
-    }
-
-    fun activityResumed(): HandoffState? {
-        if (!observedPause) return null
-        val opened = pending
-        pending = null
-        observedPause = false
-        return opened
     }
 }

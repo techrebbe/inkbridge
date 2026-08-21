@@ -7,24 +7,52 @@ import org.junit.Test
 class NeoReaderHandoffTrackerTest {
     @Test
     fun confirmsOnlyAfterActivityPausedAndResumed() {
-        val tracker = NeoReaderHandoffTracker()
+        val persistence = MemoryHandoffPersistence()
+        val tracker = NeoReaderHandoffTracker(persistence)
         val state = state()
 
         tracker.launchStarted(state)
         assertNull(tracker.activityResumed())
         tracker.activityPaused()
-        assertEquals(state, tracker.activityResumed())
+        assertEquals(expected(state), tracker.activityResumed())
         assertNull(tracker.activityResumed())
+        assertNull(persistence.value)
     }
 
     @Test
     fun failedLaunchNeverConfirms() {
-        val tracker = NeoReaderHandoffTracker()
+        val persistence = MemoryHandoffPersistence()
+        val tracker = NeoReaderHandoffTracker(persistence)
+
         tracker.launchStarted(state())
         tracker.launchFailed()
         tracker.activityPaused()
+
         assertNull(tracker.activityResumed())
+        assertNull(persistence.value)
     }
+
+    @Test
+    fun pausedHandoffSurvivesTrackerRecreation() {
+        val persistence = MemoryHandoffPersistence()
+        val state = state()
+        NeoReaderHandoffTracker(persistence).apply {
+            launchStarted(state)
+            activityPaused()
+        }
+
+        val recreated = NeoReaderHandoffTracker(persistence)
+
+        assertEquals(expected(state), recreated.activityResumed())
+        assertNull(persistence.value)
+    }
+
+    private fun expected(state: HandoffState) = PendingNeoReaderHandoff(
+        documentId = state.documentId,
+        brokerEventId = state.brokerEventId,
+        activeFileName = state.activeFileName,
+        observedPause = true,
+    )
 
     private fun state() = HandoffState(
         documentId = "inkbridge-doc-v1-" + "a".repeat(64),
@@ -35,4 +63,14 @@ class NeoReaderHandoffTrackerTest {
         activeFileName = "Example__ib-b1-s2-g3.pdf",
         installedBrokerSha256 = "b".repeat(64),
     )
+
+    private class MemoryHandoffPersistence(
+        var value: PendingNeoReaderHandoff? = null,
+    ) : NeoReaderHandoffPersistence {
+        override fun load(): PendingNeoReaderHandoff? = value
+
+        override fun save(value: PendingNeoReaderHandoff?) {
+            this.value = value
+        }
+    }
 }

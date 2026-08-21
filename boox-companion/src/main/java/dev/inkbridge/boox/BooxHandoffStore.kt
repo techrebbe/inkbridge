@@ -321,7 +321,7 @@ class BooxHandoffStore(
         val destination = File(active, newName)
         val processed = ((previous?.processedEventIds ?: emptyList()) + delivery.eventId)
             .distinct()
-            .takeLast(512)
+            .takeLast(MAX_PROCESSED_EVENT_IDS)
         val previousRetiredPredecessors = previous?.retiredPredecessors.orEmpty()
         val activeHandoffWasOpened = previous != null && previous.openedBrokerEventId == previous.brokerEventId
         require(activeHandoffWasOpened || previousRetiredPredecessors.size < MAX_RETIRED_PREDECESSORS) {

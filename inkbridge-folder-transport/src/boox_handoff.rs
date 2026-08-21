@@ -5,6 +5,7 @@ use inkbridge_broker::{
 };
 use serde::Serialize;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
@@ -184,18 +185,7 @@ fn read_finalized_artifact(
             descriptor_path.display()
         ));
     }
-    if metadata.len() > MAX_DESCRIPTOR_BYTES {
-        return Err(format!(
-            "BOOX handoff descriptor {} exceeds {MAX_DESCRIPTOR_BYTES} bytes",
-            descriptor_path.display()
-        ));
-    }
-    let bytes = fs::read(&descriptor_path).map_err(|error| {
-        format!(
-            "could not read BOOX handoff descriptor {}: {error}",
-            descriptor_path.display()
-        )
-    })?;
+    let bytes = read_bounded_descriptor(&descriptor_path, &metadata)?;
     let event: StorageEvent = serde_json::from_slice(&bytes).map_err(|error| {
         format!(
             "invalid BOOX handoff descriptor {}: {error}",
@@ -301,6 +291,38 @@ fn validate_finalized_event(
     Ok(())
 }
 
+fn read_bounded_descriptor(path: &Path, metadata: &fs::Metadata) -> Result<Vec<u8>, String> {
+    if metadata.len() > MAX_DESCRIPTOR_BYTES {
+        return Err(format!(
+            "BOOX handoff descriptor {} exceeds {MAX_DESCRIPTOR_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)
+        .map_err(|error| {
+            format!(
+                "could not read BOOX handoff descriptor {}: {error}",
+                path.display()
+            )
+        })?
+        .take(MAX_DESCRIPTOR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "could not read BOOX handoff descriptor {}: {error}",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES {
+        return Err(format!(
+            "BOOX handoff descriptor {} exceeds {MAX_DESCRIPTOR_BYTES} bytes",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
 fn validate_document_id(value: &str) -> Result<(), String> {
     let valid = value.strip_prefix("inkbridge-doc-v1-").is_some_and(|hash| {
         hash.len() == 64
@@ -395,6 +417,19 @@ mod tests {
             value["pdfFileName"].as_str().unwrap(),
             prepared.pdf_path.file_name().unwrap().to_str().unwrap()
         );
+    }
+
+    #[test]
+    fn bounded_descriptor_read_rejects_growth_after_metadata_check() {
+        let root = tempdir().unwrap();
+        let descriptor = root.path().join("delivery.pdf.inkbridge.json");
+        fs::write(&descriptor, b"{}").unwrap();
+        let stale_metadata = fs::metadata(&descriptor).unwrap();
+        fs::write(&descriptor, vec![b'x'; MAX_DESCRIPTOR_BYTES as usize + 1]).unwrap();
+
+        assert!(read_bounded_descriptor(&descriptor, &stale_metadata)
+            .unwrap_err()
+            .contains("exceeds"));
     }
 
     #[test]
