@@ -2,6 +2,7 @@ package dev.inkbridge.boox
 
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -78,6 +79,7 @@ class BooxHandoffActivity : Activity() {
     }
 
     private fun dispatchIntent(intent: Intent) {
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
         when (intent.action) {
             ACTION_INSTALL_NEXT -> installNext()
             ACTION_OPEN_ACTIVE -> openActive(intent.getStringExtra(EXTRA_DOCUMENT_ID))

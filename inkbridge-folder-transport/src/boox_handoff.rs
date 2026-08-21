@@ -4,7 +4,10 @@ use inkbridge_broker::{
     EVENT_SCHEMA_VERSION,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
@@ -131,78 +134,19 @@ impl BooxHandoffEndpoint {
             let name = descriptor_path
                 .file_name()
                 .and_then(|value| value.to_str())
+                .map(str::to_owned)
                 .unwrap_or_default();
             if !name.ends_with(DESCRIPTOR_SUFFIX) {
                 continue;
             }
-            let metadata = entry.metadata().map_err(|error| {
-                format!(
-                    "could not inspect BOOX handoff descriptor {}: {error}",
-                    descriptor_path.display()
-                )
-            })?;
-            if !metadata.is_file() {
-                return Err(format!(
-                    "BOOX handoff descriptor {} is not a regular file",
-                    descriptor_path.display()
-                ));
-            }
-            if metadata.len() > MAX_DESCRIPTOR_BYTES {
-                return Err(format!(
-                    "BOOX handoff descriptor {} exceeds {MAX_DESCRIPTOR_BYTES} bytes",
-                    descriptor_path.display()
-                ));
-            }
-            let bytes = fs::read(&descriptor_path).map_err(|error| {
-                format!(
-                    "could not read BOOX handoff descriptor {}: {error}",
-                    descriptor_path.display()
-                )
-            })?;
-            let event: StorageEvent = serde_json::from_slice(&bytes).map_err(|error| {
-                format!(
-                    "invalid BOOX handoff descriptor {}: {error}",
-                    descriptor_path.display()
-                )
-            })?;
-            validate_finalized_event(&event, document)?;
-            let pdf_name = name
-                .strip_suffix(".inkbridge.json")
-                .expect("descriptor suffix was checked above");
-            validate_file_name(pdf_name, "finalized BOOX PDF file name")?;
-            let object_name = Path::new(&event.object_path)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| {
-                    format!(
-                        "BOOX handoff descriptor {} has no object file name",
-                        descriptor_path.display()
-                    )
-                })?;
-            if object_name != pdf_name {
-                return Err(format!(
-                    "BOOX handoff descriptor {} names object {} but is paired with {}",
-                    descriptor_path.display(),
-                    object_name,
-                    pdf_name
-                ));
-            }
-            let pdf_path = outgoing.join(pdf_name);
-            if !fs::metadata(&pdf_path)
-                .map(|metadata| metadata.is_file())
-                .unwrap_or(false)
+            // Folder mirrors may expose a descriptor before its PDF or leave a
+            // partial/corrupt pair. Such an entry has no authority and must not
+            // block later valid artifacts or Supernote uploads for the document.
+            if let Ok(artifact) =
+                read_finalized_artifact(&outgoing, descriptor_path, &name, document)
             {
-                return Err(format!(
-                    "BOOX handoff descriptor {} is missing paired PDF {}",
-                    descriptor_path.display(),
-                    pdf_path.display()
-                ));
+                artifacts.push(artifact);
             }
-            artifacts.push(FinalizedBooxArtifact {
-                descriptor_path,
-                pdf_path,
-                event,
-            });
         }
         artifacts.sort_by(|left, right| {
             (
@@ -222,6 +166,112 @@ impl BooxHandoffEndpoint {
         });
         Ok(artifacts)
     }
+}
+
+fn read_finalized_artifact(
+    outgoing: &Path,
+    descriptor_path: PathBuf,
+    name: &str,
+    document: &DocumentFolders,
+) -> Result<FinalizedBooxArtifact, String> {
+    let metadata = fs::symlink_metadata(&descriptor_path).map_err(|error| {
+        format!(
+            "could not inspect BOOX handoff descriptor {}: {error}",
+            descriptor_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "BOOX handoff descriptor {} is not a regular file",
+            descriptor_path.display()
+        ));
+    }
+    if metadata.len() > MAX_DESCRIPTOR_BYTES {
+        return Err(format!(
+            "BOOX handoff descriptor {} exceeds {MAX_DESCRIPTOR_BYTES} bytes",
+            descriptor_path.display()
+        ));
+    }
+    let bytes = fs::read(&descriptor_path).map_err(|error| {
+        format!(
+            "could not read BOOX handoff descriptor {}: {error}",
+            descriptor_path.display()
+        )
+    })?;
+    let event: StorageEvent = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "invalid BOOX handoff descriptor {}: {error}",
+            descriptor_path.display()
+        )
+    })?;
+    validate_finalized_event(&event, document)?;
+    let pdf_name = name
+        .strip_suffix(".inkbridge.json")
+        .expect("descriptor suffix was checked above");
+    validate_file_name(pdf_name, "finalized BOOX PDF file name")?;
+    let object_name = Path::new(&event.object_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            format!(
+                "BOOX handoff descriptor {} has no object file name",
+                descriptor_path.display()
+            )
+        })?;
+    if object_name != pdf_name {
+        return Err(format!(
+            "BOOX handoff descriptor {} names object {} but is paired with {}",
+            descriptor_path.display(),
+            object_name,
+            pdf_name
+        ));
+    }
+    let pdf_path = outgoing.join(pdf_name);
+    let pdf_metadata = fs::symlink_metadata(&pdf_path).map_err(|error| {
+        format!(
+            "BOOX handoff descriptor {} is missing paired PDF {}: {error}",
+            descriptor_path.display(),
+            pdf_path.display()
+        )
+    })?;
+    if pdf_metadata.file_type().is_symlink() || !pdf_metadata.is_file() {
+        return Err(format!(
+            "BOOX handoff descriptor {} is missing a regular paired PDF {}",
+            descriptor_path.display(),
+            pdf_path.display()
+        ));
+    }
+    let actual_hash = sha256_file(&pdf_path)?;
+    if actual_hash != event.content_sha256 {
+        return Err(format!(
+            "BOOX handoff PDF {} hash {actual_hash} does not match descriptor {}",
+            pdf_path.display(),
+            event.content_sha256
+        ));
+    }
+    Ok(FinalizedBooxArtifact {
+        descriptor_path,
+        pdf_path,
+        event,
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let file =
+        File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn validate_finalized_event(
@@ -434,35 +484,67 @@ mod tests {
             .contains("one safe PDF"));
     }
     #[test]
-    fn rejects_descriptor_without_its_paired_pdf() {
+    fn skips_invalid_or_incomplete_descriptors_and_returns_valid_pair() {
         let root = tempdir().unwrap();
         let document = document();
         let endpoint = BooxHandoffEndpoint::new(root.path(), &document).unwrap();
         let outgoing = root.path().join(&document.document_id).join("outgoing");
         fs::create_dir_all(&outgoing).unwrap();
-        let pdf_name = "missing.pdf";
-        let event = StorageEvent {
+        fs::write(
+            outgoing.join("a-malformed.pdf.inkbridge.json"),
+            b"{not-json",
+        )
+        .unwrap();
+
+        let event = |event_id: &str, pdf_name: &str, content_sha256: String| StorageEvent {
             schema_version: EVENT_SCHEMA_VERSION,
-            event_id: "missing".to_owned(),
+            event_id: event_id.to_owned(),
             document_id: document.document_id.clone(),
             source: DeviceSide::Boox,
             object_path: format!("BOOX_Folder/{}/{pdf_name}", document.document_id),
             source_generation: 1,
             source_revision: 1,
             based_on: RevisionPair::default(),
-            content_sha256: "c".repeat(64),
+            content_sha256,
             payload_kind: DevicePayloadKind::DeviceView,
             broker_output: None,
         };
+
+        let missing = event("missing", "b-missing.pdf", "c".repeat(64));
         fs::write(
-            outgoing.join(format!("{pdf_name}.inkbridge.json")),
-            serde_json::to_vec_pretty(&event).unwrap(),
+            outgoing.join("b-missing.pdf.inkbridge.json"),
+            serde_json::to_vec_pretty(&missing).unwrap(),
         )
         .unwrap();
 
-        assert!(endpoint
-            .finalized_artifacts(&document)
-            .unwrap_err()
-            .contains("missing paired PDF"));
+        fs::write(outgoing.join("c-corrupt.pdf"), b"truncated").unwrap();
+        let corrupt = event(
+            "corrupt",
+            "c-corrupt.pdf",
+            inkbridge_broker::sha256_hex(b"expected complete PDF"),
+        );
+        fs::write(
+            outgoing.join("c-corrupt.pdf.inkbridge.json"),
+            serde_json::to_vec_pretty(&corrupt).unwrap(),
+        )
+        .unwrap();
+
+        let valid_bytes = b"valid NeoReader PDF";
+        fs::write(outgoing.join("z-valid.pdf"), valid_bytes).unwrap();
+        let valid = event(
+            "valid",
+            "z-valid.pdf",
+            inkbridge_broker::sha256_hex(valid_bytes),
+        );
+        fs::write(
+            outgoing.join("z-valid.pdf.inkbridge.json"),
+            serde_json::to_vec_pretty(&valid).unwrap(),
+        )
+        .unwrap();
+
+        let artifacts = endpoint.finalized_artifacts(&document).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].event, valid);
+        assert_eq!(artifacts[0].pdf_path, outgoing.join("z-valid.pdf"));
     }
 }

@@ -40,7 +40,19 @@ jobs:
             :boox-companion:testDebugUnitTest \
             :boox-companion:lintDebug \
             :boox-companion:assembleDebug \
+            :boox-companion:assembleRelease \
             --console=plain
+      - name: Verify automation actions are debug-only
+        run: |
+          debug_manifest=$(find boox-companion/build/intermediates/merged_manifests/debug -name AndroidManifest.xml -print -quit)
+          release_manifest=$(find boox-companion/build/intermediates/merged_manifests/release -name AndroidManifest.xml -print -quit)
+          test -n "$debug_manifest"
+          test -n "$release_manifest"
+          grep -q 'dev.inkbridge.boox.action.INSTALL_NEXT' "$debug_manifest"
+          if grep -q 'dev.inkbridge.boox.action.INSTALL_NEXT' "$release_manifest"; then
+            echo "Release manifest exposes debug-only BOOX automation actions" >&2
+            exit 1
+          fi
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:

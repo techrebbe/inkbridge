@@ -19,12 +19,6 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <intent-filter>
-                <action android:name="dev.inkbridge.boox.action.INSTALL_NEXT" />
-                <action android:name="dev.inkbridge.boox.action.OPEN_ACTIVE" />
-                <action android:name="dev.inkbridge.boox.action.FINALIZE_ACTIVE" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
         </activity>
     </application>
 </manifest>

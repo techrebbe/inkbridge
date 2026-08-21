@@ -87,7 +87,7 @@ This milestone does not add cloud resources or change deployed broker infrastruc
 
 ## ADB test actions
 
-The debug build exposes three explicit actions. Always select the physical BOOX serial when more than one Android device is connected:
+The debug build exposes three explicit actions. Their intent filters exist only in the debug manifest, and release builds ignore explicit automation actions even if another app targets the launcher activity directly. Always select the physical BOOX serial when more than one Android device is connected:
 
 ```powershell
 adb -s <BOOX_SERIAL> shell am start -a dev.inkbridge.boox.action.INSTALL_NEXT
