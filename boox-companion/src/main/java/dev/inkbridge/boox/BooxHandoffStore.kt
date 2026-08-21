@@ -136,6 +136,15 @@ class BooxHandoffStore(val root: File) {
                     else -> true
                 }
                 if (!candidate) return@runCatching false
+                if (state != null) {
+                    val active = File(activeDir(deliveryRoot), state.activeFileName)
+                    val activeHash = active.takeIf(File::isFile)?.let(::sha256Hex)
+                        ?: return@runCatching false
+                    if (
+                        activeHash != state.installedBrokerSha256 &&
+                        activeHash != state.finalizedLocalSha256
+                    ) return@runCatching false
+                }
 
                 val incomingPdf = File(descriptor.parentFile, delivery.pdfFileName)
                 require(incomingPdf.isFile) { "Incoming PDF is missing" }

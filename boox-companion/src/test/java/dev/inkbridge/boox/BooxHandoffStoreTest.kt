@@ -575,6 +575,38 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun descriptorQueue_skipsDocumentWithUnfinalizedEditAndFindsAnotherDocument() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val secondDocumentId = "inkbridge-doc-v1-" + "b".repeat(64)
+        val blocked = store.install(
+            delivery(root, "event-a-current", RevisionPair(0, 1), 10, "a-current".toByteArray()),
+        ) as InstallResult.Installed
+        store.install(
+            delivery(
+                root,
+                "event-b-current",
+                RevisionPair(0, 1),
+                10,
+                "b-current".toByteArray(),
+                secondDocumentId,
+            ),
+        )
+        blocked.activeFile.appendText("-unfinalized-edit")
+        delivery(root, "event-a-next", RevisionPair(0, 2), 11, "a-next".toByteArray())
+        val available = delivery(
+            root,
+            "event-b-next",
+            RevisionPair(0, 2),
+            11,
+            "b-next".toByteArray(),
+            secondDocumentId,
+        )
+
+        assertEquals(available.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+    }
+
+    @Test
     fun descriptorQueue_skipsExpiredEventsOutsideProcessedIdWindow() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
