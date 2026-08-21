@@ -5,9 +5,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.channels.FileChannel
 import java.nio.file.AccessDeniedException
-import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 
@@ -682,12 +680,9 @@ class BooxHandoffStore(val root: File) {
     private fun moveNoReplace(source: File, destination: File) {
         val sourceDirectory = requireNotNull(source.parentFile)
         val destinationDirectory = requireNotNull(destination.parentFile).also(File::mkdirs)
-        require(!destination.exists()) { "Refusing to overwrite ${destination.name}" }
-        try {
-            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE)
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(source.toPath(), destination.toPath())
-        }
+        // ATOMIC_MOVE may replace a target that appears concurrently. With no
+        // REPLACE_EXISTING option, the provider must fail rather than overwrite.
+        Files.move(source.toPath(), destination.toPath())
         syncDirectory(destinationDirectory)
         if (sourceDirectory.absolutePath != destinationDirectory.absolutePath) {
             syncDirectory(sourceDirectory)
