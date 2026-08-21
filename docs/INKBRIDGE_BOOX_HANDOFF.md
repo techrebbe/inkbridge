@@ -9,7 +9,7 @@ Real-device testing established two important NeoReader behaviors:
 1. Replacing bytes at an already-open path can display new annotations without adopting them as editable NeoReader ink.
 2. Keeping a stable copy and a revisioned copy visible can cause NeoReader to embed edits into the wrong file.
 
-The companion therefore gives every broker output a fresh filename and keeps exactly one active view for a logical document. The immediate predecessor moves into a hidden `.retired` directory while NeoReader releases it; after the new versioned path has been opened successfully, the next install safely compacts the older predecessor so retained full-PDF storage remains bounded.
+The companion therefore gives every broker output a fresh filename and keeps exactly one active view for a logical document. The immediate predecessor moves into a hidden `.retired` directory while NeoReader releases it; after the companion has paused for NeoReader and then resumed from that foreground round trip, the next install safely compacts the older predecessor so retained full-PDF storage remains bounded.
 
 ## Device layout
 
@@ -67,12 +67,12 @@ The companion validates the producer, document ID, filenames, source generation,
 - Hashing, copying, synchronization, state recovery, and finalization run on one serialized background worker. The activity disables actions while work is running and performs only status updates and the final NeoReader launch on Android's main thread.
 - Files and state use synchronized temporary files plus create-only publication. Existing destination bytes are never overwritten, and each streamed PDF copy is hash-verified before its temporary file is published.
 - A durable install intent keeps the previous active PDF in place until the replacement PDF and state are committed. After interruption or power loss, the next companion action completes the install or safely discards an unpublished attempt before retiring the predecessor.
-- A successful NeoReader launch records the versioned-path handoff boundary. InkBridge retains and watches at most one full predecessor PDF; the next confirmed install rechecks late bytes, publishes any final edit, and crash-safely removes the older predecessor. If the active handoff was never opened, a further install is refused instead of deleting uncertain data or growing storage without a bound.
+- Returning to the companion after it paused for a NeoReader launch records the versioned-path handoff boundary; merely dispatching the asynchronous Android intent does not. InkBridge retains and watches at most one full predecessor PDF; the next confirmed install rechecks late bytes, publishes any final edit, and crash-safely removes the older predecessor. If the active handoff was never opened, a further install is refused instead of deleting uncertain data or growing storage without a bound.
 - If either member of an already-finalized outgoing PDF/descriptor pair disappears, the next finalize action deterministically reconstructs the missing artifact from the unchanged active PDF and saved revision state.
 
 ## User flow
 
-1. **Install next update** validates and installs the next broker delivery at a fresh active path, then immediately opens that exact path in NeoReader.
+1. **Install next update** validates and installs the next broker delivery at a fresh active path, then opens that exact path in NeoReader. When you later return to the companion, it records the completed foreground handoff before enabling the next operation.
 2. **Open active document in NeoReader** can reopen the current authoritative path later and renews the same durable handoff confirmation.
 3. After editing and using NeoReader's **Embed Data to PDF**, return to the companion.
 4. **Finalize BOOX changes** creates an immutable outgoing PDF and a broker `StorageEvent` sidecar.

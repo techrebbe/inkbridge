@@ -23,6 +23,7 @@ class BooxHandoffActivity : Activity() {
     private lateinit var store: BooxHandoffStore
     private lateinit var status: TextView
     private val actionButtons = mutableListOf<Button>()
+    private val neoReaderHandoff = NeoReaderHandoffTracker()
     private var operationRunning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -41,6 +42,24 @@ class BooxHandoffActivity : Activity() {
         super.onNewIntent(intent)
         setIntent(intent)
         dispatchIntent(intent)
+    }
+
+    override fun onPause() {
+        neoReaderHandoff.activityPaused()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val opened = neoReaderHandoff.activityResumed() ?: return
+        runStorageAction("Confirming NeoReader handoff...") {
+            val confirmed = store.confirmOpened(
+                opened.documentId,
+                opened.brokerEventId,
+                opened.activeFileName,
+            )
+            StorageOutcome("NeoReader handoff confirmed", confirmed)
+        }
     }
 
     private fun buildUi(): View {
@@ -256,12 +275,17 @@ class BooxHandoffActivity : Activity() {
         // NeoReader explicitly advertises file:// PDF intents. This narrowly-scoped policy avoids
         // FileUriExposedException while preserving in-place editable annotation behavior.
         StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
-        startActivity(Intent(Intent.ACTION_VIEW).apply {
-            setClassName("com.onyx.kreader", "com.onyx.kreader.ui.ReaderHomeActivity")
-            setDataAndType(Uri.fromFile(pdf), "application/pdf")
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        })
-        store.confirmOpened(state.documentId, state.brokerEventId, state.activeFileName)
+        neoReaderHandoff.launchStarted(state)
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW).apply {
+                setClassName("com.onyx.kreader", "com.onyx.kreader.ui.ReaderHomeActivity")
+                setDataAndType(Uri.fromFile(pdf), "application/pdf")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        } catch (error: Throwable) {
+            neoReaderHandoff.launchFailed()
+            throw error
+        }
         Log.i(TAG, "OPEN document=" + state.documentId + " file=" + pdf.absolutePath)
     }
 
@@ -305,5 +329,32 @@ class BooxHandoffActivity : Activity() {
         private const val ACTION_INSTALL_NEXT = "dev.inkbridge.boox.action.INSTALL_NEXT"
         private const val ACTION_OPEN_ACTIVE = "dev.inkbridge.boox.action.OPEN_ACTIVE"
         private const val ACTION_FINALIZE_ACTIVE = "dev.inkbridge.boox.action.FINALIZE_ACTIVE"
+    }
+}
+
+internal class NeoReaderHandoffTracker {
+    private var pending: HandoffState? = null
+    private var observedPause = false
+
+    fun launchStarted(state: HandoffState) {
+        pending = state
+        observedPause = false
+    }
+
+    fun launchFailed() {
+        pending = null
+        observedPause = false
+    }
+
+    fun activityPaused() {
+        if (pending != null) observedPause = true
+    }
+
+    fun activityResumed(): HandoffState? {
+        if (!observedPause) return null
+        val opened = pending
+        pending = null
+        observedPause = false
+        return opened
     }
 }

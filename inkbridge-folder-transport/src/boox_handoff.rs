@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
 const DESCRIPTOR_SUFFIX: &str = ".pdf.inkbridge.json";
-const MAX_DESCRIPTOR_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_DESCRIPTOR_BYTES: u64 = 256 * 1024;
 const GENERATED_EVENT_ID: &str = "inkbridge-event-id";
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,5 +1,5 @@
 use crate::{
-    boox_handoff::{BooxHandoffEndpoint, FinalizedBooxArtifact},
+    boox_handoff::{BooxHandoffEndpoint, FinalizedBooxArtifact, MAX_DESCRIPTOR_BYTES},
     CloudFolder, CloudObject, DocumentFolders, FileObservation, PendingUpload, SyncReport,
     TransportAction, TransportState,
 };
@@ -2062,9 +2062,7 @@ fn publish_bytes_create_only_or_verify(
         if !metadata.is_file() {
             return Ok(DescriptorPublication::Conflict);
         }
-        let existing = fs::read(destination)
-            .map_err(|error| format!("could not read {}: {error}", destination.display()))?;
-        return Ok(if existing == bytes {
+        return Ok(if descriptor_matches(bytes, destination, &metadata)? {
             DescriptorPublication::Ready
         } else {
             DescriptorPublication::Conflict
@@ -2094,14 +2092,25 @@ fn publish_bytes_create_only_or_verify(
         if !metadata.is_file() {
             return Ok(DescriptorPublication::Conflict);
         }
-        let existing = fs::read(destination)
-            .map_err(|error| format!("could not read {}: {error}", destination.display()))?;
-        if existing != bytes {
+        if !descriptor_matches(bytes, destination, &metadata)? {
             return Ok(DescriptorPublication::Conflict);
         }
     }
     Ok(DescriptorPublication::Ready)
 }
+fn descriptor_matches(bytes: &[u8], path: &Path, metadata: &fs::Metadata) -> Result<bool, String> {
+    if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES || metadata.len() > MAX_DESCRIPTOR_BYTES {
+        return Ok(false);
+    }
+    let mut existing = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?
+        .take(MAX_DESCRIPTOR_BYTES + 1)
+        .read_to_end(&mut existing)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    Ok(existing.len() as u64 <= MAX_DESCRIPTOR_BYTES && existing == bytes)
+}
+
 fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String> {
     match rename_create_only(source, destination) {
         Ok(()) => Ok(true),
@@ -2507,6 +2516,27 @@ mod snapshot_tests {
             supernote_export_directory: root.join("supernote/outgoing"),
             supernote_incoming_directory: root.join("supernote/incoming"),
         }
+    }
+
+    #[test]
+    fn descriptor_comparison_rejects_oversized_existing_file() {
+        let directory = tempdir().unwrap();
+        let descriptor = directory.path().join("delivery.inkbridge.json");
+        fs::write(&descriptor, vec![b'x'; MAX_DESCRIPTOR_BYTES as usize + 1]).unwrap();
+        let metadata = fs::metadata(&descriptor).unwrap();
+
+        assert!(!descriptor_matches(b"expected", &descriptor, &metadata).unwrap());
+    }
+
+    #[test]
+    fn descriptor_comparison_bounds_file_that_grows_after_metadata_check() {
+        let directory = tempdir().unwrap();
+        let descriptor = directory.path().join("delivery.inkbridge.json");
+        fs::write(&descriptor, b"expected").unwrap();
+        let stale_metadata = fs::metadata(&descriptor).unwrap();
+        fs::write(&descriptor, vec![b'x'; MAX_DESCRIPTOR_BYTES as usize + 1]).unwrap();
+
+        assert!(!descriptor_matches(b"expected", &descriptor, &stale_metadata).unwrap());
     }
 
     #[test]
