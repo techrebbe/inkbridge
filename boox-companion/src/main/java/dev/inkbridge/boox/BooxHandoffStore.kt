@@ -106,6 +106,9 @@ class BooxHandoffStore(val root: File) {
                 val delivery = BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
                 val incomingPdf = File(descriptor.parentFile, delivery.pdfFileName)
                 require(incomingPdf.isFile) { "Incoming PDF is missing" }
+                require(sha256Hex(incomingPdf) == delivery.contentSha256) {
+                    "Incoming PDF hash does not match its descriptor"
+                }
                 val deliveryRoot = documentRoot(delivery.documentId)
                 recover(deliveryRoot)
                 val state = readState(deliveryRoot)

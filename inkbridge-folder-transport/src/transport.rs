@@ -751,6 +751,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 ));
             }
             let local_key = canonical_path_key(&artifact.pdf_path);
+            let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
             let boox_state = &state.document_mut(&document.document_id).boox;
             if boox_state
                 .uploaded_local_hashes
@@ -760,6 +761,10 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .accepted_local_hashes
                     .get(&local_key)
                     .is_some_and(|hash| hash == &source_hash)
+                || boox_state
+                    .accepted_source_revisions
+                    .get(&source_local_id)
+                    .is_some_and(|revision| *revision >= artifact.event.source_revision)
             {
                 continue;
             }
@@ -767,7 +772,6 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             if artifact.event.based_on == current {
                 let mut companion_document = document.clone();
                 companion_document.boox_pdf.clone_from(&artifact.pdf_path);
-                let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
                 return self.upload_boox_pdf_if_ready(
                     &companion_document,
                     state,

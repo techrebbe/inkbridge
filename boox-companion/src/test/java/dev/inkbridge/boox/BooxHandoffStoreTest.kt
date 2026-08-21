@@ -294,6 +294,16 @@ class BooxHandoffStoreTest {
                 "missing.pdf",
             ).toJson().toString(2),
         )
+        File(incoming, "c-corrupt.pdf").writeText("truncated")
+        File(incoming, "c-corrupt.inkbridge.json").writeText(
+            brokerDelivery(
+                "corrupt-pdf",
+                RevisionPair(0, 1),
+                1,
+                "b".repeat(64),
+                "c-corrupt.pdf",
+            ).toJson().toString(2),
+        )
         val valid = delivery(root, "z-valid", RevisionPair(0, 1), 2, "valid".toByteArray())
 
         assertEquals(valid.canonicalFile, store.findNextDescriptor()!!.canonicalFile)

@@ -1896,6 +1896,110 @@ fn acknowledged_boox_upload_recovers_after_checkpoint_loss_without_allocating_r2
 }
 
 #[test]
+fn acknowledged_finalized_boox_handoff_recovers_by_event_identity_after_checkpoint_loss() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let bytes = b"finalized NeoReader edit";
+    let event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-recoverable".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/book__boox-finalized-g1.pdf",
+            document.document_id
+        ),
+        source_generation: 1,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    write_finalized_boox_handoff(&handoff_root, &document, &event, bytes);
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(
+        &cloud,
+        &document,
+        0,
+        1,
+        native_export_at(0, "accepted", 0, 0),
+    );
+    let checkpoint = TransportState {
+        documents: BTreeMap::from([(
+            document.document_id.clone(),
+            DocumentTransportState {
+                revisions: event.based_on,
+                ..Default::default()
+            },
+        )]),
+        ..TransportState::empty()
+    };
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = checkpoint.clone();
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(state.documents[&document.document_id]
+        .boox
+        .pending
+        .is_some());
+
+    let manifest = b"{\"operations\":[]}".to_vec();
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/incoming/accepted.operations.json",
+            document.document_id
+        ),
+        manifest.clone(),
+        generated_metadata(&document.document_id, "1:1", &manifest),
+    );
+
+    // Simulate losing the checkpoint written after the immutable r1 upload.
+    state = checkpoint;
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    let uploads = cloud
+        .objects
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(object, _)| {
+            object
+                .path
+                .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
+        })
+        .count();
+    assert_eq!(uploads, 1, "the accepted handoff source was uploaded again");
+    assert!(!report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            ..
+        }
+    )));
+    let recovered = &state.documents[&document.document_id];
+    assert_eq!(recovered.revisions.boox, 1);
+    assert!(recovered.boox.pending.is_none());
+    assert_eq!(
+        recovered
+            .boox
+            .accepted_source_revisions
+            .get(&sha256_hex(event.event_id.as_bytes())),
+        Some(&1)
+    );
+}
+
+#[test]
 fn conflict_object_blocks_new_uploads_and_is_reported() {
     let root = tempdir().unwrap();
     let document = mapping(root.path());
