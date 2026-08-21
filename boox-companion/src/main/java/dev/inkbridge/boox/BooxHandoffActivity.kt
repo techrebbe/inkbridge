@@ -105,6 +105,7 @@ class BooxHandoffActivity : Activity() {
                     " / s" + result.state.activeRevisions.supernote +
                     "\n" + result.activeFile.name,
                 result.state,
+                result.activeFile,
             )
             is InstallResult.Duplicate -> StorageOutcome(
                 "That broker update was already installed",
@@ -260,6 +261,7 @@ class BooxHandoffActivity : Activity() {
             setDataAndType(Uri.fromFile(pdf), "application/pdf")
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         })
+        store.confirmOpened(state.documentId, state.brokerEventId, state.activeFileName)
         Log.i(TAG, "OPEN document=" + state.documentId + " file=" + pdf.absolutePath)
     }
 

@@ -95,6 +95,7 @@ data class HandoffState(
     val localGeneration: Long = 0,
     val processedEventIds: List<String> = emptyList(),
     val retiredPredecessors: List<RetiredPredecessorWatch> = emptyList(),
+    val openedBrokerEventId: String? = null,
 ) {
     fun validate() {
         require(schemaVersion == 1) { "Unsupported handoff state version" }
@@ -117,6 +118,9 @@ data class HandoffState(
         require(retiredPredecessors.map { it.retiredFileName }.distinct().size == retiredPredecessors.size) {
             "Duplicate retired predecessor watch"
         }
+        openedBrokerEventId?.let {
+            require(it == brokerEventId) { "Opened handoff does not match the active broker event" }
+        }
     }
     fun toJson(): JSONObject = JSONObject()
         .put("schemaVersion", schemaVersion)
@@ -132,6 +136,7 @@ data class HandoffState(
         .put("localGeneration", localGeneration)
         .put("processedEventIds", JSONArray(processedEventIds))
         .put("retiredPredecessors", JSONArray(retiredPredecessors.map { it.toJson() }))
+        .putOpt("openedBrokerEventId", openedBrokerEventId)
 
     companion object {
         fun fromJson(value: JSONObject): HandoffState {
@@ -154,6 +159,7 @@ data class HandoffState(
                 retiredPredecessors = List(retiredPredecessors.length()) { index ->
                     RetiredPredecessorWatch.fromJson(retiredPredecessors.getJSONObject(index), documentId)
                 },
+                openedBrokerEventId = value.optNullableString("openedBrokerEventId"),
             ).also { it.validate() }
         }
     }

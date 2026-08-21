@@ -93,6 +93,32 @@ impl CloudFolder for FakeCloud {
     }
 }
 
+struct DescriptorGuardCloud {
+    inner: FakeCloud,
+    descriptor_path: PathBuf,
+}
+
+impl CloudFolder for DescriptorGuardCloud {
+    fn list(&self, prefix: &str) -> Result<Vec<CloudObject>, String> {
+        self.inner.list(prefix)
+    }
+
+    fn upload_create(
+        &self,
+        local_path: &Path,
+        object_path: &str,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<CloudObject, String> {
+        self.inner.upload_create(local_path, object_path, metadata)
+    }
+
+    fn download(&self, object: &CloudObject, destination: &Path) -> Result<(), String> {
+        if self.descriptor_path.exists() {
+            return Err("BOOX delivery descriptor was published before its PDF".to_owned());
+        }
+        self.inner.download(object, destination)
+    }
+}
 struct MutatingDownloadCloud {
     inner: FakeCloud,
     boox_pdf: PathBuf,
@@ -354,6 +380,46 @@ fn broker_boox_output_stages_one_versioned_companion_delivery() {
     assert!(descriptor_path.is_file());
 }
 
+#[test]
+fn broker_boox_output_publishes_descriptor_only_after_pdf_is_durable() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let generated = b"broker generated PDF".to_vec();
+    let generated_hash = sha256_hex(&generated);
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    let pdf = incoming.join(format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        1,
+        1,
+        &generated_hash[..12]
+    ));
+    let descriptor = pdf.with_file_name(format!(
+        "{}.inkbridge.json",
+        pdf.file_name().unwrap().to_string_lossy()
+    ));
+    let cloud = DescriptorGuardCloud {
+        inner: FakeCloud::default(),
+        descriptor_path: descriptor.clone(),
+    };
+    cloud.inner.put(
+        &format!("BOOX_Folder/{}/book.pdf", document.document_id),
+        generated.clone(),
+        generated_metadata(&document.document_id, "0:1", &generated),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert_eq!(fs::read(pdf).unwrap(), generated);
+    assert!(descriptor.is_file());
+}
 #[test]
 fn corrupt_versioned_boox_destination_does_not_block_later_valid_delivery() {
     let root = tempdir().unwrap();

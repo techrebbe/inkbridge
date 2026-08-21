@@ -30,6 +30,7 @@ data class ActiveDocumentCatalog(
 
 private val MAX_FINALIZATION_SUFFIX_BYTES =
     "__boox-finalized-g${Long.MAX_VALUE}-${"0".repeat(12)}.pdf".toByteArray().size
+private const val MAX_RETIRED_PREDECESSORS = 1
 
 private data class FinalizationCommit(
     val pdf: File,
@@ -129,6 +130,22 @@ class BooxHandoffStore(
         val documentRoot = documentRoot(documentId)
         recover(documentRoot)
         return readState(documentRoot)
+    }
+
+    fun confirmOpened(documentId: String, brokerEventId: String, activeFileName: String): HandoffState {
+        requireDocumentId(documentId)
+        requireSafeFileName(activeFileName, "active file name")
+        val documentRoot = documentRoot(documentId)
+        recover(documentRoot)
+        val state = readState(documentRoot) ?: error("No active InkBridge document")
+        require(state.brokerEventId == brokerEventId && state.activeFileName == activeFileName) {
+            "The opened PDF is no longer the active broker handoff"
+        }
+        require(File(activeDir(documentRoot), activeFileName).isFile) { "The opened active PDF is missing" }
+        if (state.openedBrokerEventId == brokerEventId) return state
+        val confirmed = state.copy(openedBrokerEventId = brokerEventId).also(HandoffState::validate)
+        writeState(documentRoot, confirmed)
+        return confirmed
     }
 
     fun findNextDescriptor(): File? = root
@@ -305,7 +322,16 @@ class BooxHandoffStore(
         val processed = ((previous?.processedEventIds ?: emptyList()) + delivery.eventId)
             .distinct()
             .takeLast(512)
-        val retiredPredecessors = previous?.retiredPredecessors.orEmpty().toMutableList()
+        val previousRetiredPredecessors = previous?.retiredPredecessors.orEmpty()
+        val activeHandoffWasOpened = previous != null && previous.openedBrokerEventId == previous.brokerEventId
+        require(activeHandoffWasOpened || previousRetiredPredecessors.size < MAX_RETIRED_PREDECESSORS) {
+            "Open the active document in NeoReader before installing another update"
+        }
+        val retiredPredecessors = if (activeHandoffWasOpened) {
+            mutableListOf()
+        } else {
+            previousRetiredPredecessors.toMutableList()
+        }
         if (previous != null) {
             retiredPredecessors += RetiredPredecessorWatch(
                 previousState = previous.copy(
@@ -347,6 +373,7 @@ class BooxHandoffStore(
         writeState(documentRoot, next)
         preserveCommittedPredecessorIfChanged(documentRoot, intent)
         retirePreviousActive(documentRoot, intent)
+        compactAcknowledgedRetiredPredecessors(documentRoot, intent)
         clearInstallIntent(documentRoot)
         recoverRetiredPredecessors(documentRoot)
         return InstallResult.Installed(destination, requireNotNull(readState(documentRoot)))
@@ -643,6 +670,7 @@ class BooxHandoffStore(
 
         preserveCommittedPredecessorIfChanged(documentRoot, intent)
         retirePreviousActive(documentRoot, intent)
+        compactAcknowledgedRetiredPredecessors(documentRoot, intent)
         clearInstallIntent(documentRoot)
     }
 
@@ -807,6 +835,51 @@ class BooxHandoffStore(
                 deleted = true
             }
         if (deleted) syncDirectory(directory)
+    }
+
+    private fun compactAcknowledgedRetiredPredecessors(documentRoot: File, intent: InstallIntent) {
+        val previous = intent.previousState ?: return
+        if (previous.openedBrokerEventId != previous.brokerEventId) return
+        require(readState(documentRoot) == intent.nextState) {
+            "Cannot compact retired predecessors before the replacement handoff is committed"
+        }
+        val retainedNames = intent.nextState.retiredPredecessors.map { it.retiredFileName }.toSet()
+        previous.retiredPredecessors
+            .filterNot { it.retiredFileName in retainedNames }
+            .forEach { watch ->
+                val retired = File(retiredDir(documentRoot), watch.retiredFileName)
+                if (!retired.exists()) return@forEach
+                require(retired.isFile) { "Retired predecessor path is not a PDF file" }
+                awaitRetiredPredecessorQuiet(retired)
+                val currentHash = sha256Hex(retired)
+                if (currentHash != watch.observedSha256) {
+                    val nextLocalGeneration = Math.addExact(watch.localGeneration, 1)
+                    val outputName = retired.nameWithoutExtension +
+                        "__boox-finalized-g" + nextLocalGeneration + "-" + currentHash.take(12) + ".pdf"
+                    val outgoing = outgoingDir(documentRoot)
+                    cleanupSupersededPredecessorPublications(
+                        outgoing,
+                        watch.previousState,
+                        outputName,
+                        nextLocalGeneration,
+                    )
+                    cleanupStagedPublications(outgoing, outputName, "compacted predecessor PDF")
+                    cleanupStagedPublications(
+                        outgoing,
+                        "$outputName.inkbridge.json",
+                        "compacted predecessor descriptor",
+                    )
+                    ensureFinalizedArtifacts(
+                        documentRoot,
+                        watch.previousState,
+                        retired,
+                        currentHash,
+                        outputName,
+                        nextLocalGeneration,
+                    )
+                }
+                deleteAndSync(retired, retiredDir(documentRoot))
+            }
     }
 
     private fun recoverRetiredPredecessors(documentRoot: File) {

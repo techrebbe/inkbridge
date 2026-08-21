@@ -692,6 +692,92 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun unconfirmedHandoffRefusesToGrowRetiredPdfStoragePastOnePredecessor() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        store.install(delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()))
+        val second = store.install(
+            delivery(root, "event-2", RevisionPair(0, 2), 11, "two".toByteArray()),
+        ) as InstallResult.Installed
+
+        val error = runCatching {
+            store.install(delivery(root, "event-3", RevisionPair(0, 3), 12, "three".toByteArray()))
+        }.exceptionOrNull()
+
+        assertTrue(error!!.message!!.contains("Open the active document"))
+        assertEquals(second.state, store.state(documentId))
+        val retired = File(File(root, documentId), ".retired").listFiles().orEmpty()
+        assertEquals(1, retired.count { it.extension == "pdf" })
+    }
+
+    @Test
+    fun confirmedHandoffCompactsOlderPredecessorAndPreservesItsLastLateEdit() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val second = store.install(
+            delivery(root, "event-2", RevisionPair(0, 2), 11, "two".toByteArray()),
+        ) as InstallResult.Installed
+        val documentRoot = File(root, documentId)
+        val firstRetired = File(File(documentRoot, ".retired"), first.activeFile.name)
+        firstRetired.appendText("-late-before-compaction")
+        store.confirmOpened(documentId, second.state.brokerEventId, second.state.activeFileName)
+
+        val third = store.install(
+            delivery(root, "event-3", RevisionPair(0, 3), 12, "three".toByteArray()),
+        ) as InstallResult.Installed
+
+        assertFalse(firstRetired.exists())
+        val retired = File(documentRoot, ".retired").listFiles().orEmpty().filter { it.extension == "pdf" }
+        assertEquals(listOf(second.activeFile.name), retired.map(File::getName))
+        assertEquals(listOf(second.activeFile.name), third.state.retiredPredecessors.map { it.retiredFileName })
+        val outgoing = File(documentRoot, "outgoing")
+        val preserved = outgoing.listFiles().orEmpty().single { it.extension == "pdf" }
+        assertEquals("one-late-before-compaction", preserved.readText())
+        assertTrue(File(outgoing, preserved.name + ".inkbridge.json").isFile)
+    }
+
+    @Test
+    fun interruptedAcknowledgedCompactionCompletesFromInstallIntent() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val second = store.install(
+            delivery(root, "event-2", RevisionPair(0, 2), 11, "two".toByteArray()),
+        ) as InstallResult.Installed
+        val confirmedSecond = store.confirmOpened(
+            documentId,
+            second.state.brokerEventId,
+            second.state.activeFileName,
+        )
+        val confirmedInstall = InstallResult.Installed(second.activeFile, confirmedSecond)
+        val thirdBytes = "three".toByteArray()
+        val uncompactedNext = nextState(
+            confirmedInstall,
+            "event-3",
+            RevisionPair(0, 3),
+            12,
+            thirdBytes,
+        )
+        val next = uncompactedNext.copy(
+            retiredPredecessors = listOf(uncompactedNext.retiredPredecessors.last()),
+        )
+        val documentRoot = File(root, documentId)
+        File(File(documentRoot, "active"), next.activeFileName).writeBytes(thirdBytes)
+        writeIntent(documentRoot, confirmedInstall, next)
+        File(documentRoot, ".inkbridge-state.json").writeText(next.toJson().toString(2))
+
+        assertEquals(next, store.state(documentId))
+        val retired = File(documentRoot, ".retired").listFiles().orEmpty().filter { it.extension == "pdf" }
+        assertEquals(listOf(second.activeFile.name), retired.map(File::getName))
+        assertFalse(File(File(documentRoot, ".retired"), first.activeFile.name).exists())
+        assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
+    }
+    @Test
     fun missingCommittedRetiredWatchFailsClosedBeforeLateBytesCanBeIgnored() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

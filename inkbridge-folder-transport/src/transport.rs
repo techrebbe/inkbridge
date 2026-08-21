@@ -518,10 +518,11 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 if let Some(delivery) = &boox_handoff_delivery {
                     let descriptor_was_missing =
                         metadata_if_exists(&delivery.descriptor_path)?.is_none();
-                    if publish_bytes_create_only_or_verify(
-                        &delivery.descriptor_bytes,
-                        &delivery.descriptor_path,
-                    )? == DescriptorPublication::Conflict
+                    if !descriptor_was_missing
+                        && publish_bytes_create_only_or_verify(
+                            &delivery.descriptor_bytes,
+                            &delivery.descriptor_path,
+                        )? == DescriptorPublication::Conflict
                     {
                         report.actions.push(TransportAction::Deferred {
                             side,
@@ -557,6 +558,20 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                             SystemTime::now(),
                             &expected_hash,
                         )?;
+                    }
+                    if publish_bytes_create_only_or_verify(
+                        &delivery.descriptor_bytes,
+                        &delivery.descriptor_path,
+                    )? == DescriptorPublication::Conflict
+                    {
+                        report.actions.push(TransportAction::Deferred {
+                            side,
+                            reason: format!(
+                                "versioned BOOX handoff descriptor {} has unexpected content and was preserved for inspection",
+                                delivery.descriptor_path.display()
+                            ),
+                        });
+                        continue;
                     }
                     if !installed || descriptor_was_missing {
                         report.actions.push(TransportAction::Delivered {
@@ -612,10 +627,11 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
 
             if let Some(delivery) = &boox_handoff_delivery {
-                if publish_bytes_create_only_or_verify(
-                    &delivery.descriptor_bytes,
-                    &delivery.descriptor_path,
-                )? == DescriptorPublication::Conflict
+                if metadata_if_exists(&delivery.descriptor_path)?.is_some()
+                    && publish_bytes_create_only_or_verify(
+                        &delivery.descriptor_bytes,
+                        &delivery.descriptor_path,
+                    )? == DescriptorPublication::Conflict
                 {
                     report.actions.push(TransportAction::Deferred {
                         side,
