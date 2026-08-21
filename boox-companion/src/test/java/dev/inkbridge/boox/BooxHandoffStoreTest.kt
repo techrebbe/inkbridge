@@ -1115,6 +1115,24 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun finalize_rejectsOversizedExistingDescriptorWithoutReadingIt() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(2, 4), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-neo-reader-ink")
+        val finalized = store.finalize(documentId) as FinalizeResult.Finalized
+        finalized.descriptor.writeBytes(
+            ByteArray((MAX_DESCRIPTOR_BYTES + 1).toInt()) { 'x'.code.toByte() },
+        )
+
+        val error = runCatching { store.finalize(documentId) }.exceptionOrNull()
+
+        assertTrue(error!!.message!!.contains("exceeds $MAX_DESCRIPTOR_BYTES bytes"))
+    }
+
+    @Test
     fun descriptorQueue_skipsMalformedAndIncompletePairs() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

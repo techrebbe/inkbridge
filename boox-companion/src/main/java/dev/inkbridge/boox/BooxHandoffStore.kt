@@ -550,7 +550,10 @@ class BooxHandoffStore(
     private fun readDelivery(descriptor: File): BrokerDelivery =
         BrokerDelivery.fromJson(readMetadataJson(descriptor, "Incoming descriptor"))
 
-    private fun readMetadataJson(file: File, description: String): JSONObject {
+    private fun readMetadataJson(file: File, description: String): JSONObject =
+        JSONObject(readMetadataBytes(file, description).toString(Charsets.UTF_8))
+
+    private fun readMetadataBytes(file: File, description: String): ByteArray {
         require(file.isFile) { "$description is missing" }
         require(file.length() <= MAX_DESCRIPTOR_BYTES) {
             "$description ${file.name} exceeds $MAX_DESCRIPTOR_BYTES bytes"
@@ -567,7 +570,7 @@ class BooxHandoffStore(
                 if (count > 0) output.write(buffer, 0, count)
             }
         }
-        return JSONObject(output.toString(Charsets.UTF_8.name()))
+        return output.toByteArray()
     }
 
     private fun requireMetadataSize(bytes: ByteArray, description: String) {
@@ -999,7 +1002,7 @@ class BooxHandoffStore(
 
     private fun publishBytesOrVerify(bytes: ByteArray, destination: File) {
         if (destination.isFile) {
-            require(destination.readBytes().contentEquals(bytes)) {
+            require(readMetadataBytes(destination, "Existing metadata").contentEquals(bytes)) {
                 "Existing ${destination.name} has unexpected content"
             }
             return

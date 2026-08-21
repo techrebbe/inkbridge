@@ -1,12 +1,13 @@
 package dev.inkbridge.boox
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
 
 class NeoReaderHandoffTrackerTest {
     @Test
-    fun confirmsOnlyAfterActivityPausedAndResumed() {
+    fun confirmsOnlyAfterActivityPausedAndStorageCommit() {
         val persistence = MemoryHandoffPersistence()
         val tracker = NeoReaderHandoffTracker(persistence)
         val state = state()
@@ -14,7 +15,12 @@ class NeoReaderHandoffTrackerTest {
         tracker.launchStarted(state)
         assertNull(tracker.activityResumed())
         tracker.activityPaused()
-        assertEquals(expected(state), tracker.activityResumed())
+        val opened = tracker.activityResumed()
+        assertEquals(expected(state), opened)
+        assertNotNull(persistence.value)
+
+        tracker.confirmationCommitted(requireNotNull(opened))
+
         assertNull(tracker.activityResumed())
         assertNull(persistence.value)
     }
@@ -33,7 +39,7 @@ class NeoReaderHandoffTrackerTest {
     }
 
     @Test
-    fun pausedHandoffSurvivesTrackerRecreation() {
+    fun pausedHandoffSurvivesTrackerRecreationUntilConfirmationCommits() {
         val persistence = MemoryHandoffPersistence()
         val state = state()
         NeoReaderHandoffTracker(persistence).apply {
@@ -42,8 +48,15 @@ class NeoReaderHandoffTrackerTest {
         }
 
         val recreated = NeoReaderHandoffTracker(persistence)
+        val opened = recreated.activityResumed()
+        assertEquals(expected(state), opened)
+        assertNotNull(persistence.value)
 
-        assertEquals(expected(state), recreated.activityResumed())
+        val recreatedBeforeCommit = NeoReaderHandoffTracker(persistence)
+        val recoveredAgain = recreatedBeforeCommit.activityResumed()
+        assertEquals(expected(state), recoveredAgain)
+        recreatedBeforeCommit.confirmationCommitted(requireNotNull(recoveredAgain))
+
         assertNull(persistence.value)
     }
 

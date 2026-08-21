@@ -78,10 +78,12 @@ internal class NeoReaderHandoffTracker(
         if (!current.observedPause) update(current.copy(observedPause = true))
     }
 
-    fun activityResumed(): PendingNeoReaderHandoff? {
-        val opened = pending?.takeIf(PendingNeoReaderHandoff::observedPause) ?: return null
+    fun activityResumed(): PendingNeoReaderHandoff? =
+        pending?.takeIf(PendingNeoReaderHandoff::observedPause)
+
+    fun confirmationCommitted(opened: PendingNeoReaderHandoff) {
+        check(pending == opened) { "NeoReader handoff confirmation does not match the pending launch" }
         update(null)
-        return opened
     }
 
     private fun update(value: PendingNeoReaderHandoff?) {

@@ -63,6 +63,7 @@ class BooxHandoffActivity : Activity() {
                 opened.brokerEventId,
                 opened.activeFileName,
             )
+            neoReaderHandoff.confirmationCommitted(opened)
             StorageOutcome("NeoReader handoff confirmed", confirmed)
         }
     }
