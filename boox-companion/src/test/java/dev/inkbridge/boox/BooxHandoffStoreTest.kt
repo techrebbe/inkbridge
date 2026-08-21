@@ -320,6 +320,39 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun interruptedInitialInstall_duringReplacementCopy_removesStagedFileAndCanRetry() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val documentRoot = File(root, documentId)
+        val bytes = "one".toByteArray()
+        val next = HandoffState(
+            documentId = documentId,
+            originalFileName = "Example.pdf",
+            activeRevisions = RevisionPair(0, 1),
+            sourceGeneration = 10,
+            brokerEventId = "event-1",
+            activeFileName = "Example__ib-b0-s1-g10.pdf",
+            installedBrokerSha256 = sha256Hex(bytes),
+            processedEventIds = listOf("event-1"),
+        )
+        val active = File(documentRoot, "active").also(File::mkdirs)
+        val staged = File(active, ".${next.activeFileName}.123.tmp").apply { writeText("partial") }
+        File(documentRoot, ".inkbridge-install.json").writeText(
+            InstallIntent(previousActiveFileName = null, nextState = next).toJson().toString(2),
+        )
+
+        assertEquals(null, store.state(documentId))
+        assertFalse(staged.exists())
+        assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
+
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, bytes),
+        ) as InstallResult.Installed
+        assertEquals("one", installed.activeFile.readText())
+        assertEquals(next, installed.state)
+    }
+
+    @Test
     fun interruptedInstall_beforeReplacementPublication_keepsPredecessorRecoverable() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

@@ -423,6 +423,7 @@ class BooxHandoffStore(val root: File) {
         val next = intent.nextState
         val current = readState(documentRoot)
         val nextActive = File(activeDir(documentRoot), next.activeFileName)
+        cleanupStagedActivePublications(documentRoot, next.activeFileName)
 
         if (!nextActive.exists()) {
             require(current?.brokerEventId != next.brokerEventId) {
@@ -458,6 +459,15 @@ class BooxHandoffStore(val root: File) {
 
         retirePreviousActive(documentRoot, intent)
         clearInstallIntent(documentRoot)
+    }
+
+    private fun cleanupStagedActivePublications(documentRoot: File, activeFileName: String) {
+        val prefix = ".$activeFileName."
+        activeDir(documentRoot).listFiles().orEmpty()
+            .filter { it.isFile && it.name.startsWith(prefix) && it.name.endsWith(".tmp") }
+            .forEach { staged ->
+                require(staged.delete()) { "Could not remove interrupted active PDF copy " + staged.name }
+            }
     }
 
     private fun retirePreviousActive(documentRoot: File, intent: InstallIntent) {
