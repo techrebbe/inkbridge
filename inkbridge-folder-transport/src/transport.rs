@@ -516,6 +516,22 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 .contains(&generation_key)
             {
                 if let Some(delivery) = &boox_handoff_delivery {
+                    let descriptor_was_missing =
+                        metadata_if_exists(&delivery.descriptor_path)?.is_none();
+                    if publish_bytes_create_only_or_verify(
+                        &delivery.descriptor_bytes,
+                        &delivery.descriptor_path,
+                    )? == DescriptorPublication::Conflict
+                    {
+                        report.actions.push(TransportAction::Deferred {
+                            side,
+                            reason: format!(
+                                "versioned BOOX handoff descriptor {} has unexpected content and was preserved for inspection",
+                                delivery.descriptor_path.display()
+                            ),
+                        });
+                        continue;
+                    }
                     let installed = metadata_if_exists(&delivery.pdf_path)?
                         .is_some_and(|metadata| metadata.is_file())
                         && sha256_file(&delivery.pdf_path).is_ok_and(|hash| hash == expected_hash);
@@ -542,12 +558,6 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                             &expected_hash,
                         )?;
                     }
-                    let descriptor_was_missing =
-                        metadata_if_exists(&delivery.descriptor_path)?.is_none();
-                    publish_bytes_create_only_or_verify(
-                        &delivery.descriptor_bytes,
-                        &delivery.descriptor_path,
-                    )?;
                     if !installed || descriptor_was_missing {
                         report.actions.push(TransportAction::Delivered {
                             side,
@@ -601,6 +611,22 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 continue;
             }
 
+            if let Some(delivery) = &boox_handoff_delivery {
+                if publish_bytes_create_only_or_verify(
+                    &delivery.descriptor_bytes,
+                    &delivery.descriptor_path,
+                )? == DescriptorPublication::Conflict
+                {
+                    report.actions.push(TransportAction::Deferred {
+                        side,
+                        reason: format!(
+                            "versioned BOOX handoff descriptor {} has unexpected content and was preserved for inspection",
+                            delivery.descriptor_path.display()
+                        ),
+                    });
+                    continue;
+                }
+            }
             if side == DeviceSide::Boox {
                 reconcile_staged_backup(&local_path, &expected_hash)?;
             }
@@ -667,10 +693,20 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 continue;
             }
             if let Some(delivery) = &boox_handoff_delivery {
-                publish_bytes_create_only_or_verify(
+                if publish_bytes_create_only_or_verify(
                     &delivery.descriptor_bytes,
                     &delivery.descriptor_path,
-                )?;
+                )? == DescriptorPublication::Conflict
+                {
+                    report.actions.push(TransportAction::Deferred {
+                        side,
+                        reason: format!(
+                            "versioned BOOX handoff descriptor {} has unexpected content and was preserved for inspection",
+                            delivery.descriptor_path.display()
+                        ),
+                    });
+                    continue;
+                }
             }
             if side == DeviceSide::Boox
                 && file_identity(&local_path)? != FileIdentity::Sha256(expected_hash.clone())
@@ -1996,23 +2032,27 @@ fn replace_existing_file_conditionally(
     }
 }
 
-fn publish_bytes_create_only_or_verify(bytes: &[u8], destination: &Path) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescriptorPublication {
+    Ready,
+    Conflict,
+}
+
+fn publish_bytes_create_only_or_verify(
+    bytes: &[u8],
+    destination: &Path,
+) -> Result<DescriptorPublication, String> {
     if let Some(metadata) = metadata_if_exists(destination)? {
         if !metadata.is_file() {
-            return Err(format!(
-                "refusing to replace non-file handoff descriptor {}",
-                destination.display()
-            ));
+            return Ok(DescriptorPublication::Conflict);
         }
         let existing = fs::read(destination)
             .map_err(|error| format!("could not read {}: {error}", destination.display()))?;
-        if existing == bytes {
-            return Ok(());
-        }
-        return Err(format!(
-            "handoff descriptor {} already exists with unexpected content",
-            destination.display()
-        ));
+        return Ok(if existing == bytes {
+            DescriptorPublication::Ready
+        } else {
+            DescriptorPublication::Conflict
+        });
     }
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -2029,18 +2069,23 @@ fn publish_bytes_create_only_or_verify(bytes: &[u8], destination: &Path) -> Resu
     drop(output);
     let published = publish_create_only(&temporary, destination)?;
     if !published {
+        let Some(metadata) = metadata_if_exists(destination)? else {
+            return Err(format!(
+                "handoff descriptor {} disappeared after concurrent publication",
+                destination.display()
+            ));
+        };
+        if !metadata.is_file() {
+            return Ok(DescriptorPublication::Conflict);
+        }
         let existing = fs::read(destination)
             .map_err(|error| format!("could not read {}: {error}", destination.display()))?;
         if existing != bytes {
-            return Err(format!(
-                "handoff descriptor {} was concurrently created with unexpected content",
-                destination.display()
-            ));
+            return Ok(DescriptorPublication::Conflict);
         }
     }
-    Ok(())
+    Ok(DescriptorPublication::Ready)
 }
-
 fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String> {
     match rename_create_only(source, destination) {
         Ok(()) => Ok(true),

@@ -428,6 +428,84 @@ fn corrupt_versioned_boox_destination_does_not_block_later_valid_delivery() {
 }
 
 #[test]
+fn corrupt_versioned_boox_descriptor_does_not_block_later_valid_delivery() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let first = b"first broker PDF".to_vec();
+    let first_hash = sha256_hex(&first);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book-r1.pdf", document.document_id),
+        first,
+        generated_metadata(&document.document_id, "0:1", b"first broker PDF"),
+    );
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    fs::create_dir_all(&incoming).unwrap();
+    let first_pdf_name = format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        1,
+        1,
+        &first_hash[..12]
+    );
+    let corrupt_descriptor = incoming.join(format!("{first_pdf_name}.inkbridge.json"));
+    fs::write(&corrupt_descriptor, b"{truncated-descriptor").unwrap();
+
+    let valid = b"second broker PDF".to_vec();
+    let valid_hash = sha256_hex(&valid);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book-r2.pdf", document.document_id),
+        valid.clone(),
+        generated_metadata(&document.document_id, "0:2", &valid),
+    );
+    let expected_valid = incoming.join(format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        2,
+        2,
+        &valid_hash[..12]
+    ));
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("descriptor") && reason.contains("preserved")
+    )));
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            local_path,
+            ..
+        } if local_path == &expected_valid
+    )));
+    assert_eq!(
+        fs::read(&corrupt_descriptor).unwrap(),
+        b"{truncated-descriptor"
+    );
+    assert!(!incoming.join(first_pdf_name).exists());
+    assert_eq!(fs::read(&expected_valid).unwrap(), valid);
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        }
+    );
+}
+
+#[test]
 fn finalized_companion_edit_uploads_compact_operations_at_current_frontier() {
     let root = tempdir().unwrap();
     let handoff_root = root.path().join("boox-handoff");
