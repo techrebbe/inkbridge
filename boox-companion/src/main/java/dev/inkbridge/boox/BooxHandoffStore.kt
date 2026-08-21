@@ -673,6 +673,12 @@ class BooxHandoffStore(
         val outputName = previous.nameWithoutExtension +
             "__boox-finalized-g" + nextLocalGeneration + "-" + commitHash.take(12) + ".pdf"
         val outgoing = outgoingDir(documentRoot)
+        cleanupSupersededPredecessorPublications(
+            outgoing,
+            previousState,
+            outputName,
+            nextLocalGeneration,
+        )
         cleanupStagedPublications(outgoing, outputName, "preserved predecessor PDF")
         cleanupStagedPublications(
             outgoing,
@@ -756,6 +762,35 @@ class BooxHandoffStore(
                 deleted = true
             }
         if (deleted) syncDirectory(directory)
+    }
+
+    private fun cleanupSupersededPredecessorPublications(
+        outgoing: File,
+        previousState: HandoffState,
+        currentOutputName: String,
+        localGeneration: Long,
+    ) {
+        val outputPrefix = previousState.activeFileName.removeSuffix(".pdf") +
+            "__boox-finalized-g" + localGeneration + "-"
+        var deleted = false
+        outgoing.listFiles().orEmpty()
+            .filter { candidate ->
+                if (!candidate.isFile) return@filter false
+                val name = candidate.name
+                val supersededOrphan = name.startsWith(outputPrefix) &&
+                    name.endsWith(".pdf") &&
+                    name != currentOutputName &&
+                    !File(outgoing, "$name.inkbridge.json").isFile
+                val supersededStagedCopy = name.startsWith(".$outputPrefix") && name.endsWith(".tmp")
+                supersededOrphan || supersededStagedCopy
+            }
+            .forEach { candidate ->
+                require(candidate.delete()) {
+                    "Could not remove superseded predecessor snapshot " + candidate.name
+                }
+                deleted = true
+            }
+        if (deleted) syncDirectory(outgoing)
     }
 
     private fun retirePreviousActive(documentRoot: File, intent: InstallIntent) {

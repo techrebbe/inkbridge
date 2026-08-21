@@ -614,11 +614,28 @@ class BooxHandoffStoreTest {
         assertFalse(outgoing.listFiles().orEmpty().any { it.extension == "pdf" })
         assertFalse(outgoing.listFiles().orEmpty().any { it.name.endsWith(".inkbridge.json") })
 
+        val supersededHash = sha256Hex("one-late-edit".toByteArray())
+        val supersededOutputName = first.activeFile.nameWithoutExtension +
+            "__boox-finalized-g1-" + supersededHash.take(12) + ".pdf"
+        val supersededOutput = File(outgoing, supersededOutputName).apply {
+            writeText("one-late-edit")
+        }
+        val supersededStagedPdf = File(outgoing, ".$supersededOutputName.123.tmp").apply {
+            writeText("partial PDF")
+        }
+        val supersededStagedDescriptor = File(
+            outgoing,
+            ".$supersededOutputName.inkbridge.json.124.tmp",
+        ).apply { writeText("partial descriptor") }
+
         store.afterPredecessorRetirementForTest = null
         assertEquals(next, store.state(documentId))
         val preserved = outgoing.listFiles().orEmpty().single { it.extension == "pdf" }
         assertEquals("one-late-edit-retired-handle-edit", preserved.readText())
         assertTrue(File(outgoing, preserved.name + ".inkbridge.json").isFile)
+        assertFalse(supersededOutput.exists())
+        assertFalse(supersededStagedPdf.exists())
+        assertFalse(supersededStagedDescriptor.exists())
         assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
     }
 
