@@ -127,7 +127,7 @@ class BooxHandoffStore(val root: File) {
             }.getOrDefault(false)
         }
 
-    fun findMostRecentState(): HandoffState? = root
+    fun activeStates(): List<HandoffState> = root
         .listFiles()
         .orEmpty()
         .asSequence()
@@ -136,7 +136,10 @@ class BooxHandoffStore(val root: File) {
             recover(documentRoot)
             readState(documentRoot)
         }
-        .maxByOrNull { it.sourceGeneration }
+        .sortedWith(compareBy<HandoffState> { it.originalFileName.lowercase() }.thenBy { it.documentId })
+        .toList()
+
+    fun findMostRecentState(): HandoffState? = activeStates().maxByOrNull { it.sourceGeneration }
 
     private fun shouldPreservePostFinalizationEdit(
         state: HandoffState,
@@ -388,7 +391,10 @@ class BooxHandoffStore(val root: File) {
 
         val expectedHash = requireNotNull(next.finalizedLocalSha256)
         val outputName = requireNotNull(next.finalizedOutputFileName)
-        val output = File(outgoingDir(documentRoot), outputName)
+        val outgoing = outgoingDir(documentRoot)
+        cleanupStagedPublications(outgoing, outputName, "finalized PDF")
+        cleanupStagedPublications(outgoing, "$outputName.inkbridge.json", "finalized descriptor")
+        val output = File(outgoing, outputName)
         val active = File(activeDir(documentRoot), previous.activeFileName)
         val activeHash = active.takeIf(File::isFile)?.let(::sha256Hex)
         if (current == previous && !output.isFile && activeHash != expectedHash) {
@@ -423,7 +429,7 @@ class BooxHandoffStore(val root: File) {
         val next = intent.nextState
         val current = readState(documentRoot)
         val nextActive = File(activeDir(documentRoot), next.activeFileName)
-        cleanupStagedActivePublications(documentRoot, next.activeFileName)
+        cleanupStagedPublications(activeDir(documentRoot), next.activeFileName, "active PDF")
 
         if (!nextActive.exists()) {
             require(current?.brokerEventId != next.brokerEventId) {
@@ -461,12 +467,12 @@ class BooxHandoffStore(val root: File) {
         clearInstallIntent(documentRoot)
     }
 
-    private fun cleanupStagedActivePublications(documentRoot: File, activeFileName: String) {
-        val prefix = ".$activeFileName."
-        activeDir(documentRoot).listFiles().orEmpty()
+    private fun cleanupStagedPublications(directory: File, destinationName: String, description: String) {
+        val prefix = ".$destinationName."
+        directory.listFiles().orEmpty()
             .filter { it.isFile && it.name.startsWith(prefix) && it.name.endsWith(".tmp") }
             .forEach { staged ->
-                require(staged.delete()) { "Could not remove interrupted active PDF copy " + staged.name }
+                require(staged.delete()) { "Could not remove interrupted $description copy " + staged.name }
             }
     }
 

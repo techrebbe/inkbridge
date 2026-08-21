@@ -33,6 +33,31 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun activeStates_listsEveryConfiguredDocumentForUserSelection() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val secondDocumentId = "inkbridge-doc-v1-" + "b".repeat(64)
+        store.install(
+            delivery(root, "event-a", RevisionPair(0, 1), 10, "one".toByteArray()),
+        )
+        store.install(
+            delivery(
+                root,
+                "event-b",
+                RevisionPair(0, 1),
+                11,
+                "two".toByteArray(),
+                targetDocumentId = secondDocumentId,
+            ),
+        )
+
+        assertEquals(
+            listOf(documentId, secondDocumentId),
+            store.activeStates().map(HandoffState::documentId),
+        )
+    }
+
+    @Test
     fun install_rejectsStaleOrDivergentRevision() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
@@ -227,6 +252,32 @@ class BooxHandoffStoreTest {
         assertTrue(output.isFile)
         assertTrue(File(output.parentFile, output.name + ".inkbridge.json").isFile)
         assertEquals(installed.activeFile.readBytes().toList(), output.readBytes().toList())
+        assertFalse(File(documentRoot, ".inkbridge-finalize.json").exists())
+    }
+
+    @Test
+    fun interruptedFinalize_duringArtifactCopy_removesStagedFilesBeforeRetrying() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-edited")
+        val intent = finalizeIntent(installed, sha256Hex(installed.activeFile))
+        val documentRoot = File(root, documentId)
+        val outgoing = File(documentRoot, "outgoing").also(File::mkdirs)
+        val outputName = intent.nextState.finalizedOutputFileName!!
+        val stagedPdf = File(outgoing, ".$outputName.123.tmp").apply { writeText("partial PDF") }
+        val stagedDescriptor = File(outgoing, ".$outputName.inkbridge.json.124.tmp").apply {
+            writeText("partial descriptor")
+        }
+        writeFinalizeIntent(documentRoot, intent)
+
+        assertEquals(intent.nextState, store.state(documentId))
+        assertFalse(stagedPdf.exists())
+        assertFalse(stagedDescriptor.exists())
+        assertTrue(File(outgoing, outputName).isFile)
+        assertTrue(File(outgoing, "$outputName.inkbridge.json").isFile)
         assertFalse(File(documentRoot, ".inkbridge-finalize.json").exists())
     }
 
@@ -669,13 +720,21 @@ class BooxHandoffStoreTest {
         revisions: RevisionPair,
         generation: Long,
         bytes: ByteArray,
+        targetDocumentId: String = documentId,
     ): File {
-        val incoming = File(File(root, documentId), "incoming").also(File::mkdirs)
+        val incoming = File(File(root, targetDocumentId), "incoming").also(File::mkdirs)
         val pdfName = "$eventId.pdf"
         File(incoming, pdfName).writeBytes(bytes)
         val descriptor = File(incoming, "$eventId.inkbridge.json")
         descriptor.writeText(
-            brokerDelivery(eventId, revisions, generation, sha256Hex(bytes), pdfName).toJson().toString(2),
+            brokerDelivery(
+                eventId,
+                revisions,
+                generation,
+                sha256Hex(bytes),
+                pdfName,
+                targetDocumentId,
+            ).toJson().toString(2),
         )
         return descriptor
     }
@@ -686,11 +745,12 @@ class BooxHandoffStoreTest {
         generation: Long,
         hash: String,
         pdfName: String = "incoming.pdf",
+        targetDocumentId: String = documentId,
     ) = BrokerDelivery(
         schemaVersion = 1,
         producer = BROKER_PRODUCER,
         eventId = eventId,
-        documentId = documentId,
+        documentId = targetDocumentId,
         originalFileName = "Example.pdf",
         sourceRevisions = revisions,
         sourceGeneration = generation,

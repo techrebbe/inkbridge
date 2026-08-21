@@ -1,6 +1,7 @@
 package dev.inkbridge.boox
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.net.Uri
@@ -55,8 +56,12 @@ class BooxHandoffActivity : Activity() {
             setPadding(0, 8, 0, 28)
         }, matchWrap())
         content.addButton("Install next update") { installNext() }
-        content.addButton("Open active document in NeoReader") { openActive() }
-        content.addButton("Finalize BOOX changes") { finalizeActive() }
+        content.addButton("Open active document in NeoReader") {
+            chooseActiveDocument("Open which document?") { openActive(it) }
+        }
+        content.addButton("Finalize BOOX changes") {
+            chooseActiveDocument("Finalize which document?") { finalizeActive(it) }
+        }
         content.addButton("Grant file access") { requestStorageAccess() }
         status = TextView(this).apply {
             textSize = 16f
@@ -102,6 +107,54 @@ class BooxHandoffActivity : Activity() {
                 store.findMostRecentState(),
             )
         }
+    }
+
+    private fun chooseActiveDocument(title: String, action: (String) -> Unit) {
+        if (operationRunning) {
+            Log.i(TAG, "IGNORED document selection while another storage operation is running")
+            return
+        }
+        operationRunning = true
+        setActionsEnabled(false)
+        renderStatus("Loading active documents...")
+        STORAGE_EXECUTOR.execute {
+            val result = runCatching {
+                requireStorageAccess()
+                store.activeStates()
+            }
+            runOnUiThread {
+                if (isDestroyed || isFinishing) return@runOnUiThread
+                operationRunning = false
+                setActionsEnabled(true)
+                result.fold(
+                    onSuccess = { states ->
+                        when (states.size) {
+                            0 -> showFailure(IllegalStateException("No active InkBridge document"))
+                            1 -> action(states.single().documentId)
+                            else -> showDocumentPicker(title, states, action)
+                        }
+                    },
+                    onFailure = ::showFailure,
+                )
+            }
+        }
+    }
+
+    private fun showDocumentPicker(
+        title: String,
+        states: List<HandoffState>,
+        action: (String) -> Unit,
+    ) {
+        val labels = states.map { state ->
+            state.originalFileName + "\nb" + state.activeRevisions.boox +
+                " / s" + state.activeRevisions.supernote + " - " + state.documentId.takeLast(8)
+        }.toTypedArray()
+        renderStatus("Choose an active document")
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setItems(labels) { _, index -> action(states[index].documentId) }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun openActive(documentId: String? = null) =
