@@ -7,6 +7,7 @@ import java.security.MessageDigest
 
 internal const val BROKER_PRODUCER = "inkbridge-broker"
 internal const val DESCRIPTOR_SCHEMA_VERSION = 1
+internal const val SAFE_FILE_NAME_MAX_BYTES = 180
 private val DOCUMENT_ID = Regex("inkbridge-doc-v1-[0-9a-f]{64}")
 private val SHA256 = Regex("[0-9a-f]{64}")
 
@@ -290,7 +291,7 @@ internal fun sha256Hex(file: File): String {
 }
 
 internal fun requireSafeFileName(value: String, label: String) {
-    require(value.isNotBlank() && value.toByteArray(Charsets.UTF_8).size <= 180) { "Invalid $label" }
+    require(value.isNotBlank() && value.toByteArray(Charsets.UTF_8).size <= SAFE_FILE_NAME_MAX_BYTES) { "Invalid $label" }
     require(value != "." && value != "..") { "Invalid $label" }
     require(value.none { character ->
         character == '/' || character == '\\' || Character.isISOControl(character)

@@ -33,6 +33,30 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun longValidOriginalNameWithWideCountersRemainsFinalizable() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val originalName = "A".repeat(170) + ".pdf"
+        val installed = store.install(
+            delivery(
+                root,
+                "event-long-name",
+                RevisionPair(Long.MAX_VALUE - 1, Long.MAX_VALUE - 1),
+                Long.MAX_VALUE,
+                "large-counter-pdf".toByteArray(),
+                originalFileName = originalName,
+            ),
+        ) as InstallResult.Installed
+
+        assertTrue(installed.activeFile.name.toByteArray().size <= SAFE_FILE_NAME_MAX_BYTES)
+        installed.activeFile.appendText("-edited")
+        val finalized = store.finalize(documentId) as FinalizeResult.Finalized
+        assertTrue(finalized.pdf.name.toByteArray().size <= SAFE_FILE_NAME_MAX_BYTES)
+        assertTrue(finalized.pdf.isFile)
+        assertTrue(finalized.descriptor.isFile)
+    }
+
+    @Test
     fun activeStates_listsEveryConfiguredDocumentForUserSelection() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
@@ -993,6 +1017,7 @@ class BooxHandoffStoreTest {
         generation: Long,
         bytes: ByteArray,
         targetDocumentId: String = documentId,
+        originalFileName: String = "Example.pdf",
     ): File {
         val incoming = File(File(root, targetDocumentId), "incoming").also(File::mkdirs)
         val pdfName = "$eventId.pdf"
@@ -1006,6 +1031,7 @@ class BooxHandoffStoreTest {
                 sha256Hex(bytes),
                 pdfName,
                 targetDocumentId,
+                originalFileName,
             ).toJson().toString(2),
         )
         return descriptor
@@ -1018,12 +1044,13 @@ class BooxHandoffStoreTest {
         hash: String,
         pdfName: String = "incoming.pdf",
         targetDocumentId: String = documentId,
+        originalFileName: String = "Example.pdf",
     ) = BrokerDelivery(
         schemaVersion = 1,
         producer = BROKER_PRODUCER,
         eventId = eventId,
         documentId = targetDocumentId,
-        originalFileName = "Example.pdf",
+        originalFileName = originalFileName,
         sourceRevisions = revisions,
         sourceGeneration = generation,
         contentSha256 = hash,

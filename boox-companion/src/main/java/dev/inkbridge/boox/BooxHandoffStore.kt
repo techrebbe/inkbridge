@@ -27,6 +27,9 @@ data class ActiveDocumentCatalog(
     val failures: List<DocumentRecoveryFailure>,
 )
 
+private val MAX_FINALIZATION_SUFFIX_BYTES =
+    "__boox-finalized-g${Long.MAX_VALUE}-${"0".repeat(12)}.pdf".toByteArray().size
+
 private data class FinalizationCommit(
     val pdf: File,
     val descriptor: File,
@@ -275,9 +278,13 @@ class BooxHandoffStore(val root: File) {
         previousActiveHash: String?,
     ): InstallResult.Installed {
         val active = activeDir(documentRoot)
-        val stem = delivery.originalFileName.substringBeforeLast('.').sanitizeStem()
-        val newName = "${stem}__ib-b${delivery.sourceRevisions.boox}" +
+        val activeSuffix = "__ib-b${delivery.sourceRevisions.boox}" +
             "-s${delivery.sourceRevisions.supernote}-g${delivery.sourceGeneration}.pdf"
+        val stemBudget = SAFE_FILE_NAME_MAX_BYTES -
+            activeSuffix.removeSuffix(".pdf").toByteArray().size -
+            MAX_FINALIZATION_SUFFIX_BYTES
+        val stem = delivery.originalFileName.substringBeforeLast('.').sanitizeStem(stemBudget)
+        val newName = stem + activeSuffix
         val destination = File(active, newName)
         val processed = ((previous?.processedEventIds ?: emptyList()) + delivery.eventId)
             .distinct()
@@ -837,10 +844,13 @@ class BooxHandoffStore(val root: File) {
     }
 }
 
-private fun String.sanitizeStem(): String = replace(Regex("[^A-Za-z0-9._ -]"), "_")
-    .trim()
-    .take(100)
-    .ifBlank { "document" }
+private fun String.sanitizeStem(maxBytes: Int): String {
+    require(maxBytes >= "document".length) { "Active filename suffix leaves no room for a stem" }
+    return replace(Regex("[^A-Za-z0-9._ -]"), "_")
+        .trim()
+        .take(maxBytes)
+        .ifBlank { "document" }
+}
 
 private fun requireDocumentId(value: String) {
     require(Regex("inkbridge-doc-v1-[0-9a-f]{64}").matches(value)) { "Invalid document ID" }
