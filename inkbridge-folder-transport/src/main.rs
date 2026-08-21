@@ -50,8 +50,11 @@ fn run() -> Result<(), String> {
     }
     let _lock = ProcessLock::acquire(lock_path)?;
     let builder = NativeBooxManifestBuilder;
-    let transport =
+    let mut transport =
         FolderTransport::new(&cloud, &builder, Duration::from_secs(config.settle_seconds));
+    if let Some(root) = config.boox_handoff_root.clone() {
+        transport = transport.with_boox_handoff_root(root);
+    }
     let mut state = TransportState::load(&config.state_path)?;
     loop {
         for document in &config.documents {

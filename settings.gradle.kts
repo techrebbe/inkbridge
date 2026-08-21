@@ -1,5 +1,5 @@
-// inkread — single-module Android project (RR1-FR2). The Rust core is built separately by
-// buildApk.sh (cargo-ndk) and bundled from app/src/main/jniLibs/.
+// inkread Android workspace. The Rust core is built separately by buildApk.sh (cargo-ndk)
+// and bundled from app/src/main/jniLibs/.
 pluginManagement {
     repositories {
         google()
@@ -29,3 +29,6 @@ include(":app")
 // RR19-FR4b pen-latency spike — a SEPARATE measurement APK (not the reader). Standalone
 // module so it builds/installs independently of the M0 reader bring-up.
 include(":spike")
+// Lightweight BOOX/NeoReader handoff companion. This is intentionally separate from the
+// replacement-reader app: it only installs broker-generated views and finalizes NeoReader edits.
+include(":boox-companion")

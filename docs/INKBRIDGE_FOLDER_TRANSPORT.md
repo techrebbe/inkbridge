@@ -15,7 +15,7 @@ The transport deliberately does less than the broker:
 - it keeps an immutable local cache of accepted Supernote page snapshots so a newer page export
   cannot erase the identity baseline needed to interpret a simultaneous BOOX edit;
 - it downloads only objects carrying a valid InkBridge broker producer marker;
-- it installs BOOX PDF views and Supernote operation manifests through a temporary sibling file;
+- it stages BOOX PDF views as create-only, versioned companion deliveries and installs Supernote operation manifests through a temporary sibling file;
 - it persists local hashes, source revisions, pending uploads, delivered generations, and observed
   conflicts;
 - it refuses to overwrite a BOOX PDF that contains an unpublished local edit;
@@ -28,13 +28,18 @@ decide which device wins.
 
 ## Folder contract
 
-Each configured document has three local paths:
+Each configured document has its Supernote paths plus either the versioned BOOX companion root or the legacy single-file BOOX path:
 
-    BOOX_Folder/Example.pdf
+    BOOX_Device/Documents/InkBridge/inkbridge-doc-v1-<original-pdf-sha256>/incoming/<versioned>.pdf
+    BOOX_Device/Documents/InkBridge/inkbridge-doc-v1-<original-pdf-sha256>/incoming/<versioned>.pdf.inkbridge.json
+    BOOX_Device/Documents/InkBridge/inkbridge-doc-v1-<original-pdf-sha256>/outgoing/<finalized>.pdf
+    BOOX_Device/Documents/InkBridge/inkbridge-doc-v1-<original-pdf-sha256>/outgoing/<finalized>.pdf.inkbridge.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/outgoing/page-0001.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/incoming/r<revisions>-g<generation>-<event>.operations.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/acknowledged/<delivery-sha256>.ack.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/.inkbridge-accepted/r<revision>-<page-id>-<content-sha256>.json
+
+`booxHandoffRoot` points at the local mirror of `/storage/emulated/0/Documents/InkBridge`. When it is configured, `booxPdf` remains only as the legacy/testing fallback required by schema version 1; normal BOOX delivery and upload use the versioned companion directories instead.
 
 The Supernote adapter or companion writes an export to a temporary part file and renames it to
 JSON only after the complete native page export is durable. The folder transport ignores hidden
@@ -76,7 +81,7 @@ Copy docs/examples/inkbridge-folder-transport.example.json outside the repositor
 - the Cloud Storage bucket;
 - each stable document ID, derived from the immutable original PDF;
 - the exact logical Supernote filename;
-- the three local folder paths;
+- the Supernote paths, the legacy BOOX fallback path, and `booxHandoffRoot` for the mirrored companion root;
 - gcloudCommand when the executable is not on PATH.
 
 Relative paths are resolved next to the configuration file. The state file is local/private and
@@ -116,11 +121,7 @@ file path. Replacing the bytes of a PDF that is already known at the same path c
 ink without making it lassoable. Opening the identical broker view under a fresh path triggers
 NeoReader's document-data import/merge flow and makes the strokes editable.
 
-The production BOOX adapter must therefore expose one authoritative active device view and perform
-an explicit versioned-path/import handoff. It must not leave both the stable-name copy and an
-import copy active: NeoReader may later embed edits into the other path. The current folder
-transport preserves unpublished edits and never guesses which of two device copies is newer; the
-automated NeoReader handoff remains the next BOOX-adapter milestone.
+The BOOX companion and folder transport now implement that contract. Broker outputs are published as an immutable, versioned PDF plus descriptor, with the descriptor written last. The companion installs the delivery at a fresh active path, retires the predecessor, opens only the authoritative active file in NeoReader, and finalizes edits as an immutable outgoing PDF plus `StorageEvent` sidecar. The transport converts a finalized edit at the current revision frontier into compact operations; a stale or concurrent finalized edit is uploaded as a full PDF with its original `basedOn` frontier so the broker preserves it as conflict evidence instead of silently rebasing it.
 
 ## Large PDFs
 
@@ -132,6 +133,7 @@ the complete editable PDF. The broker continues rebuilding that view from the im
 ## Failure behavior
 
 - Repeated scans do not duplicate uploads or downloaded manifests.
+- A versioned BOOX delivery pair that disappears after checkpointing is reconstructed from its immutable cloud generation without creating a second version. The descriptor is published only after the PDF is durable.
 - A downloaded Supernote manifest that disappears before its valid acknowledgement is restored
   from the immutable cloud generation; an acknowledged delivery does not need to remain local.
 - A process crash after upload retries the same content/revision-stable object name.
@@ -160,7 +162,7 @@ the complete editable PDF. The broker continues rebuilding that view from the im
     cargo clippy -p inkbridge-folder-transport --all-targets -- -D warnings
     cargo test -p inkbridge-folder-transport
 
-The tests cover duplicate scans, revision acknowledgement, broker-manifest delivery, immutable
+The tests cover duplicate scans, revision acknowledgement, broker-manifest delivery, versioned BOOX handoff and recovery, immutable
 baseline recovery, simultaneous local edits, compact BOOX uploads, unpublished-edit protection,
 and conflict blocking. Broker and converter suites remain the authority for stroke parity,
 malformed NeoReader recovery, moves, and deletions.

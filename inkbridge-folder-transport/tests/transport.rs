@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 
 const GENERATED_BY: &str = "inkbridge-generated-by";
+const GENERATED_EVENT_ID: &str = "inkbridge-event-id";
 const DOCUMENT_ID: &str = "inkbridge-document-id";
 const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
 const SOURCE_REVISION: &str = "inkbridge-source-revision";
@@ -92,6 +93,32 @@ impl CloudFolder for FakeCloud {
     }
 }
 
+struct DescriptorGuardCloud {
+    inner: FakeCloud,
+    descriptor_path: PathBuf,
+}
+
+impl CloudFolder for DescriptorGuardCloud {
+    fn list(&self, prefix: &str) -> Result<Vec<CloudObject>, String> {
+        self.inner.list(prefix)
+    }
+
+    fn upload_create(
+        &self,
+        local_path: &Path,
+        object_path: &str,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<CloudObject, String> {
+        self.inner.upload_create(local_path, object_path, metadata)
+    }
+
+    fn download(&self, object: &CloudObject, destination: &Path) -> Result<(), String> {
+        if self.descriptor_path.exists() {
+            return Err("BOOX delivery descriptor was published before its PDF".to_owned());
+        }
+        self.inner.download(object, destination)
+    }
+}
 struct MutatingDownloadCloud {
     inner: FakeCloud,
     boox_pdf: PathBuf,
@@ -201,6 +228,10 @@ fn generated_metadata(
 ) -> BTreeMap<String, String> {
     BTreeMap::from([
         (GENERATED_BY.to_owned(), BROKER_PRODUCER.to_owned()),
+        (
+            GENERATED_EVENT_ID.to_owned(),
+            format!("broker-event-{}", sha256_hex(bytes)),
+        ),
         (DOCUMENT_ID.to_owned(), document_id.to_owned()),
         (SOURCE_REVISIONS.to_owned(), revisions.to_owned()),
         (CONTENT_SHA256.to_owned(), sha256_hex(bytes)),
@@ -249,6 +280,531 @@ fn accepted_supernote_upload(
             (SOURCE_PAGE_INDEX.to_owned(), page_index.to_string()),
         ]),
     );
+}
+
+fn write_finalized_boox_handoff(
+    handoff_root: &Path,
+    document: &DocumentFolders,
+    event: &StorageEvent,
+    bytes: &[u8],
+) -> PathBuf {
+    let outgoing = handoff_root.join(&document.document_id).join("outgoing");
+    fs::create_dir_all(&outgoing).unwrap();
+    let pdf_name = Path::new(&event.object_path)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let pdf = outgoing.join(pdf_name);
+    fs::write(&pdf, bytes).unwrap();
+    fs::write(
+        outgoing.join(format!("{pdf_name}.inkbridge.json")),
+        serde_json::to_vec_pretty(event).unwrap(),
+    )
+    .unwrap();
+    pdf
+}
+
+#[test]
+fn broker_boox_output_stages_one_versioned_companion_delivery() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let generated = b"broker generated PDF".to_vec();
+    cloud.put(
+        &format!("BOOX_Folder/{}/book.pdf", document.document_id),
+        generated.clone(),
+        generated_metadata(&document.document_id, "0:1", &generated),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+
+    let first = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    let delivered = first
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            TransportAction::Delivered {
+                side: DeviceSide::Boox,
+                local_path,
+                ..
+            } => Some(local_path.clone()),
+            _ => None,
+        })
+        .expect("broker BOOX view was not delivered");
+    assert!(delivered.starts_with(handoff_root.join(&document.document_id).join("incoming")));
+    assert_eq!(fs::read(&delivered).unwrap(), generated);
+    assert!(!document.boox_pdf.exists());
+
+    let descriptor_path = delivered.with_file_name(format!(
+        "{}.inkbridge.json",
+        delivered.file_name().unwrap().to_string_lossy()
+    ));
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&fs::read(&descriptor_path).unwrap()).unwrap();
+    assert_eq!(descriptor["producer"], BROKER_PRODUCER);
+    assert_eq!(descriptor["documentId"], document.document_id);
+    assert_eq!(descriptor["sourceRevisions"]["boox"], 0);
+    assert_eq!(descriptor["sourceRevisions"]["supernote"], 1);
+    assert_eq!(descriptor["contentSha256"], sha256_hex(&generated));
+
+    let again = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(again.actions.is_empty());
+    assert_eq!(
+        fs::read_dir(delivered.parent().unwrap()).unwrap().count(),
+        2,
+        "duplicate delivery created another companion pair"
+    );
+
+    fs::remove_file(&delivered).unwrap();
+    fs::remove_file(&descriptor_path).unwrap();
+    let recovered = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(recovered.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            local_path,
+            ..
+        } if local_path == &delivered
+    )));
+    assert_eq!(fs::read(&delivered).unwrap(), generated);
+    assert!(descriptor_path.is_file());
+}
+
+#[test]
+fn broker_boox_output_publishes_descriptor_only_after_pdf_is_durable() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let generated = b"broker generated PDF".to_vec();
+    let generated_hash = sha256_hex(&generated);
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    let pdf = incoming.join(format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        1,
+        1,
+        &generated_hash[..12]
+    ));
+    let descriptor = pdf.with_file_name(format!(
+        "{}.inkbridge.json",
+        pdf.file_name().unwrap().to_string_lossy()
+    ));
+    let cloud = DescriptorGuardCloud {
+        inner: FakeCloud::default(),
+        descriptor_path: descriptor.clone(),
+    };
+    cloud.inner.put(
+        &format!("BOOX_Folder/{}/book.pdf", document.document_id),
+        generated.clone(),
+        generated_metadata(&document.document_id, "0:1", &generated),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert_eq!(fs::read(pdf).unwrap(), generated);
+    assert!(descriptor.is_file());
+}
+#[test]
+fn corrupt_versioned_boox_destination_does_not_block_later_valid_delivery() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let first = b"first broker PDF".to_vec();
+    let first_hash = sha256_hex(&first);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book-r1.pdf", document.document_id),
+        first,
+        generated_metadata(&document.document_id, "0:1", b"first broker PDF"),
+    );
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    fs::create_dir_all(&incoming).unwrap();
+    let corrupt = incoming.join(format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        1,
+        1,
+        &first_hash[..12]
+    ));
+    fs::write(&corrupt, b"truncated mirror copy").unwrap();
+
+    let valid = b"second broker PDF".to_vec();
+    let valid_hash = sha256_hex(&valid);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book-r2.pdf", document.document_id),
+        valid.clone(),
+        generated_metadata(&document.document_id, "0:2", &valid),
+    );
+    let expected_valid = incoming.join(format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        2,
+        2,
+        &valid_hash[..12]
+    ));
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("unexpected content") && reason.contains("preserved")
+    )));
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            local_path,
+            ..
+        } if local_path == &expected_valid
+    )));
+    assert_eq!(fs::read(&corrupt).unwrap(), b"truncated mirror copy");
+    assert_eq!(fs::read(&expected_valid).unwrap(), valid);
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        }
+    );
+}
+
+#[test]
+fn corrupt_versioned_boox_descriptor_does_not_block_later_valid_delivery() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let first = b"first broker PDF".to_vec();
+    let first_hash = sha256_hex(&first);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book-r1.pdf", document.document_id),
+        first,
+        generated_metadata(&document.document_id, "0:1", b"first broker PDF"),
+    );
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    fs::create_dir_all(&incoming).unwrap();
+    let first_pdf_name = format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        1,
+        1,
+        &first_hash[..12]
+    );
+    let corrupt_descriptor = incoming.join(format!("{first_pdf_name}.inkbridge.json"));
+    fs::write(&corrupt_descriptor, b"{truncated-descriptor").unwrap();
+
+    let valid = b"second broker PDF".to_vec();
+    let valid_hash = sha256_hex(&valid);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book-r2.pdf", document.document_id),
+        valid.clone(),
+        generated_metadata(&document.document_id, "0:2", &valid),
+    );
+    let expected_valid = incoming.join(format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        2,
+        2,
+        &valid_hash[..12]
+    ));
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("descriptor") && reason.contains("preserved")
+    )));
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            local_path,
+            ..
+        } if local_path == &expected_valid
+    )));
+    assert_eq!(
+        fs::read(&corrupt_descriptor).unwrap(),
+        b"{truncated-descriptor"
+    );
+    assert!(!incoming.join(first_pdf_name).exists());
+    assert_eq!(fs::read(&expected_valid).unwrap(), valid);
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        }
+    );
+}
+
+#[test]
+fn finalized_companion_edit_uploads_compact_operations_at_current_frontier() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let bytes = b"NeoReader edited PDF";
+    let event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-current".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/book__boox-finalized-g1.pdf",
+            document.document_id
+        ),
+        source_generation: 1,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    let finalized = write_finalized_boox_handoff(&handoff_root, &document, &event, bytes);
+    let accepted_bytes = native_export_at(0, "accepted", 0, 0);
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(&cloud, &document, 0, 1, accepted_bytes);
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: event.based_on,
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            source_revision: 1,
+            local_path,
+            ..
+        } if local_path == &finalized
+    )));
+    let objects = cloud.objects.lock().unwrap();
+    assert_eq!(objects.len(), 2);
+    let uploaded = objects
+        .iter()
+        .find(|(object, _)| {
+            object
+                .metadata
+                .get("inkbridge-payload-kind")
+                .map(String::as_str)
+                == Some("boox_operation_manifest")
+        })
+        .expect("compact BOOX upload was not stored");
+    assert_eq!(uploaded.1, b"{\"schemaVersion\":1}\n");
+    assert_eq!(uploaded.0.metadata["inkbridge-based-on-boox"], "0");
+    assert_eq!(uploaded.0.metadata["inkbridge-based-on-supernote"], "1");
+    assert_eq!(
+        uploaded.0.metadata[SOURCE_LOCAL_ID],
+        sha256_hex(event.event_id.as_bytes())
+    );
+}
+
+#[test]
+fn corrupt_finalized_boox_pair_does_not_block_later_valid_artifact() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let corrupt_bytes = b"truncated finalized PDF";
+    let corrupt_event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-corrupt".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/a-corrupt__boox-finalized-g1.pdf",
+            document.document_id
+        ),
+        source_generation: 1,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(b"expected complete finalized PDF"),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    let corrupt =
+        write_finalized_boox_handoff(&handoff_root, &document, &corrupt_event, corrupt_bytes);
+    let valid_bytes = b"valid finalized NeoReader PDF";
+    let valid_event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-valid".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/z-valid__boox-finalized-g2.pdf",
+            document.document_id
+        ),
+        source_generation: 2,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(valid_bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    let valid = write_finalized_boox_handoff(&handoff_root, &document, &valid_event, valid_bytes);
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(
+        &cloud,
+        &document,
+        0,
+        1,
+        native_export_at(0, "accepted", 0, 0),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+            ..Default::default()
+        },
+    );
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("not descriptor hash") && reason.contains("preserved")
+    )));
+    assert!(
+        report.actions.iter().any(|action| matches!(
+            action,
+            TransportAction::Uploaded {
+                side: DeviceSide::Boox,
+                local_path,
+                ..
+            } if local_path == &valid
+        )),
+        "{report:?}"
+    );
+    assert_eq!(fs::read(&corrupt).unwrap(), corrupt_bytes);
+}
+
+#[test]
+fn stale_finalized_companion_edit_is_preserved_as_full_pdf_conflict_input() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let bytes = b"stale but valuable NeoReader edit";
+    let event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-stale".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/book__boox-finalized-g1.pdf",
+            document.document_id
+        ),
+        source_generation: 1,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    let finalized = write_finalized_boox_handoff(&handoff_root, &document, &event, bytes);
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 2,
+            },
+            ..Default::default()
+        },
+    );
+    let cloud = FakeCloud::default();
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            source_revision: 1,
+            local_path,
+            uploaded_bytes,
+            ..
+        } if local_path == &finalized && *uploaded_bytes == bytes.len() as u64
+    )));
+    let objects = cloud.objects.lock().unwrap();
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].1, bytes);
+    assert_eq!(
+        objects[0].0.metadata["inkbridge-payload-kind"],
+        "device_view"
+    );
+    assert_eq!(objects[0].0.metadata["inkbridge-based-on-boox"], "0");
+    assert_eq!(objects[0].0.metadata["inkbridge-based-on-supernote"], "1");
 }
 
 #[test]
@@ -1649,6 +2205,110 @@ fn acknowledged_boox_upload_recovers_after_checkpoint_loss_without_allocating_r2
             .get(&path_key(&document.boox_pdf))
             .map(String::as_str),
         Some(sha256_hex(b"edited BOOX view").as_str())
+    );
+}
+
+#[test]
+fn acknowledged_finalized_boox_handoff_recovers_by_event_identity_after_checkpoint_loss() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let bytes = b"finalized NeoReader edit";
+    let event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-recoverable".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/book__boox-finalized-g1.pdf",
+            document.document_id
+        ),
+        source_generation: 1,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    write_finalized_boox_handoff(&handoff_root, &document, &event, bytes);
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(
+        &cloud,
+        &document,
+        0,
+        1,
+        native_export_at(0, "accepted", 0, 0),
+    );
+    let checkpoint = TransportState {
+        documents: BTreeMap::from([(
+            document.document_id.clone(),
+            DocumentTransportState {
+                revisions: event.based_on,
+                ..Default::default()
+            },
+        )]),
+        ..TransportState::empty()
+    };
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = checkpoint.clone();
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(state.documents[&document.document_id]
+        .boox
+        .pending
+        .is_some());
+
+    let manifest = b"{\"operations\":[]}".to_vec();
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/incoming/accepted.operations.json",
+            document.document_id
+        ),
+        manifest.clone(),
+        generated_metadata(&document.document_id, "1:1", &manifest),
+    );
+
+    // Simulate losing the checkpoint written after the immutable r1 upload.
+    state = checkpoint;
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    let uploads = cloud
+        .objects
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(object, _)| {
+            object
+                .path
+                .starts_with(&format!("BOOX_Folder/{}/uploads/", document.document_id))
+        })
+        .count();
+    assert_eq!(uploads, 1, "the accepted handoff source was uploaded again");
+    assert!(!report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            ..
+        }
+    )));
+    let recovered = &state.documents[&document.document_id];
+    assert_eq!(recovered.revisions.boox, 1);
+    assert!(recovered.boox.pending.is_none());
+    assert_eq!(
+        recovered
+            .boox
+            .accepted_source_revisions
+            .get(&sha256_hex(event.event_id.as_bytes())),
+        Some(&1)
     );
 }
 
