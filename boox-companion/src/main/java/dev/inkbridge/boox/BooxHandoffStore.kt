@@ -275,6 +275,15 @@ class BooxHandoffStore(val root: File) {
         recoverMissingActive(documentRoot)
         recoverInstall(documentRoot)
         recoverMissingActive(documentRoot)
+        requireStateForActiveFiles(documentRoot)
+    }
+
+    private fun requireStateForActiveFiles(documentRoot: File) {
+        if (readState(documentRoot) != null) return
+        val activeFiles = File(documentRoot, "active").listFiles().orEmpty()
+        require(activeFiles.isEmpty()) {
+            "Handoff state is missing while active PDF files remain; refusing to install or open a revision"
+        }
     }
 
     private fun recoverMissingActive(documentRoot: File) {

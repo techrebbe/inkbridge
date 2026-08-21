@@ -228,6 +228,53 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun missingCommittedStateWithActivePdfFailsClosed() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val documentRoot = File(root, documentId)
+        assertTrue(File(documentRoot, ".inkbridge-state.json").delete())
+        val next = delivery(root, "event-2", RevisionPair(0, 2), 11, "two".toByteArray())
+
+        assertEquals(null, store.findNextDescriptor())
+        val error = runCatching { store.install(next) }.exceptionOrNull()
+
+        assertTrue(error!!.message!!.contains("state is missing"))
+        assertTrue(installed.activeFile.isFile)
+        assertEquals("one", installed.activeFile.readText())
+        assertEquals(1, installed.activeFile.parentFile!!.listFiles()!!.size)
+    }
+
+    @Test
+    fun missingStateIsRecoveredFromAnInterruptedInitialInstallBeforeFailClosedGuard() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val documentRoot = File(root, documentId)
+        val bytes = "one".toByteArray()
+        val next = HandoffState(
+            documentId = documentId,
+            originalFileName = "Example.pdf",
+            activeRevisions = RevisionPair(0, 1),
+            sourceGeneration = 10,
+            brokerEventId = "event-1",
+            activeFileName = "Example__ib-b0-s1-g10.pdf",
+            installedBrokerSha256 = sha256Hex(bytes),
+            processedEventIds = listOf("event-1"),
+        )
+        val active = File(File(documentRoot, "active").also(File::mkdirs), next.activeFileName)
+        active.writeBytes(bytes)
+        File(documentRoot, ".inkbridge-install.json").writeText(
+            InstallIntent(previousActiveFileName = null, nextState = next).toJson().toString(2),
+        )
+
+        assertEquals(next, store.state(documentId))
+        assertTrue(active.isFile)
+        assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
+    }
+
+    @Test
     fun interruptedInstall_beforeReplacementPublication_keepsPredecessorRecoverable() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
