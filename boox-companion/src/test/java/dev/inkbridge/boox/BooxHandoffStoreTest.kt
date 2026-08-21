@@ -620,9 +620,14 @@ class BooxHandoffStoreTest {
         installed.activeFile.appendText("-finalized")
         store.finalize(documentId)
         assertTrue(installed.activeFile.delete())
+        val staged = File(
+            installed.activeFile.parentFile,
+            ".${installed.activeFile.name}.123.tmp",
+        ).apply { writeText("partial recovery") }
 
         store.state(documentId)
 
+        assertFalse(staged.exists())
         assertTrue(installed.activeFile.isFile)
         assertEquals("one-finalized", installed.activeFile.readText())
         assertTrue(store.finalize(documentId) is FinalizeResult.AlreadyFinalized)

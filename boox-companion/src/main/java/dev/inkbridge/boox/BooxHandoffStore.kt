@@ -424,6 +424,7 @@ class BooxHandoffStore(val root: File) {
             recoverySource = findRetainedBrokerPdf(documentRoot, state)
         }
         if (recoverySource == null) return
+        cleanupStagedPublications(active.parentFile!!, active.name, "active PDF recovery")
         publishFileOrVerify(recoverySource, active, expectedHash)
     }
 
