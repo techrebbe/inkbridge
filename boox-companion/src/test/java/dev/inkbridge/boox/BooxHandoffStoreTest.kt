@@ -537,11 +537,20 @@ class BooxHandoffStoreTest {
         writeIntent(documentRoot, first, next)
         File(documentRoot, ".inkbridge-state.json").writeText(next.toJson().toString(2))
         first.activeFile.appendText("-late-neoreader-edit")
+        val editedHash = sha256Hex(first.activeFile)
+        val outputName = first.activeFile.nameWithoutExtension +
+            "__boox-finalized-g1-" + editedHash.take(12) + ".pdf"
+        val outgoing = File(documentRoot, "outgoing").also(File::mkdirs)
+        val stagedPdf = File(outgoing, ".$outputName.123.tmp").apply { writeText("partial PDF") }
+        val stagedDescriptor = File(outgoing, ".$outputName.inkbridge.json.124.tmp").apply {
+            writeText("partial descriptor")
+        }
 
         assertEquals(next, store.state(documentId))
         assertFalse(first.activeFile.exists())
         assertTrue(File(File(documentRoot, ".retired"), first.activeFile.name).isFile)
-        val outgoing = File(documentRoot, "outgoing")
+        assertFalse(stagedPdf.exists())
+        assertFalse(stagedDescriptor.exists())
         val preserved = outgoing.listFiles().orEmpty().single { it.extension == "pdf" }
         assertEquals("one-late-neoreader-edit", preserved.readText())
         assertTrue(File(outgoing, preserved.name + ".inkbridge.json").isFile)

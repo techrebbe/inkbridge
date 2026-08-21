@@ -612,6 +612,13 @@ class BooxHandoffStore(val root: File) {
         val nextLocalGeneration = previousState.localGeneration + 1
         val outputName = previous.nameWithoutExtension +
             "__boox-finalized-g" + nextLocalGeneration + "-" + commitHash.take(12) + ".pdf"
+        val outgoing = outgoingDir(documentRoot)
+        cleanupStagedPublications(outgoing, outputName, "preserved predecessor PDF")
+        cleanupStagedPublications(
+            outgoing,
+            "$outputName.inkbridge.json",
+            "preserved predecessor descriptor",
+        )
         ensureFinalizedArtifacts(
             documentRoot,
             previousState,
