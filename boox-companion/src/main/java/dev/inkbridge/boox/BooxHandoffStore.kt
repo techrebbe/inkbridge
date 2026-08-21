@@ -19,6 +19,12 @@ sealed class FinalizeResult {
     data class AlreadyFinalized(val pdf: File?) : FinalizeResult()
 }
 
+private data class FinalizationCommit(
+    val pdf: File,
+    val descriptor: File,
+    val state: HandoffState,
+)
+
 class BooxHandoffStore(val root: File) {
     fun install(descriptorFile: File): InstallResult {
         val delivery = BrokerDelivery.fromJson(JSONObject(descriptorFile.readText()))
@@ -29,9 +35,15 @@ class BooxHandoffStore(val root: File) {
         require(incomingHash == delivery.contentSha256) { "Incoming PDF hash does not match its descriptor" }
 
         recover(documentRoot)
-        val previous = readState(documentRoot)
+        var previous = readState(documentRoot)
         val previousActive = previous?.let { File(activeDir(documentRoot), it.activeFileName) }
         val activeHash = previousActive?.takeIf(File::isFile)?.let(::sha256Hex)
+        if (
+            previous != null && previousActive != null && activeHash != null &&
+            shouldPreservePostFinalizationEdit(previous, delivery, activeHash)
+        ) {
+            previous = commitFinalization(documentRoot, previous, previousActive, activeHash).state
+        }
         return when (val decision = HandoffPolicy.decideInstall(previous, delivery, activeHash)) {
             InstallDecision.Duplicate -> InstallResult.Duplicate(previousActive)
             is InstallDecision.Reject -> error(decision.reason)
@@ -70,26 +82,8 @@ class BooxHandoffStore(val root: File) {
             "Wait for the previous finalized BOOX changes to be acknowledged before finalizing again"
         }
 
-        val nextLocalGeneration = state.localGeneration + 1
-        val outputName = active.nameWithoutExtension +
-            "__boox-finalized-g" + nextLocalGeneration + "-" + currentHash.take(12) + ".pdf"
-        val next = state.copy(
-            finalizedLocalSha256 = currentHash,
-            finalizedOutputFileName = outputName,
-            localGeneration = nextLocalGeneration,
-        )
-        writeFinalizeIntent(documentRoot, FinalizeIntent(previousState = state, nextState = next))
-        val artifacts = ensureFinalizedArtifacts(
-            documentRoot,
-            state,
-            active,
-            currentHash,
-            outputName,
-            nextLocalGeneration,
-        )
-        writeState(documentRoot, next)
-        clearFinalizeIntent(documentRoot)
-        return FinalizeResult.Finalized(artifacts.first, artifacts.second, next)
+        val committed = commitFinalization(documentRoot, state, active, currentHash)
+        return FinalizeResult.Finalized(committed.pdf, committed.descriptor, committed.state)
     }
     fun state(documentId: String): HandoffState? {
         requireDocumentId(documentId)
@@ -143,6 +137,47 @@ class BooxHandoffStore(val root: File) {
             readState(documentRoot)
         }
         .maxByOrNull { it.sourceGeneration }
+
+    private fun shouldPreservePostFinalizationEdit(
+        state: HandoffState,
+        delivery: BrokerDelivery,
+        activeHash: String,
+    ): Boolean =
+        state.finalizedLocalSha256 != null &&
+            activeHash != state.installedBrokerSha256 &&
+            activeHash != state.finalizedLocalSha256 &&
+            delivery.eventId !in state.processedEventIds &&
+            delivery.sourceRevisions.strictlyDominates(state.activeRevisions) &&
+            delivery.sourceGeneration > state.sourceGeneration &&
+            delivery.sourceRevisions.boox > state.activeRevisions.boox
+
+    private fun commitFinalization(
+        documentRoot: File,
+        state: HandoffState,
+        active: File,
+        currentHash: String,
+    ): FinalizationCommit {
+        val nextLocalGeneration = state.localGeneration + 1
+        val outputName = active.nameWithoutExtension +
+            "__boox-finalized-g" + nextLocalGeneration + "-" + currentHash.take(12) + ".pdf"
+        val next = state.copy(
+            finalizedLocalSha256 = currentHash,
+            finalizedOutputFileName = outputName,
+            localGeneration = nextLocalGeneration,
+        )
+        writeFinalizeIntent(documentRoot, FinalizeIntent(previousState = state, nextState = next))
+        val artifacts = ensureFinalizedArtifacts(
+            documentRoot,
+            state,
+            active,
+            currentHash,
+            outputName,
+            nextLocalGeneration,
+        )
+        writeState(documentRoot, next)
+        clearFinalizeIntent(documentRoot)
+        return FinalizationCommit(artifacts.first, artifacts.second, next)
+    }
 
     private fun ensureFinalizedArtifacts(
         documentRoot: File,

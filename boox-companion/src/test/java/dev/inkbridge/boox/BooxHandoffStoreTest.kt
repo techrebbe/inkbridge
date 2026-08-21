@@ -95,6 +95,51 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun acknowledgingDeliveryPreservesPostFinalizationEditsAsConflictArtifact() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        first.activeFile.appendText("-first-edit")
+        val finalized = store.finalize(documentId) as FinalizeResult.Finalized
+        first.activeFile.appendText("-second-edit")
+        val postFinalizationBytes = first.activeFile.readBytes()
+        val postFinalizationHash = sha256Hex(postFinalizationBytes)
+        val acknowledging = delivery(
+            root,
+            "event-ack",
+            RevisionPair(1, 2),
+            11,
+            "acknowledged-view".toByteArray(),
+        )
+
+        val installed = store.install(acknowledging) as InstallResult.Installed
+
+        assertEquals("acknowledged-view", installed.activeFile.readText())
+        assertEquals(RevisionPair(1, 2), installed.state.activeRevisions)
+        assertEquals(null, installed.state.finalizedLocalSha256)
+        val outgoing = finalized.pdf.parentFile!!
+        val descriptors = outgoing.listFiles().orEmpty()
+            .filter { it.name.endsWith(".inkbridge.json") }
+            .map { it to JSONObject(it.readText()) }
+        assertEquals(2, descriptors.size)
+        val conflict = descriptors.single { (_, value) ->
+            value.getString("contentSha256") == postFinalizationHash
+        }
+        assertEquals(0, conflict.second.getJSONObject("basedOn").getLong("boox"))
+        assertEquals(1, conflict.second.getJSONObject("basedOn").getLong("supernote"))
+        assertEquals(1, conflict.second.getLong("sourceRevision"))
+        val conflictPdfName = conflict.first.name.removeSuffix(".inkbridge.json")
+        assertEquals(
+            postFinalizationBytes.toList(),
+            File(outgoing, conflictPdfName).readBytes().toList(),
+        )
+        assertTrue(finalized.pdf.isFile)
+        assertTrue(finalized.descriptor.isFile)
+    }
+
+    @Test
     fun finalize_isIdempotentAndEmitsBrokerStorageEvent() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

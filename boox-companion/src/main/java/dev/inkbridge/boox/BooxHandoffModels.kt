@@ -184,9 +184,6 @@ data class FinalizeIntent(
         require(previousState.documentId == documentId && nextState.documentId == documentId) {
             "Finalize intent belongs to a different document"
         }
-        require(previousState.finalizedLocalSha256 == null) {
-            "Finalize intent predecessor already has pending BOOX changes"
-        }
         val finalizedHash = requireNotNull(nextState.finalizedLocalSha256) {
             "Finalize intent is missing its content hash"
         }
@@ -199,7 +196,7 @@ data class FinalizeIntent(
                 finalizedOutputFileName = outputName,
                 localGeneration = previousState.localGeneration + 1,
             ),
-        ) { "Finalize intent does not describe one pending BOOX revision" }
+        ) { "Finalize intent does not describe one durable BOOX snapshot" }
     }
 
     fun toJson(): JSONObject = JSONObject()
