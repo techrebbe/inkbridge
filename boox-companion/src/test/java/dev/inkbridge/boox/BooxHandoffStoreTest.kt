@@ -165,6 +165,69 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun interruptedFinalize_beforeArtifactPublication_recoversPairAndState() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-edited")
+        val intent = finalizeIntent(installed, sha256Hex(installed.activeFile))
+        val documentRoot = File(root, documentId)
+        writeFinalizeIntent(documentRoot, intent)
+
+        assertEquals(intent.nextState, store.state(documentId))
+
+        val output = File(File(documentRoot, "outgoing"), intent.nextState.finalizedOutputFileName!!)
+        assertTrue(output.isFile)
+        assertTrue(File(output.parentFile, output.name + ".inkbridge.json").isFile)
+        assertEquals(installed.activeFile.readBytes().toList(), output.readBytes().toList())
+        assertFalse(File(documentRoot, ".inkbridge-finalize.json").exists())
+    }
+
+    @Test
+    fun interruptedFinalize_afterArtifactPublication_commitsPendingStateWithoutDuplicateEvent() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-edited")
+        val finalized = store.finalize(documentId) as FinalizeResult.Finalized
+        val documentRoot = File(root, documentId)
+        File(documentRoot, ".inkbridge-state.json").writeText(installed.state.toJson().toString(2))
+        writeFinalizeIntent(
+            documentRoot,
+            FinalizeIntent(previousState = installed.state, nextState = finalized.state),
+        )
+
+        assertEquals(finalized.state, store.state(documentId))
+        assertEquals(2, finalized.pdf.parentFile!!.listFiles()!!.size)
+        assertTrue(finalized.pdf.isFile)
+        assertTrue(finalized.descriptor.isFile)
+        assertFalse(File(documentRoot, ".inkbridge-finalize.json").exists())
+        assertTrue(store.finalize(documentId) is FinalizeResult.AlreadyFinalized)
+    }
+
+    @Test
+    fun interruptedFinalize_withoutPublishedSnapshot_restartsAfterTheActivePdfChanges() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-first-edit")
+        val documentRoot = File(root, documentId)
+        writeFinalizeIntent(documentRoot, finalizeIntent(installed, sha256Hex(installed.activeFile)))
+        installed.activeFile.appendText("-second-edit")
+
+        assertEquals(installed.state, store.state(documentId))
+        assertFalse(File(documentRoot, ".inkbridge-finalize.json").exists())
+        val finalized = store.finalize(documentId) as FinalizeResult.Finalized
+        assertEquals(sha256Hex(installed.activeFile), finalized.state.finalizedLocalSha256)
+    }
+
+    @Test
     fun interruptedInstall_beforeReplacementPublication_keepsPredecessorRecoverable() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
@@ -440,6 +503,27 @@ class BooxHandoffStoreTest {
         installedBrokerSha256 = sha256Hex(bytes),
         processedEventIds = first.state.processedEventIds + eventId,
     )
+
+    private fun finalizeIntent(
+        installed: InstallResult.Installed,
+        contentHash: String,
+    ): FinalizeIntent {
+        val nextGeneration = installed.state.localGeneration + 1
+        val outputName = installed.activeFile.nameWithoutExtension +
+            "__boox-finalized-g" + nextGeneration + "-" + contentHash.take(12) + ".pdf"
+        return FinalizeIntent(
+            previousState = installed.state,
+            nextState = installed.state.copy(
+                finalizedLocalSha256 = contentHash,
+                finalizedOutputFileName = outputName,
+                localGeneration = nextGeneration,
+            ),
+        )
+    }
+
+    private fun writeFinalizeIntent(documentRoot: File, intent: FinalizeIntent) {
+        File(documentRoot, ".inkbridge-finalize.json").writeText(intent.toJson().toString(2))
+    }
 
     private fun writeIntent(
         documentRoot: File,

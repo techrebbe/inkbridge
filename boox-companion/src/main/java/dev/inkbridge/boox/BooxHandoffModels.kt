@@ -172,6 +172,50 @@ data class InstallIntent(
         ).also { it.validate(documentId) }
     }
 }
+data class FinalizeIntent(
+    val schemaVersion: Int = 1,
+    val previousState: HandoffState,
+    val nextState: HandoffState,
+) {
+    fun validate(documentId: String) {
+        require(schemaVersion == 1) { "Unsupported finalize intent version" }
+        previousState.validate()
+        nextState.validate()
+        require(previousState.documentId == documentId && nextState.documentId == documentId) {
+            "Finalize intent belongs to a different document"
+        }
+        require(previousState.finalizedLocalSha256 == null) {
+            "Finalize intent predecessor already has pending BOOX changes"
+        }
+        val finalizedHash = requireNotNull(nextState.finalizedLocalSha256) {
+            "Finalize intent is missing its content hash"
+        }
+        val outputName = requireNotNull(nextState.finalizedOutputFileName) {
+            "Finalize intent is missing its output file name"
+        }
+        require(
+            nextState == previousState.copy(
+                finalizedLocalSha256 = finalizedHash,
+                finalizedOutputFileName = outputName,
+                localGeneration = previousState.localGeneration + 1,
+            ),
+        ) { "Finalize intent does not describe one pending BOOX revision" }
+    }
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("schemaVersion", schemaVersion)
+        .put("previousState", previousState.toJson())
+        .put("nextState", nextState.toJson())
+
+    companion object {
+        fun fromJson(value: JSONObject, documentId: String) = FinalizeIntent(
+            schemaVersion = value.getInt("schemaVersion"),
+            previousState = HandoffState.fromJson(value.getJSONObject("previousState")),
+            nextState = HandoffState.fromJson(value.getJSONObject("nextState")),
+        ).also { it.validate(documentId) }
+    }
+}
+
 sealed class InstallDecision {
     data object Install : InstallDecision()
     data object Duplicate : InstallDecision()

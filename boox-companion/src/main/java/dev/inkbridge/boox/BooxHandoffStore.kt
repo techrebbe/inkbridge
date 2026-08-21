@@ -73,6 +73,12 @@ class BooxHandoffStore(val root: File) {
         val nextLocalGeneration = state.localGeneration + 1
         val outputName = active.nameWithoutExtension +
             "__boox-finalized-g" + nextLocalGeneration + "-" + currentHash.take(12) + ".pdf"
+        val next = state.copy(
+            finalizedLocalSha256 = currentHash,
+            finalizedOutputFileName = outputName,
+            localGeneration = nextLocalGeneration,
+        )
+        writeFinalizeIntent(documentRoot, FinalizeIntent(previousState = state, nextState = next))
         val artifacts = ensureFinalizedArtifacts(
             documentRoot,
             state,
@@ -81,12 +87,8 @@ class BooxHandoffStore(val root: File) {
             outputName,
             nextLocalGeneration,
         )
-        val next = state.copy(
-            finalizedLocalSha256 = currentHash,
-            finalizedOutputFileName = outputName,
-            localGeneration = nextLocalGeneration,
-        )
         writeState(documentRoot, next)
+        clearFinalizeIntent(documentRoot)
         return FinalizeResult.Finalized(artifacts.first, artifacts.second, next)
     }
     fun state(documentId: String): HandoffState? {
@@ -225,6 +227,7 @@ class BooxHandoffStore(val root: File) {
     private fun outgoingDir(documentRoot: File) = File(documentRoot, "outgoing").also(File::mkdirs)
     private fun stateFile(documentRoot: File) = File(documentRoot, ".inkbridge-state.json")
     private fun installIntentFile(documentRoot: File) = File(documentRoot, ".inkbridge-install.json")
+    private fun finalizeIntentFile(documentRoot: File) = File(documentRoot, ".inkbridge-finalize.json")
 
     private fun readState(documentRoot: File): HandoffState? = stateFile(documentRoot)
         .takeIf(File::isFile)
@@ -268,6 +271,7 @@ class BooxHandoffStore(val root: File) {
 
     private fun recover(documentRoot: File) {
         recoverState(documentRoot)
+        recoverFinalize(documentRoot)
         recoverMissingActive(documentRoot)
         recoverInstall(documentRoot)
         recoverMissingActive(documentRoot)
@@ -318,6 +322,47 @@ class BooxHandoffStore(val root: File) {
                 }.getOrNull()
             }
             .firstOrNull()
+
+    private fun writeFinalizeIntent(documentRoot: File, intent: FinalizeIntent) {
+        intent.validate(documentRoot.name)
+        publishBytesOrVerify(
+            intent.toJson().toString(2).toByteArray(),
+            finalizeIntentFile(documentRoot),
+        )
+    }
+
+    private fun recoverFinalize(documentRoot: File) {
+        val intentFile = finalizeIntentFile(documentRoot)
+        if (!intentFile.isFile) return
+        val intent = FinalizeIntent.fromJson(JSONObject(intentFile.readText()), documentRoot.name)
+        val previous = intent.previousState
+        val next = intent.nextState
+        val current = readState(documentRoot) ?: error("Finalize intent has no handoff state")
+        require(current == previous || current == next) {
+            "Finalize intent does not match the committed handoff state"
+        }
+
+        val expectedHash = requireNotNull(next.finalizedLocalSha256)
+        val outputName = requireNotNull(next.finalizedOutputFileName)
+        val output = File(outgoingDir(documentRoot), outputName)
+        val active = File(activeDir(documentRoot), previous.activeFileName)
+        val activeHash = active.takeIf(File::isFile)?.let(::sha256Hex)
+        if (current == previous && !output.isFile && activeHash != expectedHash) {
+            clearFinalizeIntent(documentRoot)
+            return
+        }
+
+        ensureFinalizedArtifacts(
+            documentRoot,
+            previous,
+            active,
+            expectedHash,
+            outputName,
+            next.localGeneration,
+        )
+        if (current == previous) writeState(documentRoot, next)
+        clearFinalizeIntent(documentRoot)
+    }
 
     private fun writeInstallIntent(documentRoot: File, intent: InstallIntent) {
         intent.validate(documentRoot.name)
@@ -380,6 +425,13 @@ class BooxHandoffStore(val root: File) {
         val retired = File(retiredDir(documentRoot), previousName)
         require(!retired.exists()) { "Refusing to overwrite retired " + retired.name }
         moveNoReplace(previous, retired)
+    }
+
+    private fun clearFinalizeIntent(documentRoot: File) {
+        val intent = finalizeIntentFile(documentRoot)
+        if (intent.exists()) {
+            require(intent.delete()) { "Could not clear completed finalize intent" }
+        }
     }
 
     private fun clearInstallIntent(documentRoot: File) {
