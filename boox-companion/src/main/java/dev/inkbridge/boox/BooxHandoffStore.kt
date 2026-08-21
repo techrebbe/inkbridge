@@ -635,7 +635,17 @@ class BooxHandoffStore(val root: File) {
             commitHash == expectedHash ||
             commitHash == previousState.installedBrokerSha256 ||
             commitHash == previousState.finalizedLocalSha256
-        ) return
+        ) {
+            retireRevalidatedPredecessor(
+                documentRoot,
+                intent,
+                previous,
+                activePrevious,
+                retiredPrevious,
+                commitHash,
+            )
+            return
+        }
 
         val nextLocalGeneration = previousState.localGeneration + 1
         val outputName = previous.nameWithoutExtension +
@@ -655,14 +665,32 @@ class BooxHandoffStore(val root: File) {
             outputName,
             nextLocalGeneration,
         ) {
-            beforePreservedDescriptorForTest?.invoke(previous)
-            require(sha256Hex(previous) == commitHash) {
-                "NeoReader continued changing the predecessor while it was being preserved; retry the update"
-            }
-            if (previous == activePrevious) retirePreviousActive(documentRoot, intent)
-            require(retiredPrevious.isFile && sha256Hex(retiredPrevious) == commitHash) {
-                "NeoReader changed the predecessor at retirement; retry the update"
-            }
+            retireRevalidatedPredecessor(
+                documentRoot,
+                intent,
+                previous,
+                activePrevious,
+                retiredPrevious,
+                commitHash,
+            )
+        }
+    }
+
+    private fun retireRevalidatedPredecessor(
+        documentRoot: File,
+        intent: InstallIntent,
+        previous: File,
+        activePrevious: File,
+        retiredPrevious: File,
+        expectedHash: String,
+    ) {
+        beforePreservedDescriptorForTest?.invoke(previous)
+        require(sha256Hex(previous) == expectedHash) {
+            "NeoReader continued changing the predecessor before retirement; retry the update"
+        }
+        if (previous == activePrevious) retirePreviousActive(documentRoot, intent)
+        require(retiredPrevious.isFile && sha256Hex(retiredPrevious) == expectedHash) {
+            "NeoReader changed the predecessor at retirement; retry the update"
         }
     }
 
