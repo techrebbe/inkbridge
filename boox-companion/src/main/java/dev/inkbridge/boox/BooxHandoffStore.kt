@@ -1,6 +1,7 @@
 package dev.inkbridge.boox
 
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.channels.FileChannel
@@ -304,6 +305,18 @@ class BooxHandoffStore(
         val processed = ((previous?.processedEventIds ?: emptyList()) + delivery.eventId)
             .distinct()
             .takeLast(512)
+        val retiredPredecessors = previous?.retiredPredecessors.orEmpty().toMutableList()
+        if (previous != null) {
+            retiredPredecessors += RetiredPredecessorWatch(
+                previousState = previous.copy(
+                    processedEventIds = emptyList(),
+                    retiredPredecessors = emptyList(),
+                ),
+                retiredFileName = previous.activeFileName,
+                observedSha256 = requireNotNull(previousActiveHash),
+                localGeneration = previous.localGeneration,
+            )
+        }
         val next = HandoffState(
             documentId = delivery.documentId,
             originalFileName = delivery.originalFileName,
@@ -313,6 +326,7 @@ class BooxHandoffStore(
             activeFileName = newName,
             installedBrokerSha256 = delivery.contentSha256,
             processedEventIds = processed,
+            retiredPredecessors = retiredPredecessors,
         )
         next.validate()
         val intent = InstallIntent(
@@ -334,7 +348,8 @@ class BooxHandoffStore(
         preserveCommittedPredecessorIfChanged(documentRoot, intent)
         retirePreviousActive(documentRoot, intent)
         clearInstallIntent(documentRoot)
-        return InstallResult.Installed(destination, next)
+        recoverRetiredPredecessors(documentRoot)
+        return InstallResult.Installed(destination, requireNotNull(readState(documentRoot)))
     }
     private fun documentRoot(documentId: String): File {
         requireDocumentId(documentId)
@@ -344,8 +359,6 @@ class BooxHandoffStore(
     private fun activeDir(documentRoot: File) = File(documentRoot, "active").also(File::mkdirs)
     private fun incomingDir(documentRoot: File) = File(documentRoot, "incoming")
     private fun retiredDir(documentRoot: File) = File(documentRoot, ".retired").also(File::mkdirs)
-    private fun retiredWatchDir(documentRoot: File) =
-        File(retiredDir(documentRoot), ".watches").also(File::mkdirs)
     private fun outgoingDir(documentRoot: File) = File(documentRoot, "outgoing").also(File::mkdirs)
     private fun stateFile(documentRoot: File) = File(documentRoot, ".inkbridge-state.json")
     private fun installIntentFile(documentRoot: File) = File(documentRoot, ".inkbridge-install.json")
@@ -356,7 +369,7 @@ class BooxHandoffStore(
         ?.let { parseState(it, documentRoot) }
 
     private fun parseState(file: File, documentRoot: File): HandoffState =
-        HandoffState.fromJson(JSONObject(file.readText())).also { state ->
+        HandoffState.fromJson(readMetadataJson(file, "Handoff state")).also { state ->
             require(state.documentId == documentRoot.name) { "Handoff state belongs to a different document" }
         }
 
@@ -365,7 +378,9 @@ class BooxHandoffStore(
         val current = stateFile(documentRoot)
         val next = File(documentRoot, ".inkbridge-state.next")
         val previous = File(documentRoot, ".inkbridge-state.previous")
-        writeSynced(next, state.toJson().toString(2).toByteArray())
+        val stateBytes = state.toJson().toString(2).toByteArray()
+        requireMetadataSize(stateBytes, "Handoff state")
+        writeSynced(next, stateBytes)
         if (current.isFile) {
             deleteAndSync(previous, documentRoot)
             moveNoReplace(current, previous)
@@ -505,26 +520,46 @@ class BooxHandoffStore(
             }
             .firstOrNull()
 
-    private fun readDelivery(descriptor: File): BrokerDelivery {
-        require(descriptor.isFile) { "Incoming descriptor is missing" }
-        require(descriptor.length() <= MAX_DESCRIPTOR_BYTES) {
-            "Incoming descriptor ${descriptor.name} exceeds $MAX_DESCRIPTOR_BYTES bytes"
+    private fun readDelivery(descriptor: File): BrokerDelivery =
+        BrokerDelivery.fromJson(readMetadataJson(descriptor, "Incoming descriptor"))
+
+    private fun readMetadataJson(file: File, description: String): JSONObject {
+        require(file.isFile) { "$description is missing" }
+        require(file.length() <= MAX_DESCRIPTOR_BYTES) {
+            "$description ${file.name} exceeds $MAX_DESCRIPTOR_BYTES bytes"
         }
-        return BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
+        val output = ByteArrayOutputStream(minOf(file.length(), MAX_DESCRIPTOR_BYTES).toInt())
+        file.inputStream().buffered().use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(output.size() + count <= MAX_DESCRIPTOR_BYTES) {
+                    "$description ${file.name} exceeds $MAX_DESCRIPTOR_BYTES bytes"
+                }
+                if (count > 0) output.write(buffer, 0, count)
+            }
+        }
+        return JSONObject(output.toString(Charsets.UTF_8.name()))
+    }
+
+    private fun requireMetadataSize(bytes: ByteArray, description: String) {
+        require(bytes.size <= MAX_DESCRIPTOR_BYTES) {
+            "$description exceeds $MAX_DESCRIPTOR_BYTES bytes"
+        }
     }
 
     private fun writeFinalizeIntent(documentRoot: File, intent: FinalizeIntent) {
         intent.validate(documentRoot.name)
-        publishBytesOrVerify(
-            intent.toJson().toString(2).toByteArray(),
-            finalizeIntentFile(documentRoot),
-        )
+        val bytes = intent.toJson().toString(2).toByteArray()
+        requireMetadataSize(bytes, "Finalize intent")
+        publishBytesOrVerify(bytes, finalizeIntentFile(documentRoot))
     }
 
     private fun recoverFinalize(documentRoot: File) {
         val intentFile = finalizeIntentFile(documentRoot)
         if (!intentFile.isFile) return
-        val intent = FinalizeIntent.fromJson(JSONObject(intentFile.readText()), documentRoot.name)
+        val intent = FinalizeIntent.fromJson(readMetadataJson(intentFile, "Finalize intent"), documentRoot.name)
         val previous = intent.previousState
         val next = intent.nextState
         val current = readState(documentRoot) ?: error("Finalize intent has no handoff state")
@@ -559,16 +594,15 @@ class BooxHandoffStore(
 
     private fun writeInstallIntent(documentRoot: File, intent: InstallIntent) {
         intent.validate(documentRoot.name)
-        publishBytesOrVerify(
-            intent.toJson().toString(2).toByteArray(),
-            installIntentFile(documentRoot),
-        )
+        val bytes = intent.toJson().toString(2).toByteArray()
+        requireMetadataSize(bytes, "Install intent")
+        publishBytesOrVerify(bytes, installIntentFile(documentRoot))
     }
 
     private fun recoverInstall(documentRoot: File) {
         val intentFile = installIntentFile(documentRoot)
         if (!intentFile.isFile) return
-        val intent = InstallIntent.fromJson(JSONObject(intentFile.readText()), documentRoot.name)
+        val intent = InstallIntent.fromJson(readMetadataJson(intentFile, "Install intent"), documentRoot.name)
         val next = intent.nextState
         val current = readState(documentRoot)
         val nextActive = File(activeDir(documentRoot), next.activeFileName)
@@ -676,7 +710,6 @@ class BooxHandoffStore(
                 activePrevious,
                 retiredPrevious,
                 commitHash,
-                previousState.localGeneration,
             )
             return
         }
@@ -712,7 +745,6 @@ class BooxHandoffStore(
                 activePrevious,
                 retiredPrevious,
                 commitHash,
-                nextLocalGeneration,
             )
         }
     }
@@ -724,7 +756,6 @@ class BooxHandoffStore(
         activePrevious: File,
         retiredPrevious: File,
         expectedHash: String,
-        observedGeneration: Long,
     ) {
         beforePreservedDescriptorForTest?.invoke(previous)
         require(sha256Hex(previous) == expectedHash) {
@@ -739,15 +770,6 @@ class BooxHandoffStore(
         require(sha256Hex(retiredPrevious) == expectedHash) {
             "NeoReader changed the retired predecessor; retry the update"
         }
-        writeRetiredPredecessorWatch(
-            documentRoot,
-            RetiredPredecessorWatch(
-                previousState = requireNotNull(intent.previousState),
-                retiredFileName = retiredPrevious.name,
-                observedSha256 = expectedHash,
-                localGeneration = observedGeneration,
-            ),
-        )
     }
 
     private fun awaitRetiredPredecessorQuiet(retired: File) {
@@ -788,31 +810,23 @@ class BooxHandoffStore(
     }
 
     private fun recoverRetiredPredecessors(documentRoot: File) {
-        val watches = retiredWatchDir(documentRoot)
+        var state = readState(documentRoot) ?: return
+        val retiredFiles = retiredDir(documentRoot)
             .listFiles()
             .orEmpty()
-            .asSequence()
-            .filter { it.isFile && it.name.endsWith(".json") }
-            .map { watchFile ->
-                require(watchFile.length() <= MAX_DESCRIPTOR_BYTES) {
-                    "Retired predecessor watch ${watchFile.name} exceeds $MAX_DESCRIPTOR_BYTES bytes"
-                }
-                RetiredPredecessorWatch.fromJson(
-                    JSONObject(watchFile.readText()),
-                    documentRoot.name,
-                )
-            }
-            .groupBy(RetiredPredecessorWatch::retiredFileName)
+            .filter { it.isFile && it.name.endsWith(".pdf", ignoreCase = true) }
+        val retiredNames = retiredFiles.map(File::getName).toSet()
+        val watchedNames = state.retiredPredecessors.map { it.retiredFileName }.toSet()
+        require(retiredNames == watchedNames) {
+            val missingWatches = retiredNames - watchedNames
+            val missingFiles = watchedNames - retiredNames
+            "Retired predecessor coverage mismatch" +
+                if (missingWatches.isEmpty()) "" else "; untracked=" + missingWatches.sorted().joinToString() +
+                if (missingFiles.isEmpty()) "" else "; missing=" + missingFiles.sorted().joinToString()
+        }
 
-        watches.values.forEach { versions ->
-            val latestGeneration = versions.maxOf(RetiredPredecessorWatch::localGeneration)
-            val latest = versions.filter { it.localGeneration == latestGeneration }.distinct()
-            require(latest.size == 1) { "Conflicting retired predecessor watch records" }
-            val watch = latest.single()
+        state.retiredPredecessors.toList().forEach { watch ->
             val retired = File(retiredDir(documentRoot), watch.retiredFileName)
-            require(retired.isFile) {
-                "Watched retired predecessor ${watch.retiredFileName} is missing"
-            }
             val currentHash = sha256Hex(retired)
             if (currentHash == watch.observedSha256) return@forEach
 
@@ -840,54 +854,18 @@ class BooxHandoffStore(
                 outputName,
                 nextLocalGeneration,
             )
-            writeRetiredPredecessorWatch(
-                documentRoot,
-                watch.copy(
-                    observedSha256 = currentHash,
-                    localGeneration = nextLocalGeneration,
-                ),
+            val updatedWatch = watch.copy(
+                observedSha256 = currentHash,
+                localGeneration = nextLocalGeneration,
             )
+            state = state.copy(
+                retiredPredecessors = state.retiredPredecessors.map { existing ->
+                    if (existing.retiredFileName == watch.retiredFileName) updatedWatch else existing
+                },
+            )
+            writeState(documentRoot, state)
         }
     }
-
-    private fun writeRetiredPredecessorWatch(
-        documentRoot: File,
-        watch: RetiredPredecessorWatch,
-    ) {
-        watch.validate(documentRoot.name)
-        val watches = retiredWatchDir(documentRoot)
-        val watchKey = sha256Hex(watch.retiredFileName.toByteArray()).take(16)
-        val destination = File(
-            watches,
-            "watch-$watchKey-g${watch.localGeneration}-${watch.observedSha256.take(12)}.json",
-        )
-        publishBytesOrVerify(watch.toJson().toString(2).toByteArray(), destination)
-
-        var deleted = false
-        watches.listFiles().orEmpty()
-            .filter { it.isFile && it != destination && it.name.endsWith(".json") }
-            .forEach { candidate ->
-                val older = runCatching {
-                    require(candidate.length() <= MAX_DESCRIPTOR_BYTES)
-                    RetiredPredecessorWatch.fromJson(
-                        JSONObject(candidate.readText()),
-                        documentRoot.name,
-                    )
-                }.getOrNull()
-                if (
-                    older != null &&
-                    older.retiredFileName == watch.retiredFileName &&
-                    older.localGeneration < watch.localGeneration
-                ) {
-                    require(candidate.delete()) {
-                        "Could not remove obsolete retired predecessor watch " + candidate.name
-                    }
-                    deleted = true
-                }
-            }
-        if (deleted) syncDirectory(watches)
-    }
-
     private fun cleanupSupersededPredecessorPublications(
         outgoing: File,
         previousState: HandoffState,

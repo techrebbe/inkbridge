@@ -99,13 +99,36 @@ class BooxHandoffStoreTest {
                 targetDocumentId = secondDocumentId,
             ),
         )
-        File(File(root, documentId), ".inkbridge-state.json").writeText("{")
+        File(File(root, documentId), ".inkbridge-state.json").writeBytes(
+            ByteArray((MAX_DESCRIPTOR_BYTES + 1).toInt()) { 'x'.code.toByte() },
+        )
 
         val catalog = store.activeDocumentCatalog()
 
         assertEquals(listOf(secondDocumentId), catalog.states.map(HandoffState::documentId))
         assertEquals(listOf(documentId), catalog.failures.map(DocumentRecoveryFailure::documentId))
+        assertTrue(catalog.failures.single().message.contains("exceeds $MAX_DESCRIPTOR_BYTES bytes"))
         assertEquals(listOf(secondDocumentId), store.activeStates().map(HandoffState::documentId))
+    }
+
+    @Test
+    fun recoveryRejectsOversizedIntentMetadataBeforeParsing() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        )
+        val documentRoot = File(root, documentId)
+        val oversized = ByteArray((MAX_DESCRIPTOR_BYTES + 1).toInt()) { 'x'.code.toByte() }
+        val finalizeIntent = File(documentRoot, ".inkbridge-finalize.json").apply { writeBytes(oversized) }
+
+        val finalizeError = runCatching { store.state(documentId) }.exceptionOrNull()
+        assertTrue(finalizeError!!.message!!.contains("exceeds $MAX_DESCRIPTOR_BYTES bytes"))
+        assertTrue(finalizeIntent.delete())
+
+        File(documentRoot, ".inkbridge-install.json").writeBytes(oversized)
+        val installError = runCatching { store.state(documentId) }.exceptionOrNull()
+        assertTrue(installError!!.message!!.contains("exceeds $MAX_DESCRIPTOR_BYTES bytes"))
     }
 
     @Test
@@ -663,11 +686,34 @@ class BooxHandoffStoreTest {
         assertTrue(File(outgoing, preserved.name + ".inkbridge.json").isFile)
         assertTrue(store.finalize(documentId) is FinalizeResult.NoChanges)
         assertEquals(1, outgoing.listFiles().orEmpty().count { it.extension == "pdf" })
-        assertEquals(
-            1,
-            File(File(documentRoot, ".retired"), ".watches")
-                .listFiles().orEmpty().count { it.extension == "json" },
+        val recoveredState = requireNotNull(store.state(documentId))
+        assertEquals(1, recoveredState.retiredPredecessors.size)
+        assertEquals(sha256Hex(retired), recoveredState.retiredPredecessors.single().observedSha256)
+    }
+
+    @Test
+    fun missingCommittedRetiredWatchFailsClosedBeforeLateBytesCanBeIgnored() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val second = store.install(
+            delivery(root, "event-2", RevisionPair(0, 2), 11, "two".toByteArray()),
+        ) as InstallResult.Installed
+        val documentRoot = File(root, documentId)
+        File(documentRoot, ".inkbridge-state.json").writeText(
+            second.state.copy(retiredPredecessors = emptyList()).toJson().toString(2),
         )
+        val retired = File(File(documentRoot, ".retired"), first.activeFile.name)
+        retired.appendText("-late-open-handle-edit")
+
+        val error = runCatching { store.finalize(documentId) }.exceptionOrNull()
+
+        assertTrue(error!!.message!!.contains("coverage mismatch"))
+        assertTrue(error.message!!.contains("untracked="))
+        assertEquals("one-late-open-handle-edit", retired.readText())
+        assertFalse(File(documentRoot, "outgoing").listFiles().orEmpty().any { it.extension == "pdf" })
     }
 
     @Test
@@ -1067,6 +1113,15 @@ class BooxHandoffStoreTest {
             "-s" + revisions.supernote + "-g" + generation + ".pdf",
         installedBrokerSha256 = sha256Hex(bytes),
         processedEventIds = first.state.processedEventIds + eventId,
+        retiredPredecessors = first.state.retiredPredecessors + RetiredPredecessorWatch(
+            previousState = first.state.copy(
+                processedEventIds = emptyList(),
+                retiredPredecessors = emptyList(),
+            ),
+            retiredFileName = first.activeFile.name,
+            observedSha256 = sha256Hex(first.activeFile),
+            localGeneration = first.state.localGeneration,
+        ),
     )
 
     private fun finalizeIntent(

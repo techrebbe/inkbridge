@@ -94,6 +94,7 @@ data class HandoffState(
     val finalizedOutputFileName: String? = null,
     val localGeneration: Long = 0,
     val processedEventIds: List<String> = emptyList(),
+    val retiredPredecessors: List<RetiredPredecessorWatch> = emptyList(),
 ) {
     fun validate() {
         require(schemaVersion == 1) { "Unsupported handoff state version" }
@@ -112,6 +113,10 @@ data class HandoffState(
         require(processedEventIds.all { it.isNotBlank() && it.length <= 256 }) {
             "Invalid processed event ID"
         }
+        retiredPredecessors.forEach { it.validate(documentId) }
+        require(retiredPredecessors.map { it.retiredFileName }.distinct().size == retiredPredecessors.size) {
+            "Duplicate retired predecessor watch"
+        }
     }
     fun toJson(): JSONObject = JSONObject()
         .put("schemaVersion", schemaVersion)
@@ -126,13 +131,16 @@ data class HandoffState(
         .putOpt("finalizedOutputFileName", finalizedOutputFileName)
         .put("localGeneration", localGeneration)
         .put("processedEventIds", JSONArray(processedEventIds))
+        .put("retiredPredecessors", JSONArray(retiredPredecessors.map { it.toJson() }))
 
     companion object {
         fun fromJson(value: JSONObject): HandoffState {
             val eventIds = value.optJSONArray("processedEventIds") ?: JSONArray()
+            val documentId = value.getString("documentId")
+            val retiredPredecessors = value.optJSONArray("retiredPredecessors") ?: JSONArray()
             return HandoffState(
                 schemaVersion = value.getInt("schemaVersion"),
-                documentId = value.getString("documentId"),
+                documentId = documentId,
                 originalFileName = value.getString("originalFileName"),
                 activeRevisions = RevisionPair.fromJson(value.getJSONObject("activeRevisions")),
                 sourceGeneration = value.getLong("sourceGeneration"),
@@ -143,6 +151,9 @@ data class HandoffState(
                 finalizedOutputFileName = value.optNullableString("finalizedOutputFileName"),
                 localGeneration = value.optLong("localGeneration", 0),
                 processedEventIds = List(eventIds.length()) { eventIds.getString(it) },
+                retiredPredecessors = List(retiredPredecessors.length()) { index ->
+                    RetiredPredecessorWatch.fromJson(retiredPredecessors.getJSONObject(index), documentId)
+                },
             ).also { it.validate() }
         }
     }
@@ -200,6 +211,9 @@ data class RetiredPredecessorWatch(
     fun validate(documentId: String) {
         require(schemaVersion == 1) { "Unsupported retired predecessor watch version" }
         previousState.validate()
+        require(previousState.retiredPredecessors.isEmpty()) {
+            "Retired predecessor watches cannot contain nested watch history"
+        }
         require(previousState.documentId == documentId) { "Retired predecessor watch belongs elsewhere" }
         requireSafeFileName(retiredFileName, "retired predecessor file name")
         require(retiredFileName == previousState.activeFileName) {
