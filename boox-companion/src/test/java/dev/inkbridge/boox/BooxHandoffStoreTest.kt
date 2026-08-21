@@ -558,6 +558,36 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun interruptedInstall_afterEditedPredecessorRetirement_completesOutgoingPair() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val secondBytes = "two".toByteArray()
+        val next = nextState(first, "event-2", RevisionPair(0, 2), 11, secondBytes)
+        val documentRoot = File(root, documentId)
+        File(File(documentRoot, "active"), next.activeFileName).writeBytes(secondBytes)
+        writeIntent(documentRoot, first, next)
+        File(documentRoot, ".inkbridge-state.json").writeText(next.toJson().toString(2))
+        first.activeFile.appendText("-late-edit")
+        val editedHash = sha256Hex(first.activeFile)
+        val outputName = first.activeFile.nameWithoutExtension +
+            "__boox-finalized-g1-" + editedHash.take(12) + ".pdf"
+        val outgoing = File(documentRoot, "outgoing").also(File::mkdirs)
+        val output = File(outgoing, outputName).apply { writeBytes(first.activeFile.readBytes()) }
+        val retired = File(File(documentRoot, ".retired").also(File::mkdirs), first.activeFile.name)
+        assertTrue(first.activeFile.renameTo(retired))
+
+        assertEquals(next, store.state(documentId))
+        assertFalse(first.activeFile.exists())
+        assertEquals("one-late-edit", retired.readText())
+        assertEquals("one-late-edit", output.readText())
+        assertTrue(File(outgoing, "$outputName.inkbridge.json").isFile)
+        assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
+    }
+
+    @Test
     fun interruptedInstall_discardsSnapshotWhenPredecessorChangesBeforeDescriptorPublication() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
@@ -594,6 +624,10 @@ class BooxHandoffStoreTest {
         assertEquals("one-late-edit-newer-edit", preserved.readText())
         assertTrue(File(outgoing, preserved.name + ".inkbridge.json").isFile)
         assertFalse(first.activeFile.exists())
+        assertEquals(
+            "one-late-edit-newer-edit",
+            File(File(documentRoot, ".retired"), first.activeFile.name).readText(),
+        )
     }
 
     @Test

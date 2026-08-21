@@ -618,8 +618,16 @@ class BooxHandoffStore(val root: File) {
         intent: InstallIntent,
     ) {
         val previousState = intent.previousState ?: return
-        val previous = File(activeDir(documentRoot), previousState.activeFileName)
-        if (!previous.isFile) return
+        val activePrevious = File(activeDir(documentRoot), previousState.activeFileName)
+        val retiredPrevious = File(retiredDir(documentRoot), previousState.activeFileName)
+        require(!(activePrevious.isFile && retiredPrevious.isFile)) {
+            "Install intent predecessor exists in both active and retired storage"
+        }
+        val previous = when {
+            activePrevious.isFile -> activePrevious
+            retiredPrevious.isFile -> retiredPrevious
+            else -> return
+        }
         val expectedHash = requireNotNull(intent.previousActiveSha256)
         val commitHash = sha256Hex(previous)
         if (
@@ -649,6 +657,10 @@ class BooxHandoffStore(val root: File) {
             beforePreservedDescriptorForTest?.invoke(previous)
             require(sha256Hex(previous) == commitHash) {
                 "NeoReader continued changing the predecessor while it was being preserved; retry the update"
+            }
+            if (previous == activePrevious) retirePreviousActive(documentRoot, intent)
+            require(retiredPrevious.isFile && sha256Hex(retiredPrevious) == commitHash) {
+                "NeoReader changed the predecessor at retirement; retry the update"
             }
         }
     }
