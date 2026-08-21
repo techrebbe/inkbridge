@@ -114,7 +114,8 @@ class BooxHandoffStore(val root: File) {
                     delivery.eventId in state.processedEventIds -> false
                     delivery.sourceRevisions == state.activeRevisions ->
                         delivery.contentSha256 != state.installedBrokerSha256
-                    state.activeRevisions.dominates(delivery.sourceRevisions) -> false
+                    !delivery.sourceRevisions.strictlyDominates(state.activeRevisions) -> false
+                    delivery.sourceGeneration <= state.sourceGeneration -> false
                     else -> true
                 }
             }.getOrDefault(false)
@@ -207,6 +208,7 @@ class BooxHandoffStore(val root: File) {
     }
 
     private fun activeDir(documentRoot: File) = File(documentRoot, "active").also(File::mkdirs)
+    private fun incomingDir(documentRoot: File) = File(documentRoot, "incoming")
     private fun retiredDir(documentRoot: File) = File(documentRoot, ".retired").also(File::mkdirs)
     private fun outgoingDir(documentRoot: File) = File(documentRoot, "outgoing").also(File::mkdirs)
     private fun stateFile(documentRoot: File) = File(documentRoot, ".inkbridge-state.json")
@@ -254,8 +256,56 @@ class BooxHandoffStore(val root: File) {
 
     private fun recover(documentRoot: File) {
         recoverState(documentRoot)
+        recoverMissingActive(documentRoot)
         recoverInstall(documentRoot)
+        recoverMissingActive(documentRoot)
     }
+
+    private fun recoverMissingActive(documentRoot: File) {
+        val state = readState(documentRoot) ?: return
+        val active = File(activeDir(documentRoot), state.activeFileName)
+        if (active.exists()) {
+            require(active.isFile) { "The active PDF path is not a file" }
+            return
+        }
+
+        val expectedHash: String
+        val recoverySource: File?
+        if (state.finalizedLocalSha256 != null) {
+            expectedHash = state.finalizedLocalSha256
+            recoverySource = state.finalizedOutputFileName
+                ?.let { File(outgoingDir(documentRoot), it) }
+                ?.takeIf(File::isFile)
+        } else {
+            expectedHash = state.installedBrokerSha256
+            recoverySource = findRetainedBrokerPdf(documentRoot, state)
+        }
+        if (recoverySource == null) return
+        publishFileOrVerify(recoverySource, active, expectedHash)
+    }
+
+    private fun findRetainedBrokerPdf(documentRoot: File, state: HandoffState): File? =
+        incomingDir(documentRoot)
+            .listFiles()
+            .orEmpty()
+            .asSequence()
+            .filter { it.isFile && it.name.endsWith(".inkbridge.json") }
+            .mapNotNull { descriptor ->
+                runCatching {
+                    val delivery = BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
+                    if (
+                        delivery.eventId != state.brokerEventId ||
+                        delivery.documentId != state.documentId ||
+                        delivery.sourceRevisions != state.activeRevisions ||
+                        delivery.sourceGeneration != state.sourceGeneration ||
+                        delivery.contentSha256 != state.installedBrokerSha256
+                    ) {
+                        return@runCatching null
+                    }
+                    File(descriptor.parentFile, delivery.pdfFileName).takeIf(File::isFile)
+                }.getOrNull()
+            }
+            .firstOrNull()
 
     private fun writeInstallIntent(documentRoot: File, intent: InstallIntent) {
         intent.validate(documentRoot.name)

@@ -208,6 +208,56 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun descriptorQueue_skipsIncomparableRevisionAheadOfValidDelivery() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        store.install(
+            delivery(root, "event-current", RevisionPair(1, 1), 10, "current".toByteArray()),
+        )
+        delivery(root, "a-incomparable", RevisionPair(0, 2), 11, "conflict".toByteArray())
+        delivery(root, "b-old-generation", RevisionPair(2, 2), 10, "old".toByteArray())
+        val next = delivery(root, "z-next", RevisionPair(2, 2), 12, "next".toByteArray())
+
+        assertEquals(next.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+    }
+
+    @Test
+    fun missingCommittedActivePdf_isRecoveredBeforeInstallingNewerDelivery() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        assertTrue(first.activeFile.delete())
+        val next = delivery(root, "event-2", RevisionPair(0, 2), 11, "two".toByteArray())
+
+        assertEquals(next.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+        assertTrue(first.activeFile.isFile)
+        assertEquals("one", first.activeFile.readText())
+        val installed = store.install(next) as InstallResult.Installed
+        assertEquals("two", installed.activeFile.readText())
+        assertEquals(RevisionPair(0, 2), installed.state.activeRevisions)
+    }
+
+    @Test
+    fun missingFinalizedActivePdf_isRecoveredFromFinalizedOutgoingPdf() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(1, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-finalized")
+        store.finalize(documentId)
+        assertTrue(installed.activeFile.delete())
+
+        store.state(documentId)
+
+        assertTrue(installed.activeFile.isFile)
+        assertEquals("one-finalized", installed.activeFile.readText())
+        assertTrue(store.finalize(documentId) is FinalizeResult.AlreadyFinalized)
+    }
+
+    @Test
     fun finalize_recreatesMissingPublishedPairFromActivePdf() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
