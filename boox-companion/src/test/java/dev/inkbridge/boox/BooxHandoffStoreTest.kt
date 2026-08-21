@@ -558,6 +558,45 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun interruptedInstall_discardsSnapshotWhenPredecessorChangesBeforeDescriptorPublication() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val secondBytes = "two".toByteArray()
+        val next = nextState(first, "event-2", RevisionPair(0, 2), 11, secondBytes)
+        val documentRoot = File(root, documentId)
+        File(File(documentRoot, "active"), next.activeFileName).writeBytes(secondBytes)
+        writeIntent(documentRoot, first, next)
+        File(documentRoot, ".inkbridge-state.json").writeText(next.toJson().toString(2))
+        first.activeFile.appendText("-late-edit")
+        var injectNewerEdit = true
+        store.beforePreservedDescriptorForTest = { predecessor ->
+            if (injectNewerEdit) {
+                injectNewerEdit = false
+                predecessor.appendText("-newer-edit")
+            }
+        }
+
+        val error = runCatching { store.state(documentId) }.exceptionOrNull()
+
+        assertTrue(error!!.message!!.contains("continued changing"))
+        assertTrue(first.activeFile.isFile)
+        assertTrue(File(documentRoot, ".inkbridge-install.json").isFile)
+        val outgoing = File(documentRoot, "outgoing")
+        assertFalse(outgoing.listFiles().orEmpty().any { it.extension == "pdf" })
+        assertFalse(outgoing.listFiles().orEmpty().any { it.name.endsWith(".inkbridge.json") })
+
+        store.beforePreservedDescriptorForTest = null
+        assertEquals(next, store.state(documentId))
+        val preserved = outgoing.listFiles().orEmpty().single { it.extension == "pdf" }
+        assertEquals("one-late-edit-newer-edit", preserved.readText())
+        assertTrue(File(outgoing, preserved.name + ".inkbridge.json").isFile)
+        assertFalse(first.activeFile.exists())
+    }
+
+    @Test
     fun publication_rejectsBytesThatDoNotMatchTheInitialHash() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

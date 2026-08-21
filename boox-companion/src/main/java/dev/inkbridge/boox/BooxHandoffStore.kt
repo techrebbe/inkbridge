@@ -35,6 +35,7 @@ private data class FinalizationCommit(
 
 class BooxHandoffStore(val root: File) {
     internal var beforeInstallCommitForTest: ((File?) -> Unit)? = null
+    internal var beforePreservedDescriptorForTest: ((File) -> Unit)? = null
     fun install(descriptorFile: File): InstallResult {
         val delivery = BrokerDelivery.fromJson(JSONObject(descriptorFile.readText()))
         val documentRoot = documentRoot(delivery.documentId)
@@ -230,16 +231,25 @@ class BooxHandoffStore(val root: File) {
         currentHash: String,
         outputName: String,
         localGeneration: Long,
+        beforeDescriptorPublication: (() -> Unit)? = null,
     ): Pair<File, File> {
         requireSafeFileName(outputName, "finalized output file name")
         require(localGeneration >= 1) { "Invalid local generation" }
-        val output = File(outgoingDir(documentRoot), outputName)
+        val outgoing = outgoingDir(documentRoot)
+        val output = File(outgoing, outputName)
+        val descriptor = File(outgoing, outputName + ".inkbridge.json")
         publishFileOrVerify(active, output, currentHash)
+        try {
+            beforeDescriptorPublication?.invoke()
+        } catch (error: Exception) {
+            deleteAndSync(descriptor, outgoing)
+            deleteAndSync(output, outgoing)
+            throw error
+        }
         val eventIdentity = state.documentId + ":" +
             state.activeRevisions.boox + ":" + state.activeRevisions.supernote + ":" +
             (state.activeRevisions.boox + 1) + ":" + currentHash
         val eventId = "boox-finalize-" + sha256Hex(eventIdentity.toByteArray())
-        val descriptor = File(outgoingDir(documentRoot), outputName + ".inkbridge.json")
         val descriptorJson = JSONObject()
             .put("schemaVersion", 1)
             .put("eventId", eventId)
@@ -252,7 +262,7 @@ class BooxHandoffStore(val root: File) {
             .put("contentSha256", currentHash)
             .put("payloadKind", "device_view")
         publishBytesOrVerify(descriptorJson.toString(2).toByteArray(), descriptor)
-        syncDirectory(outgoingDir(documentRoot))
+        syncDirectory(outgoing)
         return output to descriptor
     }
     private fun installAccepted(
@@ -635,9 +645,11 @@ class BooxHandoffStore(val root: File) {
             commitHash,
             outputName,
             nextLocalGeneration,
-        )
-        require(sha256Hex(previous) == commitHash) {
-            "NeoReader continued changing the predecessor while it was being preserved; retry the update"
+        ) {
+            beforePreservedDescriptorForTest?.invoke(previous)
+            require(sha256Hex(previous) == commitHash) {
+                "NeoReader continued changing the predecessor while it was being preserved; retry the update"
+            }
         }
     }
 
