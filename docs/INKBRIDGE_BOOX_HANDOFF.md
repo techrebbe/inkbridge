@@ -63,6 +63,7 @@ The companion validates the producer, document ID, filenames, source generation,
 - If NeoReader changed the active PDF, a new broker view is refused until those changes are finalized.
 - Even after finalization, the old view is retained until a new broker delivery advances the BOOX revision, proving that the broker accepted the finalized BOOX edit.
 - Incoming and outgoing PDFs are streamed, so a 500 MB PDF is never loaded wholly into memory.
+- Hashing, copying, synchronization, state recovery, and finalization run on one serialized background worker. The activity disables actions while work is running and performs only status updates and the final NeoReader launch on Android's main thread.
 - Files and state use synchronized temporary files plus create-only publication. Existing destination bytes are never overwritten, and each streamed PDF copy is hash-verified before its temporary file is published.
 - A durable install intent keeps the previous active PDF in place until the replacement PDF and state are committed. After interruption or power loss, the next companion action completes the install or safely discards an unpublished attempt before retiring the predecessor.
 

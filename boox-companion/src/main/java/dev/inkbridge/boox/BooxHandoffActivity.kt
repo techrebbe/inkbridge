@@ -15,16 +15,19 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
+import java.util.concurrent.Executors
 
 class BooxHandoffActivity : Activity() {
     private lateinit var store: BooxHandoffStore
     private lateinit var status: TextView
+    private val actionButtons = mutableListOf<Button>()
+    private var operationRunning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = BooxHandoffStore(File(Environment.getExternalStorageDirectory(), "Documents/InkBridge"))
         setContentView(buildUi())
-        refreshStatus("Ready")
+        renderStatus("Ready")
         dispatchIntent(intent)
     }
 
@@ -64,12 +67,14 @@ class BooxHandoffActivity : Activity() {
     }
 
     private fun LinearLayout.addButton(label: String, action: () -> Unit) {
-        addView(Button(this@BooxHandoffActivity).apply {
+        val button = Button(this@BooxHandoffActivity).apply {
             text = label
             textSize = 17f
             isAllCaps = false
-            setOnClickListener { runAction(action) }
-        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 18 })
+            setOnClickListener { action() }
+        }
+        actionButtons += button
+        addView(button, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 18 })
     }
 
     private fun dispatchIntent(intent: Intent) {
@@ -80,52 +85,58 @@ class BooxHandoffActivity : Activity() {
         }
     }
 
-    private fun installNext() = runAction {
+    private fun installNext() = runStorageAction("Installing next broker update...") {
         requireStorageAccess()
         val descriptor = store.findNextDescriptor() ?: error("No new broker update is waiting")
         when (val result = store.install(descriptor)) {
-            is InstallResult.Installed -> refreshStatus(
-                "Installed revision b${result.state.activeRevisions.boox} / " +
-                    "s${result.state.activeRevisions.supernote}\n${result.activeFile.name}",
+            is InstallResult.Installed -> StorageOutcome(
+                "Installed revision b" + result.state.activeRevisions.boox +
+                    " / s" + result.state.activeRevisions.supernote +
+                    "\n" + result.activeFile.name,
+                result.state,
             )
-            is InstallResult.Duplicate -> refreshStatus("That broker update was already installed")
-        }
-    }
-
-    private fun openActive(documentId: String? = null) = runAction {
-        requireStorageAccess()
-        val state = documentId?.let(store::state) ?: store.findMostRecentState()
-            ?: error("No active InkBridge document")
-        val pdf = File(File(File(store.root, state.documentId), "active"), state.activeFileName)
-        require(pdf.isFile) { "The active PDF is missing" }
-        // NeoReader explicitly advertises file:// PDF intents. This narrowly-scoped policy avoids
-        // FileUriExposedException while preserving in-place editable annotation behavior.
-        StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
-        startActivity(Intent(Intent.ACTION_VIEW).apply {
-            setClassName("com.onyx.kreader", "com.onyx.kreader.ui.ReaderHomeActivity")
-            setDataAndType(Uri.fromFile(pdf), "application/pdf")
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        })
-        Log.i(TAG, "OPEN document=${state.documentId} file=${pdf.absolutePath}")
-    }
-
-    private fun finalizeActive(documentId: String? = null) = runAction {
-        requireStorageAccess()
-        val state = documentId?.let(store::state) ?: store.findMostRecentState()
-            ?: error("No active InkBridge document")
-        when (val result = store.finalize(state.documentId)) {
-            FinalizeResult.NoChanges -> refreshStatus("No new BOOX changes to finalize")
-            is FinalizeResult.AlreadyFinalized -> refreshStatus("These BOOX changes were already finalized")
-            is FinalizeResult.Finalized -> refreshStatus(
-                "BOOX changes finalized\n${result.pdf.name}\nReady for folder sync",
+            is InstallResult.Duplicate -> StorageOutcome(
+                "That broker update was already installed",
+                store.findMostRecentState(),
             )
         }
     }
 
-    private fun requestStorageAccess() {
+    private fun openActive(documentId: String? = null) =
+        runStorageAction("Preparing the active document...") {
+            requireStorageAccess()
+            val state = documentId?.let(store::state) ?: store.findMostRecentState()
+                ?: error("No active InkBridge document")
+            val pdf = File(File(File(store.root, state.documentId), "active"), state.activeFileName)
+            require(pdf.isFile) { "The active PDF is missing" }
+            StorageOutcome("Opening active document in NeoReader", state, pdf)
+        }
+
+    private fun finalizeActive(documentId: String? = null) =
+        runStorageAction("Finalizing BOOX changes...") {
+            requireStorageAccess()
+            val state = documentId?.let(store::state) ?: store.findMostRecentState()
+                ?: error("No active InkBridge document")
+            when (val result = store.finalize(state.documentId)) {
+                FinalizeResult.NoChanges -> StorageOutcome(
+                    "No new BOOX changes to finalize",
+                    state,
+                )
+                is FinalizeResult.AlreadyFinalized -> StorageOutcome(
+                    "These BOOX changes were already finalized",
+                    store.state(state.documentId),
+                )
+                is FinalizeResult.Finalized -> StorageOutcome(
+                    "BOOX changes finalized\n" + result.pdf.name + "\nReady for folder sync",
+                    result.state,
+                )
+            }
+        }
+
+    private fun requestStorageAccess() = runUiAction {
         if (Environment.isExternalStorageManager()) {
-            refreshStatus("File access is already enabled")
-            return
+            renderStatus("File access is already enabled")
+            return@runUiAction
         }
         startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
             data = Uri.parse("package:$packageName")
@@ -136,26 +147,81 @@ class BooxHandoffActivity : Activity() {
         check(Environment.isExternalStorageManager()) { "Tap Grant file access first" }
     }
 
-    private fun runAction(action: () -> Unit) {
-        runCatching(action).onFailure {
-            Log.e(TAG, "ERROR ${it.message}", it)
-            refreshStatus("Stopped safely: ${it.message}")
+    private fun runStorageAction(progress: String, action: () -> StorageOutcome) {
+        if (operationRunning) {
+            Log.i(TAG, "IGNORED action while another storage operation is running")
+            return
+        }
+        operationRunning = true
+        setActionsEnabled(false)
+        renderStatus(progress)
+        STORAGE_EXECUTOR.execute {
+            val result = runCatching(action)
+            runOnUiThread {
+                if (isDestroyed || isFinishing) return@runOnUiThread
+                operationRunning = false
+                setActionsEnabled(true)
+                result.fold(
+                    onSuccess = { outcome ->
+                        runCatching { applyOutcome(outcome) }
+                            .onFailure(::showFailure)
+                    },
+                    onFailure = ::showFailure,
+                )
+            }
         }
     }
 
-    private fun refreshStatus(message: String) {
-        val recent = runCatching { store.findMostRecentState() }.getOrNull()
+    private fun applyOutcome(outcome: StorageOutcome) {
+        renderStatus(outcome.message, outcome.recent)
+        val pdf = outcome.openPdf ?: return
+        val state = requireNotNull(outcome.recent)
+        // NeoReader explicitly advertises file:// PDF intents. This narrowly-scoped policy avoids
+        // FileUriExposedException while preserving in-place editable annotation behavior.
+        StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
+        startActivity(Intent(Intent.ACTION_VIEW).apply {
+            setClassName("com.onyx.kreader", "com.onyx.kreader.ui.ReaderHomeActivity")
+            setDataAndType(Uri.fromFile(pdf), "application/pdf")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        })
+        Log.i(TAG, "OPEN document=" + state.documentId + " file=" + pdf.absolutePath)
+    }
+
+    private fun runUiAction(action: () -> Unit) {
+        runCatching(action).onFailure(::showFailure)
+    }
+
+    private fun showFailure(error: Throwable) {
+        Log.e(TAG, "ERROR " + error.message, error)
+        renderStatus("Stopped safely: " + error.message)
+    }
+
+    private fun setActionsEnabled(enabled: Boolean) {
+        actionButtons.forEach { it.isEnabled = enabled }
+    }
+
+    private fun renderStatus(message: String, recent: HandoffState? = null) {
         val detail = recent?.let {
-            "\n\nActive: b${it.activeRevisions.boox} / s${it.activeRevisions.supernote}" +
-                "\n${it.originalFileName}"
+            "\n\nActive: b" + it.activeRevisions.boox + " / s" +
+                it.activeRevisions.supernote + "\n" + it.originalFileName
         }.orEmpty()
         status.text = message + detail
-        Log.i(TAG, "$message${recent?.let { " document=${it.documentId}" }.orEmpty()}")
+        Log.i(
+            TAG,
+            message + (recent?.let { " document=" + it.documentId }.orEmpty()),
+        )
     }
 
     private fun matchWrap() = LinearLayout.LayoutParams(-1, -2)
 
+    private data class StorageOutcome(
+        val message: String,
+        val recent: HandoffState? = null,
+        val openPdf: File? = null,
+    )
+
     companion object {
+        private val STORAGE_EXECUTOR = Executors.newSingleThreadExecutor()
         private const val TAG = "INKBRIDGE_BOOX_HANDOFF"
         private const val EXTRA_DOCUMENT_ID = "documentId"
         private const val ACTION_INSTALL_NEXT = "dev.inkbridge.boox.action.INSTALL_NEXT"
