@@ -720,6 +720,34 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun descriptorQueue_allowsAcknowledgementThatPreservesPostFinalizationEdit() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-current", RevisionPair(1, 1), 10, "current".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-first-edit")
+        assertTrue(store.finalize(documentId) is FinalizeResult.Finalized)
+        installed.activeFile.appendText("-second-edit")
+        val acknowledged = delivery(
+            root,
+            "event-acknowledged",
+            RevisionPair(2, 2),
+            12,
+            "acknowledged".toByteArray(),
+        )
+
+        assertEquals(acknowledged.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+        assertTrue(store.install(acknowledged) is InstallResult.Installed)
+        val outgoingPdfs = File(File(root, documentId), "outgoing")
+            .listFiles()
+            .orEmpty()
+            .filter { it.extension == "pdf" }
+        assertEquals(2, outgoingPdfs.size)
+        assertTrue(outgoingPdfs.any { it.readText() == "current-first-edit-second-edit" })
+    }
+
+    @Test
     fun descriptorQueue_skipsUnacknowledgedUpdateAfterFinalizedBooxEdit() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

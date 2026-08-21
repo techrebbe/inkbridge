@@ -143,7 +143,8 @@ class BooxHandoffStore(val root: File) {
                         ?: return@runCatching false
                     if (
                         activeHash != state.installedBrokerSha256 &&
-                        activeHash != state.finalizedLocalSha256
+                        activeHash != state.finalizedLocalSha256 &&
+                        !shouldPreservePostFinalizationEdit(state, delivery, activeHash)
                     ) return@runCatching false
                 }
 
