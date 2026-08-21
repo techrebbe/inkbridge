@@ -178,6 +178,36 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun publication_rejectsBytesThatDoNotMatchTheInitialHash() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val source = File(root, "source.pdf").apply { writeText("changed-after-initial-hash") }
+        val destination = File(root, "published.pdf")
+        val initialHash = sha256Hex("original".toByteArray())
+
+        val error = runCatching {
+            store.publishFileOrVerify(source, destination, initialHash)
+        }.exceptionOrNull()
+
+        assertTrue(error!!.message!!.contains("changed while it was being copied"))
+        assertFalse(destination.exists())
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+    }
+
+    @Test
+    fun descriptorQueue_skipsExpiredEventsOutsideProcessedIdWindow() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        store.install(
+            delivery(root, "event-current", RevisionPair(5, 5), 10, "current".toByteArray()),
+        )
+        delivery(root, "a-expired", RevisionPair(0, 1), 1, "expired".toByteArray())
+        val next = delivery(root, "z-next", RevisionPair(5, 6), 11, "next".toByteArray())
+
+        assertEquals(next.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+    }
+
+    @Test
     fun sameRevisionWithDifferentBytesIsRejected() {
         val state = state(RevisionPair(1, 2), "a".repeat(64))
         val different = brokerDelivery("other", RevisionPair(1, 2), 11, "b".repeat(64))

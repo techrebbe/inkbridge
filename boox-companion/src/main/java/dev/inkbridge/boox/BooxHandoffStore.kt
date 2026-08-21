@@ -6,6 +6,7 @@ import java.io.FileOutputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 
 sealed class InstallResult {
     data class Installed(val activeFile: File, val state: HandoffState) : InstallResult()
@@ -110,7 +111,14 @@ class BooxHandoffStore(val root: File) {
                 val deliveryRoot = documentRoot(delivery.documentId)
                 recover(deliveryRoot)
                 val state = readState(deliveryRoot)
-                state == null || delivery.eventId !in state.processedEventIds
+                when {
+                    state == null -> true
+                    delivery.eventId in state.processedEventIds -> false
+                    delivery.sourceRevisions == state.activeRevisions ->
+                        delivery.contentSha256 != state.installedBrokerSha256
+                    state.activeRevisions.dominates(delivery.sourceRevisions) -> false
+                    else -> true
+                }
             }.getOrDefault(true)
         }
 
@@ -292,14 +300,14 @@ class BooxHandoffStore(val root: File) {
         }
     }
 
-    private fun publishFileOrVerify(source: File, destination: File, expectedHash: String) {
+    internal fun publishFileOrVerify(source: File, destination: File, expectedHash: String) {
         if (destination.isFile) {
             require(sha256Hex(destination) == expectedHash) {
                 "Existing ${destination.name} has unexpected content"
             }
             return
         }
-        publishCreateOnly(source, destination)
+        publishCreateOnly(source, destination, expectedHash)
     }
 
     private fun publishBytesOrVerify(bytes: ByteArray, destination: File) {
@@ -312,21 +320,38 @@ class BooxHandoffStore(val root: File) {
         publishBytesCreateOnly(bytes, destination)
     }
 
-    private fun publishCreateOnly(source: File, destination: File) {
+    private fun publishCreateOnly(source: File, destination: File, expectedHash: String) {
         destination.parentFile?.mkdirs()
-        require(!destination.exists()) { "Refusing to overwrite ${destination.name}" }
-        val temp = File(destination.parentFile, ".${destination.name}.${System.nanoTime()}.tmp")
-        FileOutputStream(temp).use { output ->
-            source.inputStream().buffered().use { input -> input.copyTo(output) }
-            output.fd.sync()
-        }
+        require(!destination.exists()) { "Refusing to overwrite " + destination.name }
+        val temp = File(
+            destination.parentFile,
+            "." + destination.name + "." + System.nanoTime() + ".tmp",
+        )
         try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileOutputStream(temp).use { output ->
+                source.inputStream().buffered().use { input ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        if (count > 0) {
+                            output.write(buffer, 0, count)
+                            digest.update(buffer, 0, count)
+                        }
+                    }
+                }
+                output.fd.sync()
+            }
+            val copiedHash = digest.digest().joinToString("") { "%02x".format(it) }
+            require(copiedHash == expectedHash) {
+                "Source " + source.name + " changed while it was being copied"
+            }
             publishTempCreateOnly(temp, destination)
         } finally {
             temp.delete()
         }
     }
-
     private fun publishBytesCreateOnly(bytes: ByteArray, destination: File) {
         destination.parentFile?.mkdirs()
         require(!destination.exists()) { "Refusing to overwrite ${destination.name}" }
