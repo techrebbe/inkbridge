@@ -1,0 +1,50 @@
+name: InkBridge BOOX companion
+
+on:
+  push:
+    branches: [master, "feat/**", "agent/**"]
+    paths:
+      - "boox-companion/**"
+      - "settings.gradle.kts"
+      - "build.gradle.kts"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - ".github/workflows/inkbridge-boox-companion.yml"
+  pull_request:
+    paths:
+      - "boox-companion/**"
+      - "settings.gradle.kts"
+      - "build.gradle.kts"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - ".github/workflows/inkbridge-boox-companion.yml"
+
+jobs:
+  build-and-test:
+    name: BOOX handoff tests + APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - name: Test, lint, and assemble
+        run: |
+          chmod +x ./gradlew
+          ./gradlew \
+            :boox-companion:testDebugUnitTest \
+            :boox-companion:lintDebug \
+            :boox-companion:assembleDebug \
+            --console=plain
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkbridge-boox-companion-debug-apk
+          path: boox-companion/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7

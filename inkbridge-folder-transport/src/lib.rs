@@ -1,3 +1,4 @@
+mod boox_handoff;
 mod companion;
 mod gcloud;
 mod model;
