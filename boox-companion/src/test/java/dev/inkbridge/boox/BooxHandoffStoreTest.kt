@@ -222,6 +222,41 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun descriptorQueue_skipsSameRevisionHashConflictAheadOfValidDelivery() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        store.install(
+            delivery(root, "event-current", RevisionPair(1, 1), 10, "current".toByteArray()),
+        )
+        delivery(root, "a-conflict", RevisionPair(1, 1), 11, "conflict".toByteArray())
+        val next = delivery(root, "z-next", RevisionPair(1, 2), 12, "next".toByteArray())
+
+        assertEquals(next.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+    }
+
+    @Test
+    fun descriptorQueue_skipsUnacknowledgedUpdateAfterFinalizedBooxEdit() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-current", RevisionPair(1, 1), 10, "current".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-edited")
+        assertTrue(store.finalize(documentId) is FinalizeResult.Finalized)
+        delivery(root, "a-unacknowledged", RevisionPair(1, 2), 11, "intermediate".toByteArray())
+        val acknowledged = delivery(
+            root,
+            "z-acknowledged",
+            RevisionPair(2, 2),
+            12,
+            "acknowledged".toByteArray(),
+        )
+
+        assertEquals(acknowledged.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+        assertTrue(store.install(acknowledged) is InstallResult.Installed)
+    }
+
+    @Test
     fun missingCommittedActivePdf_isRecoveredBeforeInstallingNewerDelivery() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

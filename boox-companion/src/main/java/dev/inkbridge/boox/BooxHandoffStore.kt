@@ -115,10 +115,11 @@ class BooxHandoffStore(val root: File) {
                 when {
                     state == null -> true
                     delivery.eventId in state.processedEventIds -> false
-                    delivery.sourceRevisions == state.activeRevisions ->
-                        delivery.contentSha256 != state.installedBrokerSha256
+                    delivery.sourceRevisions == state.activeRevisions -> false
                     !delivery.sourceRevisions.strictlyDominates(state.activeRevisions) -> false
                     delivery.sourceGeneration <= state.sourceGeneration -> false
+                    state.finalizedLocalSha256 != null &&
+                        delivery.sourceRevisions.boox <= state.activeRevisions.boox -> false
                     else -> true
                 }
             }.getOrDefault(false)
