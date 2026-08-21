@@ -225,6 +225,8 @@ class BooxHandoffStoreTest {
         ) as InstallResult.Installed
         installed.activeFile.appendText("-first-edit")
         val first = store.finalize(documentId) as FinalizeResult.Finalized
+        val descriptorBytes = first.descriptor.readBytes()
+        assertTrue(first.descriptor.delete())
         installed.activeFile.appendText("-second-edit")
 
         val error = runCatching { store.finalize(documentId) }.exceptionOrNull()
@@ -232,6 +234,7 @@ class BooxHandoffStoreTest {
         assertTrue(error!!.message!!.contains("acknowledged"))
         assertTrue(first.pdf.isFile)
         assertTrue(first.descriptor.isFile)
+        assertTrue(descriptorBytes.contentEquals(first.descriptor.readBytes()))
         assertEquals(2, first.pdf.parentFile!!.listFiles()!!.size)
         assertEquals("one-first-edit-second-edit", installed.activeFile.readText())
     }

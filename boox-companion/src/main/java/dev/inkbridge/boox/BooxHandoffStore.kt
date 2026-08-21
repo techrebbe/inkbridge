@@ -75,22 +75,31 @@ class BooxHandoffStore(val root: File) {
         val active = File(activeDir(documentRoot), state.activeFileName)
         require(active.isFile) { "The active PDF is missing" }
         val currentHash = sha256Hex(active)
-        if (currentHash == state.installedBrokerSha256) return FinalizeResult.NoChanges
-        if (currentHash == state.finalizedLocalSha256) {
+        val finalizedHash = state.finalizedLocalSha256
+        if (finalizedHash != null) {
             val outputName = requireNotNull(state.finalizedOutputFileName)
+            val output = File(outgoingDir(documentRoot), outputName)
+            val recoverySource = when {
+                currentHash == finalizedHash -> active
+                output.isFile -> output
+                else -> error(
+                    "The pending finalized BOOX snapshot is missing; preserving the newer active edit",
+                )
+            }
             val artifacts = ensureFinalizedArtifacts(
                 documentRoot,
                 state,
-                active,
-                currentHash,
+                recoverySource,
+                finalizedHash,
                 outputName,
                 state.localGeneration,
             )
+            check(currentHash == finalizedHash) {
+                "Wait for the previous finalized BOOX changes to be acknowledged before finalizing again"
+            }
             return FinalizeResult.AlreadyFinalized(artifacts.first)
         }
-        check(state.finalizedLocalSha256 == null) {
-            "Wait for the previous finalized BOOX changes to be acknowledged before finalizing again"
-        }
+        if (currentHash == state.installedBrokerSha256) return FinalizeResult.NoChanges
 
         val committed = commitFinalization(documentRoot, state, active, currentHash)
         return FinalizeResult.Finalized(committed.pdf, committed.descriptor, committed.state)
@@ -234,6 +243,7 @@ class BooxHandoffStore(val root: File) {
             .put("contentSha256", currentHash)
             .put("payloadKind", "device_view")
         publishBytesOrVerify(descriptorJson.toString(2).toByteArray(), descriptor)
+        syncDirectory(outgoingDir(documentRoot))
         return output to descriptor
     }
     private fun installAccepted(
@@ -594,12 +604,15 @@ class BooxHandoffStore(val root: File) {
     }
 
     private fun publishTempCreateOnly(temp: File, destination: File) {
+        val directory = requireNotNull(destination.parentFile)
         try {
             Files.createLink(destination.toPath(), temp.toPath())
-            temp.delete()
+            require(temp.delete()) { "Could not remove staged copy " + temp.name }
+            syncDirectory(directory)
         } catch (error: Exception) {
             if (destination.exists()) throw error
             moveNoReplace(temp, destination)
+            syncDirectory(directory)
         }
     }
 
