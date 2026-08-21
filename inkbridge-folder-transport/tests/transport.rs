@@ -355,6 +355,79 @@ fn broker_boox_output_stages_one_versioned_companion_delivery() {
 }
 
 #[test]
+fn corrupt_versioned_boox_destination_does_not_block_later_valid_delivery() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let first = b"first broker PDF".to_vec();
+    let first_hash = sha256_hex(&first);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book-r1.pdf", document.document_id),
+        first,
+        generated_metadata(&document.document_id, "0:1", b"first broker PDF"),
+    );
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    fs::create_dir_all(&incoming).unwrap();
+    let corrupt = incoming.join(format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        1,
+        1,
+        &first_hash[..12]
+    ));
+    fs::write(&corrupt, b"truncated mirror copy").unwrap();
+
+    let valid = b"second broker PDF".to_vec();
+    let valid_hash = sha256_hex(&valid);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book-r2.pdf", document.document_id),
+        valid.clone(),
+        generated_metadata(&document.document_id, "0:2", &valid),
+    );
+    let expected_valid = incoming.join(format!(
+        "broker-b{:020}-s{:020}-g{:020}-{}.pdf",
+        0,
+        2,
+        2,
+        &valid_hash[..12]
+    ));
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("unexpected content") && reason.contains("preserved")
+    )));
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            local_path,
+            ..
+        } if local_path == &expected_valid
+    )));
+    assert_eq!(fs::read(&corrupt).unwrap(), b"truncated mirror copy");
+    assert_eq!(fs::read(&expected_valid).unwrap(), valid);
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        }
+    );
+}
+
+#[test]
 fn finalized_companion_edit_uploads_compact_operations_at_current_frontier() {
     let root = tempdir().unwrap();
     let handoff_root = root.path().join("boox-handoff");
@@ -426,6 +499,102 @@ fn finalized_companion_edit_uploads_compact_operations_at_current_frontier() {
         uploaded.0.metadata[SOURCE_LOCAL_ID],
         sha256_hex(event.event_id.as_bytes())
     );
+}
+
+#[test]
+fn corrupt_finalized_boox_pair_does_not_block_later_valid_artifact() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let corrupt_bytes = b"truncated finalized PDF";
+    let corrupt_event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-corrupt".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/a-corrupt__boox-finalized-g1.pdf",
+            document.document_id
+        ),
+        source_generation: 1,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(b"expected complete finalized PDF"),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    let corrupt =
+        write_finalized_boox_handoff(&handoff_root, &document, &corrupt_event, corrupt_bytes);
+    let valid_bytes = b"valid finalized NeoReader PDF";
+    let valid_event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-valid".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/z-valid__boox-finalized-g2.pdf",
+            document.document_id
+        ),
+        source_generation: 2,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(valid_bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    let valid = write_finalized_boox_handoff(&handoff_root, &document, &valid_event, valid_bytes);
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(
+        &cloud,
+        &document,
+        0,
+        1,
+        native_export_at(0, "accepted", 0, 0),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+            ..Default::default()
+        },
+    );
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Boox,
+            reason,
+        } if reason.contains("not descriptor hash") && reason.contains("preserved")
+    )));
+    assert!(
+        report.actions.iter().any(|action| matches!(
+            action,
+            TransportAction::Uploaded {
+                side: DeviceSide::Boox,
+                local_path,
+                ..
+            } if local_path == &valid
+        )),
+        "{report:?}"
+    );
+    assert_eq!(fs::read(&corrupt).unwrap(), corrupt_bytes);
 }
 
 #[test]

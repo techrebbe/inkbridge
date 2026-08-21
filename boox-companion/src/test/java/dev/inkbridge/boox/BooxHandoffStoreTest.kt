@@ -120,6 +120,51 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun finalize_rejectsSecondEditUntilPriorFinalizationIsAcknowledged() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-first-edit")
+        val first = store.finalize(documentId) as FinalizeResult.Finalized
+        installed.activeFile.appendText("-second-edit")
+
+        val error = runCatching { store.finalize(documentId) }.exceptionOrNull()
+
+        assertTrue(error!!.message!!.contains("acknowledged"))
+        assertTrue(first.pdf.isFile)
+        assertTrue(first.descriptor.isFile)
+        assertEquals(2, first.pdf.parentFile!!.listFiles()!!.size)
+        assertEquals("one-first-edit-second-edit", installed.activeFile.readText())
+    }
+
+    @Test
+    fun finalizedEventIdentityIncludesTheRevisionFrontier() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val firstInstalled = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "broker-one".toByteArray()),
+        ) as InstallResult.Installed
+        firstInstalled.activeFile.writeText("repeated-finalized-content")
+        val first = store.finalize(documentId) as FinalizeResult.Finalized
+        val firstEventId = JSONObject(first.descriptor.readText()).getString("eventId")
+
+        val acknowledged = store.install(
+            delivery(root, "event-2", RevisionPair(1, 2), 11, "broker-two".toByteArray()),
+        ) as InstallResult.Installed
+        acknowledged.activeFile.writeText("repeated-finalized-content")
+        val second = store.finalize(documentId) as FinalizeResult.Finalized
+        val secondEventId = JSONObject(second.descriptor.readText()).getString("eventId")
+
+        assertTrue(firstEventId != secondEventId)
+        assertEquals(
+            JSONObject(first.descriptor.readText()).getString("contentSha256"),
+            JSONObject(second.descriptor.readText()).getString("contentSha256"),
+        )
+    }
+
+    @Test
     fun interruptedInstall_beforeReplacementPublication_keepsPredecessorRecoverable() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

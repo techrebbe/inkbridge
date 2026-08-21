@@ -4,10 +4,7 @@ use inkbridge_broker::{
     EVENT_SCHEMA_VERSION,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::fs;
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
@@ -139,9 +136,10 @@ impl BooxHandoffEndpoint {
             if !name.ends_with(DESCRIPTOR_SUFFIX) {
                 continue;
             }
-            // Folder mirrors may expose a descriptor before its PDF or leave a
-            // partial/corrupt pair. Such an entry has no authority and must not
-            // block later valid artifacts or Supernote uploads for the document.
+            // Folder mirrors may expose a malformed descriptor before its PDF.
+            // Validate the cheap metadata/pair contract here, but defer hashing
+            // complete PDFs until transport state has filtered acknowledged events.
+            // A later hash mismatch is preserved and skipped by the transport.
             if let Ok(artifact) =
                 read_finalized_artifact(&outgoing, descriptor_path, &name, document)
             {
@@ -241,37 +239,12 @@ fn read_finalized_artifact(
             pdf_path.display()
         ));
     }
-    let actual_hash = sha256_file(&pdf_path)?;
-    if actual_hash != event.content_sha256 {
-        return Err(format!(
-            "BOOX handoff PDF {} hash {actual_hash} does not match descriptor {}",
-            pdf_path.display(),
-            event.content_sha256
-        ));
-    }
+
     Ok(FinalizedBooxArtifact {
         descriptor_path,
         pdf_path,
         event,
     })
-}
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let file =
-        File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn validate_finalized_event(
@@ -484,7 +457,7 @@ mod tests {
             .contains("one safe PDF"));
     }
     #[test]
-    fn skips_invalid_or_incomplete_descriptors_and_returns_valid_pair() {
+    fn skips_invalid_or_incomplete_descriptors_without_hashing_complete_pairs() {
         let root = tempdir().unwrap();
         let document = document();
         let endpoint = BooxHandoffEndpoint::new(root.path(), &document).unwrap();
@@ -543,8 +516,10 @@ mod tests {
         .unwrap();
 
         let artifacts = endpoint.finalized_artifacts(&document).unwrap();
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].event, valid);
-        assert_eq!(artifacts[0].pdf_path, outgoing.join("z-valid.pdf"));
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].event, corrupt);
+        assert_eq!(artifacts[0].pdf_path, outgoing.join("c-corrupt.pdf"));
+        assert_eq!(artifacts[1].event, valid);
+        assert_eq!(artifacts[1].pdf_path, outgoing.join("z-valid.pdf"));
     }
 }

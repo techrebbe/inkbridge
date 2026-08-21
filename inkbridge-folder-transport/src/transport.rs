@@ -521,10 +521,14 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                         && sha256_file(&delivery.pdf_path).is_ok_and(|hash| hash == expected_hash);
                     if !installed {
                         if metadata_if_exists(&delivery.pdf_path)?.is_some() {
-                            return Err(format!(
-                                "versioned BOOX handoff destination {} changed after delivery",
-                                delivery.pdf_path.display()
-                            ));
+                            report.actions.push(TransportAction::Deferred {
+                                side,
+                                reason: format!(
+                                    "versioned BOOX handoff destination {} changed after delivery and was preserved for inspection",
+                                    delivery.pdf_path.display()
+                                ),
+                            });
+                            continue;
                         }
                         self.download_verified(
                             &object,
@@ -635,10 +639,14 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 && !already_installed
                 && metadata_if_exists(&local_path)?.is_some()
             {
-                return Err(format!(
-                    "versioned BOOX handoff destination {} already exists with unexpected content",
-                    local_path.display()
-                ));
+                report.actions.push(TransportAction::Deferred {
+                    side,
+                    reason: format!(
+                        "versioned BOOX handoff destination {} already exists with unexpected content and was preserved for inspection",
+                        local_path.display()
+                    ),
+                });
+                continue;
             }
             let handoff_missing = boox_handoff_delivery
                 .as_ref()
@@ -737,35 +745,42 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             return Ok(());
         }
         for artifact in endpoint.finalized_artifacts(document)? {
+            let local_key = canonical_path_key(&artifact.pdf_path);
+            let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
+            let expected_source_hash = artifact.event.content_sha256.clone();
+            let already_processed = {
+                let boox_state = &state.document_mut(&document.document_id).boox;
+                boox_state
+                    .uploaded_local_hashes
+                    .get(&local_key)
+                    .is_some_and(|hash| hash == &expected_source_hash)
+                    || boox_state
+                        .accepted_local_hashes
+                        .get(&local_key)
+                        .is_some_and(|hash| hash == &expected_source_hash)
+                    || boox_state
+                        .accepted_source_revisions
+                        .get(&source_local_id)
+                        .is_some_and(|revision| *revision >= artifact.event.source_revision)
+            };
+            if already_processed {
+                continue;
+            }
             if !file_is_settled(&artifact.descriptor_path, state, now, self.settle)?
                 || !file_is_settled(&artifact.pdf_path, state, now, self.settle)?
             {
                 continue;
             }
             let source_hash = sha256_file(&artifact.pdf_path)?;
-            if source_hash != artifact.event.content_sha256 {
-                return Err(format!(
-                    "finalized BOOX PDF {} hash {source_hash} does not match descriptor {}",
-                    artifact.pdf_path.display(),
-                    artifact.event.content_sha256
-                ));
-            }
-            let local_key = canonical_path_key(&artifact.pdf_path);
-            let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
-            let boox_state = &state.document_mut(&document.document_id).boox;
-            if boox_state
-                .uploaded_local_hashes
-                .get(&local_key)
-                .is_some_and(|hash| hash == &source_hash)
-                || boox_state
-                    .accepted_local_hashes
-                    .get(&local_key)
-                    .is_some_and(|hash| hash == &source_hash)
-                || boox_state
-                    .accepted_source_revisions
-                    .get(&source_local_id)
-                    .is_some_and(|revision| *revision >= artifact.event.source_revision)
-            {
+            if source_hash != expected_source_hash {
+                report.actions.push(TransportAction::Deferred {
+                    side: DeviceSide::Boox,
+                    reason: format!(
+                        "finalized BOOX PDF {} has content hash {source_hash}, not descriptor hash {}, and was preserved for inspection",
+                        artifact.pdf_path.display(),
+                        expected_source_hash
+                    ),
+                });
                 continue;
             }
             let current = state.document_mut(&document.document_id).revisions;

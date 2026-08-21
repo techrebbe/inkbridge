@@ -66,6 +66,9 @@ class BooxHandoffStore(val root: File) {
             )
             return FinalizeResult.AlreadyFinalized(artifacts.first)
         }
+        check(state.finalizedLocalSha256 == null) {
+            "Wait for the previous finalized BOOX changes to be acknowledged before finalizing again"
+        }
 
         val nextLocalGeneration = state.localGeneration + 1
         val outputName = active.nameWithoutExtension +
@@ -104,15 +107,10 @@ class BooxHandoffStore(val root: File) {
         .firstOrNull { descriptor ->
             runCatching {
                 val delivery = BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
-                val incomingPdf = File(descriptor.parentFile, delivery.pdfFileName)
-                require(incomingPdf.isFile) { "Incoming PDF is missing" }
-                require(sha256Hex(incomingPdf) == delivery.contentSha256) {
-                    "Incoming PDF hash does not match its descriptor"
-                }
                 val deliveryRoot = documentRoot(delivery.documentId)
                 recover(deliveryRoot)
                 val state = readState(deliveryRoot)
-                when {
+                val candidate = when {
                     state == null -> true
                     delivery.eventId in state.processedEventIds -> false
                     delivery.sourceRevisions == state.activeRevisions -> false
@@ -122,6 +120,14 @@ class BooxHandoffStore(val root: File) {
                         delivery.sourceRevisions.boox <= state.activeRevisions.boox -> false
                     else -> true
                 }
+                if (!candidate) return@runCatching false
+
+                val incomingPdf = File(descriptor.parentFile, delivery.pdfFileName)
+                require(incomingPdf.isFile) { "Incoming PDF is missing" }
+                require(sha256Hex(incomingPdf) == delivery.contentSha256) {
+                    "Incoming PDF hash does not match its descriptor"
+                }
+                true
             }.getOrDefault(false)
         }
 
@@ -148,8 +154,10 @@ class BooxHandoffStore(val root: File) {
         require(localGeneration >= 1) { "Invalid local generation" }
         val output = File(outgoingDir(documentRoot), outputName)
         publishFileOrVerify(active, output, currentHash)
-        val eventId = "boox-finalize-" +
-            sha256Hex((state.documentId + ":" + currentHash).toByteArray())
+        val eventIdentity = state.documentId + ":" +
+            state.activeRevisions.boox + ":" + state.activeRevisions.supernote + ":" +
+            (state.activeRevisions.boox + 1) + ":" + currentHash
+        val eventId = "boox-finalize-" + sha256Hex(eventIdentity.toByteArray())
         val descriptor = File(outgoingDir(documentRoot), outputName + ".inkbridge.json")
         val descriptorJson = JSONObject()
             .put("schemaVersion", 1)
