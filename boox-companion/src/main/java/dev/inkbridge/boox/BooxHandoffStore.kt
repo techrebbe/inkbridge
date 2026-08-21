@@ -551,11 +551,14 @@ class BooxHandoffStore(val root: File) {
 
     private fun cleanupStagedPublications(directory: File, destinationName: String, description: String) {
         val prefix = ".$destinationName."
+        var deleted = false
         directory.listFiles().orEmpty()
             .filter { it.isFile && it.name.startsWith(prefix) && it.name.endsWith(".tmp") }
             .forEach { staged ->
                 require(staged.delete()) { "Could not remove interrupted $description copy " + staged.name }
+                deleted = true
             }
+        if (deleted) syncDirectory(directory)
     }
 
     private fun retirePreviousActive(documentRoot: File, intent: InstallIntent) {
@@ -570,17 +573,11 @@ class BooxHandoffStore(val root: File) {
     }
 
     private fun clearFinalizeIntent(documentRoot: File) {
-        val intent = finalizeIntentFile(documentRoot)
-        if (intent.exists()) {
-            require(intent.delete()) { "Could not clear completed finalize intent" }
-        }
+        deleteAndSync(finalizeIntentFile(documentRoot), documentRoot)
     }
 
     private fun clearInstallIntent(documentRoot: File) {
-        val intent = installIntentFile(documentRoot)
-        if (intent.exists()) {
-            require(intent.delete()) { "Could not clear completed install intent" }
-        }
+        deleteAndSync(installIntentFile(documentRoot), documentRoot)
     }
 
     internal fun publishFileOrVerify(source: File, destination: File, expectedHash: String) {
