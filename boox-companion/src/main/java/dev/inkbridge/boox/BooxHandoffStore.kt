@@ -36,9 +36,24 @@ private data class FinalizationCommit(
     val state: HandoffState,
 )
 
-class BooxHandoffStore(val root: File) {
+class BooxHandoffStore(
+    val root: File,
+    private val predecessorQuietPeriodMillis: Long = 0,
+    private val predecessorSettleTimeoutMillis: Long = predecessorQuietPeriodMillis,
+) {
+    init {
+        require(predecessorQuietPeriodMillis >= 0) { "Predecessor quiet period cannot be negative" }
+        require(predecessorSettleTimeoutMillis >= predecessorQuietPeriodMillis) {
+            "Predecessor settle timeout must cover the quiet period"
+        }
+        require(predecessorSettleTimeoutMillis <= 60_000) {
+            "Predecessor settle timeout is unreasonably long"
+        }
+    }
+
     internal var beforeInstallCommitForTest: ((File?) -> Unit)? = null
     internal var beforePreservedDescriptorForTest: ((File) -> Unit)? = null
+    internal var afterPredecessorRetirementForTest: ((File) -> Unit)? = null
     fun install(descriptorFile: File): InstallResult {
         val delivery = BrokerDelivery.fromJson(JSONObject(descriptorFile.readText()))
         val documentRoot = documentRoot(delivery.documentId)
@@ -698,6 +713,36 @@ class BooxHandoffStore(val root: File) {
         if (previous == activePrevious) retirePreviousActive(documentRoot, intent)
         require(retiredPrevious.isFile && sha256Hex(retiredPrevious) == expectedHash) {
             "NeoReader changed the predecessor at retirement; retry the update"
+        }
+        afterPredecessorRetirementForTest?.invoke(retiredPrevious)
+        awaitRetiredPredecessorQuiet(retiredPrevious)
+        require(sha256Hex(retiredPrevious) == expectedHash) {
+            "NeoReader changed the retired predecessor; retry the update"
+        }
+    }
+
+    private fun awaitRetiredPredecessorQuiet(retired: File) {
+        if (predecessorQuietPeriodMillis == 0L) return
+        val pollMillis = minOf(100L, predecessorQuietPeriodMillis)
+        val timeoutAt = System.nanoTime() + predecessorSettleTimeoutMillis * 1_000_000L
+        var quietUntil = System.nanoTime() + predecessorQuietPeriodMillis * 1_000_000L
+        var observedLength = retired.length()
+        var observedModified = retired.lastModified()
+        while (true) {
+            val now = System.nanoTime()
+            require(now < timeoutAt) { "NeoReader did not release the retired predecessor in time" }
+            val remainingQuietMillis = ((quietUntil - now) / 1_000_000L).coerceAtLeast(1L)
+            Thread.sleep(minOf(pollMillis, remainingQuietMillis))
+            val currentLength = retired.length()
+            val currentModified = retired.lastModified()
+            val checkedAt = System.nanoTime()
+            if (currentLength != observedLength || currentModified != observedModified) {
+                observedLength = currentLength
+                observedModified = currentModified
+                quietUntil = checkedAt + predecessorQuietPeriodMillis * 1_000_000L
+            } else if (checkedAt >= quietUntil) {
+                return
+            }
         }
     }
 

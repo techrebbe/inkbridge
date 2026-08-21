@@ -27,7 +27,11 @@ class BooxHandoffActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        store = BooxHandoffStore(File(Environment.getExternalStorageDirectory(), "Documents/InkBridge"))
+        store = BooxHandoffStore(
+            File(Environment.getExternalStorageDirectory(), "Documents/InkBridge"),
+            predecessorQuietPeriodMillis = 1_500,
+            predecessorSettleTimeoutMillis = 15_000,
+        )
         setContentView(buildUi())
         renderStatus("Ready")
         dispatchIntent(intent)
