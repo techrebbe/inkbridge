@@ -27,7 +27,7 @@ class BooxHandoffStore(val root: File) {
         val incomingHash = sha256Hex(incomingPdf)
         require(incomingHash == delivery.contentSha256) { "Incoming PDF hash does not match its descriptor" }
 
-        recoverState(documentRoot)
+        recover(documentRoot)
         val previous = readState(documentRoot)
         val previousActive = previous?.let { File(activeDir(documentRoot), it.activeFileName) }
         val activeHash = previousActive?.takeIf(File::isFile)?.let(::sha256Hex)
@@ -47,7 +47,7 @@ class BooxHandoffStore(val root: File) {
     fun finalize(documentId: String): FinalizeResult {
         requireDocumentId(documentId)
         val documentRoot = documentRoot(documentId)
-        recoverState(documentRoot)
+        recover(documentRoot)
         val state = readState(documentRoot) ?: error("No active InkBridge document")
         val active = File(activeDir(documentRoot), state.activeFileName)
         require(active.isFile) { "The active PDF is missing" }
@@ -92,7 +92,7 @@ class BooxHandoffStore(val root: File) {
     fun state(documentId: String): HandoffState? {
         requireDocumentId(documentId)
         val documentRoot = documentRoot(documentId)
-        recoverState(documentRoot)
+        recover(documentRoot)
         return readState(documentRoot)
     }
 
@@ -107,7 +107,9 @@ class BooxHandoffStore(val root: File) {
         .firstOrNull { descriptor ->
             runCatching {
                 val delivery = BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
-                val state = readState(documentRoot(delivery.documentId))
+                val deliveryRoot = documentRoot(delivery.documentId)
+                recover(deliveryRoot)
+                val state = readState(deliveryRoot)
                 state == null || delivery.eventId !in state.processedEventIds
             }.getOrDefault(true)
         }
@@ -117,7 +119,10 @@ class BooxHandoffStore(val root: File) {
         .orEmpty()
         .asSequence()
         .filter { it.isDirectory && it.name.startsWith("inkbridge-doc-v1-") }
-        .mapNotNull { readState(it) }
+        .mapNotNull { documentRoot ->
+            recover(documentRoot)
+            readState(documentRoot)
+        }
         .maxByOrNull { it.sourceGeneration }
 
     private fun installAccepted(
@@ -128,28 +133,10 @@ class BooxHandoffStore(val root: File) {
         previousActive: File?,
     ): InstallResult.Installed {
         val active = activeDir(documentRoot)
-        val retired = retiredDir(documentRoot)
         val stem = delivery.originalFileName.substringBeforeLast('.').sanitizeStem()
         val newName = "${stem}__ib-b${delivery.sourceRevisions.boox}" +
             "-s${delivery.sourceRevisions.supernote}-g${delivery.sourceGeneration}.pdf"
         val destination = File(active, newName)
-        require(!destination.exists()) { "Revisioned destination already exists unexpectedly" }
-
-        var retiredPrevious: File? = null
-        try {
-            if (previousActive?.isFile == true) {
-                retiredPrevious = File(retired, previousActive.name)
-                moveNoReplace(previousActive, retiredPrevious)
-            }
-            publishCreateOnly(incomingPdf, destination)
-        } catch (error: Throwable) {
-            destination.delete()
-            if (retiredPrevious?.isFile == true && previousActive != null && !previousActive.exists()) {
-                moveNoReplace(retiredPrevious, previousActive)
-            }
-            throw error
-        }
-
         val processed = ((previous?.processedEventIds ?: emptyList()) + delivery.eventId)
             .distinct()
             .takeLast(512)
@@ -163,18 +150,22 @@ class BooxHandoffStore(val root: File) {
             installedBrokerSha256 = delivery.contentSha256,
             processedEventIds = processed,
         )
-        try {
-            writeState(documentRoot, next)
-        } catch (error: Throwable) {
-            destination.delete()
-            if (retiredPrevious?.isFile == true && previousActive != null && !previousActive.exists()) {
-                moveNoReplace(retiredPrevious, previousActive)
-            }
-            throw error
-        }
+        next.validate()
+        val intent = InstallIntent(
+            previousActiveFileName = previousActive?.name,
+            nextState = next,
+        )
+        writeInstallIntent(documentRoot, intent)
+
+        // Keep the predecessor active until both the replacement and its durable
+        // state are committed. recoverInstall() completes or safely restarts each
+        // intermediate state after process death or power loss.
+        publishFileOrVerify(incomingPdf, destination, delivery.contentSha256)
+        writeState(documentRoot, next)
+        retirePreviousActive(documentRoot, intent)
+        clearInstallIntent(documentRoot)
         return InstallResult.Installed(destination, next)
     }
-
     private fun documentRoot(documentId: String): File {
         requireDocumentId(documentId)
         return File(root, documentId)
@@ -184,6 +175,7 @@ class BooxHandoffStore(val root: File) {
     private fun retiredDir(documentRoot: File) = File(documentRoot, ".retired").also(File::mkdirs)
     private fun outgoingDir(documentRoot: File) = File(documentRoot, "outgoing").also(File::mkdirs)
     private fun stateFile(documentRoot: File) = File(documentRoot, ".inkbridge-state.json")
+    private fun installIntentFile(documentRoot: File) = File(documentRoot, ".inkbridge-install.json")
 
     private fun readState(documentRoot: File): HandoffState? = stateFile(documentRoot)
         .takeIf(File::isFile)
@@ -222,6 +214,81 @@ class BooxHandoffStore(val root: File) {
                 previous.delete()
             }
             previous.isFile -> moveNoReplace(previous, current)
+        }
+    }
+
+    private fun recover(documentRoot: File) {
+        recoverState(documentRoot)
+        recoverInstall(documentRoot)
+    }
+
+    private fun writeInstallIntent(documentRoot: File, intent: InstallIntent) {
+        intent.validate(documentRoot.name)
+        publishBytesOrVerify(
+            intent.toJson().toString(2).toByteArray(),
+            installIntentFile(documentRoot),
+        )
+    }
+
+    private fun recoverInstall(documentRoot: File) {
+        val intentFile = installIntentFile(documentRoot)
+        if (!intentFile.isFile) return
+        val intent = InstallIntent.fromJson(JSONObject(intentFile.readText()), documentRoot.name)
+        val next = intent.nextState
+        val current = readState(documentRoot)
+        val nextActive = File(activeDir(documentRoot), next.activeFileName)
+
+        if (!nextActive.exists()) {
+            require(current?.brokerEventId != next.brokerEventId) {
+                "Committed handoff state points to a missing active PDF"
+            }
+            clearInstallIntent(documentRoot)
+            return
+        }
+        require(nextActive.isFile) { "Replacement active path is not a PDF file" }
+        require(sha256Hex(nextActive) == next.installedBrokerSha256) {
+            "Replacement active PDF has unexpected content"
+        }
+
+        when {
+            current == next -> Unit
+            current == null -> writeState(documentRoot, next)
+            current.brokerEventId == next.brokerEventId -> {
+                error("Install intent does not match the committed handoff state")
+            }
+            else -> {
+                require(intent.previousActiveFileName == current.activeFileName) {
+                    "Install intent predecessor does not match the active handoff state"
+                }
+                require(next.activeRevisions.strictlyDominates(current.activeRevisions)) {
+                    "Install intent is stale or conflicts with the active revisions"
+                }
+                require(next.sourceGeneration > current.sourceGeneration) {
+                    "Install intent generation is not newer"
+                }
+                writeState(documentRoot, next)
+            }
+        }
+
+        retirePreviousActive(documentRoot, intent)
+        clearInstallIntent(documentRoot)
+    }
+
+    private fun retirePreviousActive(documentRoot: File, intent: InstallIntent) {
+        val previousName = intent.previousActiveFileName ?: return
+        if (previousName == intent.nextState.activeFileName) return
+        val previous = File(activeDir(documentRoot), previousName)
+        if (!previous.exists()) return
+        require(previous.isFile) { "Previous active path is not a PDF file" }
+        val retired = File(retiredDir(documentRoot), previousName)
+        require(!retired.exists()) { "Refusing to overwrite retired " + retired.name }
+        moveNoReplace(previous, retired)
+    }
+
+    private fun clearInstallIntent(documentRoot: File) {
+        val intent = installIntentFile(documentRoot)
+        if (intent.exists()) {
+            require(intent.delete()) { "Could not clear completed install intent" }
         }
     }
 

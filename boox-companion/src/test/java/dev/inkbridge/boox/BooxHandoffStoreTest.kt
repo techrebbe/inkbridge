@@ -120,6 +120,64 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun interruptedInstall_beforeReplacementPublication_keepsPredecessorRecoverable() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val secondBytes = "two".toByteArray()
+        val next = nextState(first, "event-2", RevisionPair(0, 2), 11, secondBytes)
+        val documentRoot = File(root, documentId)
+        writeIntent(documentRoot, first, next)
+
+        assertEquals(first.state, store.state(documentId))
+        assertTrue(first.activeFile.isFile)
+        assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
+    }
+
+    @Test
+    fun interruptedInstall_afterReplacementPublication_commitsStateAndRetiresPredecessor() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val secondBytes = "two".toByteArray()
+        val descriptor = delivery(root, "event-2", RevisionPair(0, 2), 11, secondBytes)
+        val next = nextState(first, "event-2", RevisionPair(0, 2), 11, secondBytes)
+        val documentRoot = File(root, documentId)
+        File(File(documentRoot, "active"), next.activeFileName).writeBytes(secondBytes)
+        writeIntent(documentRoot, first, next)
+
+        assertTrue(store.install(descriptor) is InstallResult.Duplicate)
+        assertEquals(next, store.state(documentId))
+        assertFalse(first.activeFile.exists())
+        assertTrue(File(File(documentRoot, ".retired"), first.activeFile.name).isFile)
+        assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
+    }
+
+    @Test
+    fun interruptedInstall_afterStateCommit_retiresPredecessorAndClearsIntent() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val first = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val secondBytes = "two".toByteArray()
+        val next = nextState(first, "event-2", RevisionPair(0, 2), 11, secondBytes)
+        val documentRoot = File(root, documentId)
+        File(File(documentRoot, "active"), next.activeFileName).writeBytes(secondBytes)
+        writeIntent(documentRoot, first, next)
+        File(documentRoot, ".inkbridge-state.json").writeText(next.toJson().toString(2))
+
+        assertEquals(next, store.state(documentId))
+        assertFalse(first.activeFile.exists())
+        assertTrue(File(File(documentRoot, ".retired"), first.activeFile.name).isFile)
+        assertFalse(File(documentRoot, ".inkbridge-install.json").exists())
+    }
+
+    @Test
     fun sameRevisionWithDifferentBytesIsRejected() {
         val state = state(RevisionPair(1, 2), "a".repeat(64))
         val different = brokerDelivery("other", RevisionPair(1, 2), 11, "b".repeat(64))
@@ -153,6 +211,37 @@ class BooxHandoffStoreTest {
         assertEquals(RevisionPair(2, 4), parsed.sourceRevisions)
         assertEquals(19, parsed.sourceGeneration)
     }
+    private fun nextState(
+        first: InstallResult.Installed,
+        eventId: String,
+        revisions: RevisionPair,
+        generation: Long,
+        bytes: ByteArray,
+    ) = HandoffState(
+        documentId = documentId,
+        originalFileName = "Example.pdf",
+        activeRevisions = revisions,
+        sourceGeneration = generation,
+        brokerEventId = eventId,
+        activeFileName = "Example__ib-b" + revisions.boox +
+            "-s" + revisions.supernote + "-g" + generation + ".pdf",
+        installedBrokerSha256 = sha256Hex(bytes),
+        processedEventIds = first.state.processedEventIds + eventId,
+    )
+
+    private fun writeIntent(
+        documentRoot: File,
+        first: InstallResult.Installed,
+        next: HandoffState,
+    ) {
+        File(documentRoot, ".inkbridge-install.json").writeText(
+            InstallIntent(
+                previousActiveFileName = first.activeFile.name,
+                nextState = next,
+            ).toJson().toString(2),
+        )
+    }
+
     private fun delivery(
         root: File,
         eventId: String,

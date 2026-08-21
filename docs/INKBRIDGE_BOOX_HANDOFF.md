@@ -29,6 +29,7 @@ InkBridge/
       Original__ib-b2-s4-g19__boox-finalized-g1-<hash>.pdf
       Original__ib-b2-s4-g19__boox-finalized-g1-<hash>.pdf.inkbridge.json
     .inkbridge-state.json
+    .inkbridge-install.json  # present only while an install is being committed/recovered
 ```
 
 The stable document ID is the broker's `inkbridge-doc-v1-<SHA-256 of immutable original PDF>`. Filenames never define identity.
@@ -62,6 +63,7 @@ The companion validates the producer, document ID, filenames, source generation,
 - Even after finalization, the old view is retained until a new broker delivery advances the BOOX revision, proving that the broker accepted the finalized BOOX edit.
 - Incoming and outgoing PDFs are streamed, so a 500 MB PDF is never loaded wholly into memory.
 - Files and state use synchronized temporary files plus create-only publication. Existing destination bytes are never overwritten.
+- A durable install intent keeps the previous active PDF in place until the replacement PDF and state are committed. After interruption or power loss, the next companion action completes the install or safely discards an unpublished attempt before retiring the predecessor.
 
 ## User flow
 

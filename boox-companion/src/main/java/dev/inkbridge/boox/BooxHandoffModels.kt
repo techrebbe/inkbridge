@@ -93,6 +93,24 @@ data class HandoffState(
     val localGeneration: Long = 0,
     val processedEventIds: List<String> = emptyList(),
 ) {
+    fun validate() {
+        require(schemaVersion == 1) { "Unsupported handoff state version" }
+        require(DOCUMENT_ID.matches(documentId)) { "Invalid stable document ID" }
+        requireSafeFileName(originalFileName, "original file name")
+        requireSafeFileName(activeFileName, "active file name")
+        require(sourceGeneration >= 1) { "Invalid source generation" }
+        require(brokerEventId.isNotBlank() && brokerEventId.length <= 256) { "Invalid broker event ID" }
+        require(SHA256.matches(installedBrokerSha256)) { "Invalid installed PDF hash" }
+        finalizedLocalSha256?.let { require(SHA256.matches(it)) { "Invalid finalized PDF hash" } }
+        finalizedOutputFileName?.let { requireSafeFileName(it, "finalized output file name") }
+        require((finalizedLocalSha256 == null) == (finalizedOutputFileName == null)) {
+            "Finalized PDF hash and file name must be recorded together"
+        }
+        require(localGeneration >= 0) { "Invalid local generation" }
+        require(processedEventIds.all { it.isNotBlank() && it.length <= 256 }) {
+            "Invalid processed event ID"
+        }
+    }
     fun toJson(): JSONObject = JSONObject()
         .put("schemaVersion", schemaVersion)
         .put("documentId", documentId)
@@ -123,11 +141,37 @@ data class HandoffState(
                 finalizedOutputFileName = value.optNullableString("finalizedOutputFileName"),
                 localGeneration = value.optLong("localGeneration", 0),
                 processedEventIds = List(eventIds.length()) { eventIds.getString(it) },
-            )
+            ).also { it.validate() }
         }
     }
 }
 
+
+data class InstallIntent(
+    val schemaVersion: Int = 1,
+    val previousActiveFileName: String?,
+    val nextState: HandoffState,
+) {
+    fun validate(documentId: String) {
+        require(schemaVersion == 1) { "Unsupported install intent version" }
+        nextState.validate()
+        require(nextState.documentId == documentId) { "Install intent belongs to a different document" }
+        previousActiveFileName?.let { requireSafeFileName(it, "previous active file name") }
+    }
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("schemaVersion", schemaVersion)
+        .putOpt("previousActiveFileName", previousActiveFileName)
+        .put("nextState", nextState.toJson())
+
+    companion object {
+        fun fromJson(value: JSONObject, documentId: String) = InstallIntent(
+            schemaVersion = value.getInt("schemaVersion"),
+            previousActiveFileName = value.optNullableString("previousActiveFileName"),
+            nextState = HandoffState.fromJson(value.getJSONObject("nextState")),
+        ).also { it.validate(documentId) }
+    }
+}
 sealed class InstallDecision {
     data object Install : InstallDecision()
     data object Duplicate : InstallDecision()
