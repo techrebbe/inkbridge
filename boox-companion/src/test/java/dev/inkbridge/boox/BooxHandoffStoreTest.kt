@@ -208,6 +208,48 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun finalize_recreatesMissingPublishedPairFromActivePdf() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(2, 4), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-neo-reader-ink")
+        val finalized = store.finalize(documentId) as FinalizeResult.Finalized
+        val expectedPdf = finalized.pdf.readBytes()
+        val expectedDescriptor = finalized.descriptor.readBytes()
+        assertTrue(finalized.pdf.delete())
+        assertTrue(finalized.descriptor.delete())
+
+        val recovered = store.finalize(documentId)
+        assertTrue(recovered is FinalizeResult.AlreadyFinalized)
+        assertTrue(finalized.pdf.isFile)
+        assertTrue(finalized.descriptor.isFile)
+        assertTrue(expectedPdf.contentEquals(finalized.pdf.readBytes()))
+        assertTrue(expectedDescriptor.contentEquals(finalized.descriptor.readBytes()))
+    }
+
+    @Test
+    fun descriptorQueue_skipsMalformedAndIncompletePairs() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val incoming = File(File(root, documentId), "incoming").also(File::mkdirs)
+        File(incoming, "a-malformed.inkbridge.json").writeText("{not-json")
+        File(incoming, "b-missing.inkbridge.json").writeText(
+            brokerDelivery(
+                "missing-pdf",
+                RevisionPair(0, 1),
+                1,
+                "a".repeat(64),
+                "missing.pdf",
+            ).toJson().toString(2),
+        )
+        val valid = delivery(root, "z-valid", RevisionPair(0, 1), 2, "valid".toByteArray())
+
+        assertEquals(valid.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+    }
+
+    @Test
     fun sameRevisionWithDifferentBytesIsRejected() {
         val state = state(RevisionPair(1, 2), "a".repeat(64))
         val different = brokerDelivery("other", RevisionPair(1, 2), 11, "b".repeat(64))

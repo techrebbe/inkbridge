@@ -55,41 +55,37 @@ class BooxHandoffStore(val root: File) {
         val currentHash = sha256Hex(active)
         if (currentHash == state.installedBrokerSha256) return FinalizeResult.NoChanges
         if (currentHash == state.finalizedLocalSha256) {
-            return FinalizeResult.AlreadyFinalized(
-                state.finalizedOutputFileName?.let { File(outgoingDir(documentRoot), it) },
+            val outputName = requireNotNull(state.finalizedOutputFileName)
+            val artifacts = ensureFinalizedArtifacts(
+                documentRoot,
+                state,
+                active,
+                currentHash,
+                outputName,
+                state.localGeneration,
             )
+            return FinalizeResult.AlreadyFinalized(artifacts.first)
         }
 
         val nextLocalGeneration = state.localGeneration + 1
         val outputName = active.nameWithoutExtension +
-            "__boox-finalized-g${nextLocalGeneration}-${currentHash.take(12)}.pdf"
-        val output = File(outgoingDir(documentRoot), outputName)
-        publishFileOrVerify(active, output, currentHash)
-        val eventId = "boox-finalize-${sha256Hex("${state.documentId}:$currentHash".toByteArray())}"
-        val descriptor = File(outgoingDir(documentRoot), "$outputName.inkbridge.json")
-        val descriptorJson = JSONObject()
-            .put("schemaVersion", 1)
-            .put("eventId", eventId)
-            .put("documentId", state.documentId)
-            .put("source", "boox")
-            .put("objectPath", "BOOX_Folder/${state.documentId}/$outputName")
-            .put("sourceGeneration", nextLocalGeneration)
-            .put("sourceRevision", state.activeRevisions.boox + 1)
-            .put("basedOn", state.activeRevisions.toJson())
-            .put("contentSha256", currentHash)
-            .put("payloadKind", "device_view")
-        val descriptorBytes = descriptorJson.toString(2).toByteArray()
-        publishBytesOrVerify(descriptorBytes, descriptor)
-
+            "__boox-finalized-g" + nextLocalGeneration + "-" + currentHash.take(12) + ".pdf"
+        val artifacts = ensureFinalizedArtifacts(
+            documentRoot,
+            state,
+            active,
+            currentHash,
+            outputName,
+            nextLocalGeneration,
+        )
         val next = state.copy(
             finalizedLocalSha256 = currentHash,
             finalizedOutputFileName = outputName,
             localGeneration = nextLocalGeneration,
         )
         writeState(documentRoot, next)
-        return FinalizeResult.Finalized(output, descriptor, next)
+        return FinalizeResult.Finalized(artifacts.first, artifacts.second, next)
     }
-
     fun state(documentId: String): HandoffState? {
         requireDocumentId(documentId)
         val documentRoot = documentRoot(documentId)
@@ -108,6 +104,8 @@ class BooxHandoffStore(val root: File) {
         .firstOrNull { descriptor ->
             runCatching {
                 val delivery = BrokerDelivery.fromJson(JSONObject(descriptor.readText()))
+                val incomingPdf = File(descriptor.parentFile, delivery.pdfFileName)
+                require(incomingPdf.isFile) { "Incoming PDF is missing" }
                 val deliveryRoot = documentRoot(delivery.documentId)
                 recover(deliveryRoot)
                 val state = readState(deliveryRoot)
@@ -119,7 +117,7 @@ class BooxHandoffStore(val root: File) {
                     state.activeRevisions.dominates(delivery.sourceRevisions) -> false
                     else -> true
                 }
-            }.getOrDefault(true)
+            }.getOrDefault(false)
         }
 
     fun findMostRecentState(): HandoffState? = root
@@ -133,6 +131,35 @@ class BooxHandoffStore(val root: File) {
         }
         .maxByOrNull { it.sourceGeneration }
 
+    private fun ensureFinalizedArtifacts(
+        documentRoot: File,
+        state: HandoffState,
+        active: File,
+        currentHash: String,
+        outputName: String,
+        localGeneration: Long,
+    ): Pair<File, File> {
+        requireSafeFileName(outputName, "finalized output file name")
+        require(localGeneration >= 1) { "Invalid local generation" }
+        val output = File(outgoingDir(documentRoot), outputName)
+        publishFileOrVerify(active, output, currentHash)
+        val eventId = "boox-finalize-" +
+            sha256Hex((state.documentId + ":" + currentHash).toByteArray())
+        val descriptor = File(outgoingDir(documentRoot), outputName + ".inkbridge.json")
+        val descriptorJson = JSONObject()
+            .put("schemaVersion", 1)
+            .put("eventId", eventId)
+            .put("documentId", state.documentId)
+            .put("source", "boox")
+            .put("objectPath", "BOOX_Folder/" + state.documentId + "/" + outputName)
+            .put("sourceGeneration", localGeneration)
+            .put("sourceRevision", state.activeRevisions.boox + 1)
+            .put("basedOn", state.activeRevisions.toJson())
+            .put("contentSha256", currentHash)
+            .put("payloadKind", "device_view")
+        publishBytesOrVerify(descriptorJson.toString(2).toByteArray(), descriptor)
+        return output to descriptor
+    }
     private fun installAccepted(
         delivery: BrokerDelivery,
         incomingPdf: File,
