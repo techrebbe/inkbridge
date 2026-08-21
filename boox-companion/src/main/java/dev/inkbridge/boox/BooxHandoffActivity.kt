@@ -120,18 +120,31 @@ class BooxHandoffActivity : Activity() {
         STORAGE_EXECUTOR.execute {
             val result = runCatching {
                 requireStorageAccess()
-                store.activeStates()
+                store.activeDocumentCatalog()
             }
             runOnUiThread {
                 if (isDestroyed || isFinishing) return@runOnUiThread
                 operationRunning = false
                 setActionsEnabled(true)
                 result.fold(
-                    onSuccess = { states ->
-                        when (states.size) {
-                            0 -> showFailure(IllegalStateException("No active InkBridge document"))
-                            1 -> action(states.single().documentId)
-                            else -> showDocumentPicker(title, states, action)
+                    onSuccess = { catalog ->
+                        when {
+                            catalog.states.isEmpty() && catalog.failures.isNotEmpty() -> {
+                                val failure = catalog.failures.first()
+                                showFailure(
+                                    IllegalStateException(
+                                        "No accessible active document; " +
+                                            failure.documentId.takeLast(8) + ": " + failure.message,
+                                    ),
+                                )
+                            }
+                            catalog.states.isEmpty() -> {
+                                showFailure(IllegalStateException("No active InkBridge document"))
+                            }
+                            catalog.states.size == 1 && catalog.failures.isEmpty() -> {
+                                action(catalog.states.single().documentId)
+                            }
+                            else -> showDocumentPicker(title, catalog, action)
                         }
                     },
                     onFailure = ::showFailure,
@@ -142,17 +155,21 @@ class BooxHandoffActivity : Activity() {
 
     private fun showDocumentPicker(
         title: String,
-        states: List<HandoffState>,
+        catalog: ActiveDocumentCatalog,
         action: (String) -> Unit,
     ) {
-        val labels = states.map { state ->
+        val labels = catalog.states.map { state ->
             state.originalFileName + "\nb" + state.activeRevisions.boox +
                 " / s" + state.activeRevisions.supernote + " - " + state.documentId.takeLast(8)
         }.toTypedArray()
-        renderStatus("Choose an active document")
+        val unavailable = catalog.failures.size
+        renderStatus(
+            "Choose an active document" +
+                if (unavailable == 0) "" else "\n$unavailable damaged document(s) unavailable",
+        )
         AlertDialog.Builder(this)
             .setTitle(title)
-            .setItems(labels) { _, index -> action(states[index].documentId) }
+            .setItems(labels) { _, index -> action(catalog.states[index].documentId) }
             .setNegativeButton("Cancel", null)
             .show()
     }

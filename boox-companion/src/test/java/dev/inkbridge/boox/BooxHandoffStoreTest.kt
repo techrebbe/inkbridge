@@ -58,6 +58,33 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun activeDocumentCatalog_isolatesMalformedStateToItsDocument() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val secondDocumentId = "inkbridge-doc-v1-" + "b".repeat(64)
+        store.install(
+            delivery(root, "event-a", RevisionPair(0, 1), 10, "one".toByteArray()),
+        )
+        store.install(
+            delivery(
+                root,
+                "event-b",
+                RevisionPair(0, 1),
+                11,
+                "two".toByteArray(),
+                targetDocumentId = secondDocumentId,
+            ),
+        )
+        File(File(root, documentId), ".inkbridge-state.json").writeText("{")
+
+        val catalog = store.activeDocumentCatalog()
+
+        assertEquals(listOf(secondDocumentId), catalog.states.map(HandoffState::documentId))
+        assertEquals(listOf(documentId), catalog.failures.map(DocumentRecoveryFailure::documentId))
+        assertEquals(listOf(secondDocumentId), store.activeStates().map(HandoffState::documentId))
+    }
+
+    @Test
     fun install_rejectsStaleOrDivergentRevision() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

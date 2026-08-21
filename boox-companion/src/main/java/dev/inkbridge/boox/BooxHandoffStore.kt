@@ -3,9 +3,12 @@ package dev.inkbridge.boox
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.channels.FileChannel
+import java.nio.file.AccessDeniedException
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 
 sealed class InstallResult {
@@ -18,6 +21,13 @@ sealed class FinalizeResult {
     data class Finalized(val pdf: File, val descriptor: File, val state: HandoffState) : FinalizeResult()
     data class AlreadyFinalized(val pdf: File?) : FinalizeResult()
 }
+
+data class DocumentRecoveryFailure(val documentId: String, val message: String)
+
+data class ActiveDocumentCatalog(
+    val states: List<HandoffState>,
+    val failures: List<DocumentRecoveryFailure>,
+)
 
 private data class FinalizationCommit(
     val pdf: File,
@@ -127,17 +137,30 @@ class BooxHandoffStore(val root: File) {
             }.getOrDefault(false)
         }
 
-    fun activeStates(): List<HandoffState> = root
-        .listFiles()
-        .orEmpty()
-        .asSequence()
-        .filter { it.isDirectory && it.name.startsWith("inkbridge-doc-v1-") }
-        .mapNotNull { documentRoot ->
-            recover(documentRoot)
-            readState(documentRoot)
-        }
-        .sortedWith(compareBy<HandoffState> { it.originalFileName.lowercase() }.thenBy { it.documentId })
-        .toList()
+    fun activeDocumentCatalog(): ActiveDocumentCatalog {
+        val states = mutableListOf<HandoffState>()
+        val failures = mutableListOf<DocumentRecoveryFailure>()
+        root.listFiles()
+            .orEmpty()
+            .asSequence()
+            .filter { it.isDirectory && it.name.startsWith("inkbridge-doc-v1-") }
+            .forEach { documentRoot ->
+                try {
+                    recover(documentRoot)
+                    readState(documentRoot)?.let(states::add)
+                } catch (error: Exception) {
+                    failures += DocumentRecoveryFailure(
+                        documentId = documentRoot.name,
+                        message = error.message ?: error.javaClass.simpleName,
+                    )
+                }
+            }
+        states.sortWith(compareBy<HandoffState> { it.originalFileName.lowercase() }.thenBy { it.documentId })
+        failures.sortBy(DocumentRecoveryFailure::documentId)
+        return ActiveDocumentCatalog(states, failures)
+    }
+
+    fun activeStates(): List<HandoffState> = activeDocumentCatalog().states
 
     fun findMostRecentState(): HandoffState? = activeStates().maxByOrNull { it.sourceGeneration }
 
@@ -278,14 +301,19 @@ class BooxHandoffStore(val root: File) {
         val previous = File(documentRoot, ".inkbridge-state.previous")
         writeSynced(next, state.toJson().toString(2).toByteArray())
         if (current.isFile) {
-            previous.delete()
+            deleteAndSync(previous, documentRoot)
             moveNoReplace(current, previous)
+            syncDirectory(documentRoot)
         }
         try {
             moveNoReplace(next, current)
-            previous.delete()
+            syncDirectory(documentRoot)
+            deleteAndSync(previous, documentRoot)
         } catch (error: Throwable) {
-            if (!current.exists() && previous.isFile) moveNoReplace(previous, current)
+            if (!current.exists() && previous.isFile) {
+                moveNoReplace(previous, current)
+                syncDirectory(documentRoot)
+            }
             throw error
         }
     }
@@ -572,6 +600,20 @@ class BooxHandoffStore(val root: File) {
         } catch (error: Exception) {
             if (destination.exists()) throw error
             moveNoReplace(temp, destination)
+        }
+    }
+
+    private fun deleteAndSync(file: File, directory: File) {
+        if (!file.exists()) return
+        require(file.delete()) { "Could not remove " + file.name }
+        syncDirectory(directory)
+    }
+
+    private fun syncDirectory(directory: File) {
+        try {
+            FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
+        } catch (error: AccessDeniedException) {
+            if (!(System.getProperty("os.name") ?: "").startsWith("Windows", ignoreCase = true)) throw error
         }
     }
 
