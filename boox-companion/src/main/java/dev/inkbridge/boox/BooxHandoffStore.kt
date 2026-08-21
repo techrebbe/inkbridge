@@ -639,12 +639,17 @@ class BooxHandoffStore(val root: File) {
     }
 
     private fun moveNoReplace(source: File, destination: File) {
-        destination.parentFile?.mkdirs()
+        val sourceDirectory = requireNotNull(source.parentFile)
+        val destinationDirectory = requireNotNull(destination.parentFile).also(File::mkdirs)
         require(!destination.exists()) { "Refusing to overwrite ${destination.name}" }
         try {
             Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE)
         } catch (_: AtomicMoveNotSupportedException) {
             Files.move(source.toPath(), destination.toPath())
+        }
+        syncDirectory(destinationDirectory)
+        if (sourceDirectory.absolutePath != destinationDirectory.absolutePath) {
+            syncDirectory(sourceDirectory)
         }
     }
 }
