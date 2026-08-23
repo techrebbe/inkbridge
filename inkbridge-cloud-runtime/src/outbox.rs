@@ -41,6 +41,8 @@ pub struct PendingCommit {
     pub state_write: OutboxWrite,
     pub object_writes: Vec<OutboxWrite>,
     #[serde(default)]
+    pub release_writes: Vec<OutboxWrite>,
+    #[serde(default)]
     pub delivered: BTreeMap<String, PayloadRef>,
 }
 
@@ -58,6 +60,7 @@ pub trait CanonicalStateStore: Send + Sync {
     fn reserve(&self, pending: &PendingCommit) -> Result<PendingCommit, String>;
     fn save_pending(&self, pending: &PendingCommit) -> Result<(), String>;
     fn finalize(&self, pending: &PendingCommit) -> Result<ActiveState, String>;
+    fn complete(&self, pending: &PendingCommit) -> Result<(), String>;
 }
 
 pub trait ObjectStore: Send + Sync {
@@ -145,8 +148,19 @@ impl CanonicalStateStore for MemoryCanonicalStateStore {
         if current.commit_id != pending.commit_id {
             return Err("a different pending commit replaced this one".to_owned());
         }
-        if pending.delivered.len() != pending.object_writes.len() {
+        if !pending
+            .object_writes
+            .iter()
+            .all(|write| pending.delivered.contains_key(&write.path))
+        {
             return Err("cannot publish state before every object is delivered".to_owned());
+        }
+        if let Some(active) = record.active.as_ref() {
+            if active.payload == pending.state_write.payload
+                && active.metadata == pending.state_write.metadata
+            {
+                return Ok(active.clone());
+            }
         }
         let generation = record
             .active
@@ -158,8 +172,44 @@ impl CanonicalStateStore for MemoryCanonicalStateStore {
             metadata: pending.state_write.metadata.clone(),
         };
         record.active = Some(active.clone());
-        record.pending = None;
+        if pending.release_writes.is_empty() {
+            record.pending = None;
+        }
         Ok(active)
+    }
+
+    fn complete(&self, pending: &PendingCommit) -> Result<(), String> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| "state lock was poisoned".to_owned())?;
+        let record = records
+            .get_mut(&pending.document_id)
+            .ok_or_else(|| "pending state record disappeared".to_owned())?;
+        let current = record
+            .pending
+            .as_ref()
+            .ok_or_else(|| "pending commit disappeared before completion".to_owned())?;
+        if current.commit_id != pending.commit_id {
+            return Err("a different pending commit replaced this one".to_owned());
+        }
+        let active = record
+            .active
+            .as_ref()
+            .ok_or_else(|| "canonical state was not finalized before completion".to_owned())?;
+        if active.payload != pending.state_write.payload
+            || active.metadata != pending.state_write.metadata
+            || !pending
+                .release_writes
+                .iter()
+                .all(|write| pending.delivered.contains_key(&write.path))
+        {
+            return Err(
+                "cannot complete commit before every release signal is delivered".to_owned(),
+            );
+        }
+        record.pending = None;
+        Ok(())
     }
 }
 
@@ -322,65 +372,44 @@ impl CloudBrokerStorage {
         let Some(pending) = record.pending else {
             return Ok(false);
         };
-        self.deliver(pending)
+        let canonical_already_active = record.active.as_ref().is_some_and(|active| {
+            active.payload == pending.state_write.payload
+                && active.metadata == pending.state_write.metadata
+        });
+        self.deliver(pending, canonical_already_active)
             .map(|_| true)
             .map_err(|error| format!("pending outbox recovery failed: {error:?}"))
     }
 
-    fn deliver(&self, mut pending: PendingCommit) -> Result<Vec<StoredObject>, CommitError> {
-        let mut delivered_objects = Vec::with_capacity(pending.object_writes.len());
-        for write in &pending.object_writes {
-            let bytes = self.read_payload(&write.payload)?;
-            let object = if let Some(delivered) = pending.delivered.get(&write.path) {
-                let current = self
-                    .objects
-                    .read(&write.path)
-                    .map_err(CommitError::Other)?
-                    .ok_or_else(|| {
-                        CommitError::Other(format!("delivered object {} disappeared", write.path))
-                    })?;
-                if current.generation != delivered.generation
-                    || current.bytes != bytes
-                    || current.metadata != write.metadata
-                {
-                    return Err(CommitError::Other(format!(
-                        "delivered object {} changed before outbox finalization",
-                        write.path
-                    )));
-                }
-                current
-            } else if let Some(current) =
-                self.objects.read(&write.path).map_err(CommitError::Other)?
-            {
-                if current.bytes == bytes && current.metadata == write.metadata {
-                    current
-                } else {
-                    self.objects
-                        .conditional_write(&materialize_write(write, bytes.clone()))?
-                }
-            } else {
-                self.objects
-                    .conditional_write(&materialize_write(write, bytes.clone()))?
-            };
-            pending.delivered.insert(
-                write.path.clone(),
-                PayloadRef {
-                    path: write.path.clone(),
-                    generation: object.generation,
-                    content_sha256: sha256_hex(&object.bytes),
-                    size: object.bytes.len() as u64,
-                },
-            );
-            self.states
-                .save_pending(&pending)
-                .map_err(CommitError::Other)?;
-            delivered_objects.push(object);
+    fn deliver(
+        &self,
+        mut pending: PendingCommit,
+        canonical_already_active: bool,
+    ) -> Result<Vec<StoredObject>, CommitError> {
+        let mut delivered_objects =
+            Vec::with_capacity(pending.object_writes.len() + pending.release_writes.len());
+        if !canonical_already_active {
+            for write in pending.object_writes.clone() {
+                delivered_objects.push(self.deliver_write(&mut pending, &write)?);
+            }
         }
+
         self.states.finalize(&pending).map_err(CommitError::Other)?;
+
+        // A conflict-resolution marker is an externally visible unblock signal. It may
+        // become visible only after the canonical state is active. Keeping it in the
+        // durable pending commit lets recovery finish this phase after a crash.
+        for write in pending.release_writes.clone() {
+            delivered_objects.push(self.deliver_write(&mut pending, &write)?);
+        }
+        if !pending.release_writes.is_empty() {
+            self.states.complete(&pending).map_err(CommitError::Other)?;
+        }
+
         // Only finalized commits may release their immutable delivery payloads. Cleanup is
         // generation-conditional and best-effort: a failure can leak storage, but it must never
         // roll back published state or make a pending commit unrecoverable.
-        for write in &pending.object_writes {
+        for write in pending.object_writes.iter().chain(&pending.release_writes) {
             if let Err(error) = self
                 .objects
                 .delete_generation(&write.payload.path, write.payload.generation)
@@ -392,6 +421,56 @@ impl CloudBrokerStorage {
             }
         }
         Ok(delivered_objects)
+    }
+
+    fn deliver_write(
+        &self,
+        pending: &mut PendingCommit,
+        write: &OutboxWrite,
+    ) -> Result<StoredObject, CommitError> {
+        let bytes = self.read_payload(&write.payload)?;
+        let object = if let Some(delivered) = pending.delivered.get(&write.path) {
+            let current = self
+                .objects
+                .read(&write.path)
+                .map_err(CommitError::Other)?
+                .ok_or_else(|| {
+                    CommitError::Other(format!("delivered object {} disappeared", write.path))
+                })?;
+            if current.generation != delivered.generation
+                || current.bytes != bytes
+                || current.metadata != write.metadata
+            {
+                return Err(CommitError::Other(format!(
+                    "delivered object {} changed before outbox finalization",
+                    write.path
+                )));
+            }
+            current
+        } else if let Some(current) = self.objects.read(&write.path).map_err(CommitError::Other)? {
+            if current.bytes == bytes && current.metadata == write.metadata {
+                current
+            } else {
+                self.objects
+                    .conditional_write(&materialize_write(write, bytes.clone()))?
+            }
+        } else {
+            self.objects
+                .conditional_write(&materialize_write(write, bytes.clone()))?
+        };
+        pending.delivered.insert(
+            write.path.clone(),
+            PayloadRef {
+                path: write.path.clone(),
+                generation: object.generation,
+                content_sha256: sha256_hex(&object.bytes),
+                size: object.bytes.len() as u64,
+            },
+        );
+        self.states
+            .save_pending(pending)
+            .map_err(CommitError::Other)?;
+        Ok(object)
     }
 
     fn read_payload(&self, payload: &PayloadRef) -> Result<Blob, CommitError> {
@@ -519,13 +598,13 @@ impl BrokerStorage for CloudBrokerStorage {
         let document_id = document_id_from_state_path(&state_write.path)
             .expect("state write was already identified")
             .to_owned();
-        let object_writes = writes
+        let all_object_writes = writes
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != state_index)
             .map(|(_, write)| write.clone())
             .collect::<Vec<_>>();
-        for write in &object_writes {
+        for write in &all_object_writes {
             let current = self.objects.read(&write.path).map_err(CommitError::Other)?;
             let already_delivered = current.as_ref().is_some_and(|object| {
                 object.bytes == write.bytes && object.metadata == write.metadata
@@ -544,14 +623,19 @@ impl BrokerStorage for CloudBrokerStorage {
                 });
             }
         }
-        let commit_id = commit_id(&document_id, &state_write, &object_writes);
+        let commit_id = commit_id(&document_id, &state_write, &all_object_writes);
         let staged_state =
             self.stage_payload(&document_id, &commit_id, state_index, &state_write, true)?;
-        let staged_objects = object_writes
-            .iter()
-            .enumerate()
-            .map(|(index, write)| self.stage_payload(&document_id, &commit_id, index, write, false))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut staged_objects = Vec::new();
+        let mut staged_releases = Vec::new();
+        for (index, write) in all_object_writes.iter().enumerate() {
+            let staged = self.stage_payload(&document_id, &commit_id, index, write, false)?;
+            if is_post_finalize_release(write) {
+                staged_releases.push(staged);
+            } else {
+                staged_objects.push(staged);
+            }
+        }
         let pending = self
             .states
             .reserve(&PendingCommit {
@@ -559,10 +643,11 @@ impl BrokerStorage for CloudBrokerStorage {
                 document_id,
                 state_write: staged_state,
                 object_writes: staged_objects,
+                release_writes: staged_releases,
                 delivered: BTreeMap::new(),
             })
             .map_err(CommitError::Other)?;
-        let delivered = self.deliver(pending)?;
+        let delivered = self.deliver(pending, false)?;
         let active = self
             .states
             .load(document_id_from_state_path(&writes[state_index].path).unwrap())
@@ -642,6 +727,15 @@ fn hash_field(digest: &mut Sha256, bytes: &[u8]) {
     digest.update(bytes);
 }
 
+fn is_post_finalize_release(write: &ConditionalWrite) -> bool {
+    write.path.starts_with("Conflicts/")
+        && write.path.ends_with("/resolution.json")
+        && write
+            .metadata
+            .get("inkbridge-kind")
+            .is_some_and(|kind| kind == "conflict-resolution")
+}
+
 fn document_id_from_state_path(path: &str) -> Option<&str> {
     path.strip_prefix("Canonical/")?
         .strip_suffix("/state.json")
@@ -660,6 +754,66 @@ fn materialize_write(write: &OutboxWrite, bytes: Blob) -> ConditionalWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Default)]
+    struct FailOnceStateStore {
+        inner: MemoryCanonicalStateStore,
+        fail_next_finalize: Arc<AtomicBool>,
+        fail_next_complete: Arc<AtomicBool>,
+    }
+
+    impl FailOnceStateStore {
+        fn fail_finalize_once() -> Self {
+            Self {
+                inner: MemoryCanonicalStateStore::default(),
+                fail_next_finalize: Arc::new(AtomicBool::new(true)),
+                fail_next_complete: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_complete_once() -> Self {
+            Self {
+                inner: MemoryCanonicalStateStore::default(),
+                fail_next_finalize: Arc::new(AtomicBool::new(false)),
+                fail_next_complete: Arc::new(AtomicBool::new(true)),
+            }
+        }
+
+        fn record(&self, document_id: &str) -> Option<StateRecord> {
+            self.inner.record(document_id)
+        }
+    }
+
+    impl CanonicalStateStore for FailOnceStateStore {
+        fn load(&self, document_id: &str) -> Result<StateRecord, String> {
+            self.inner.load(document_id)
+        }
+
+        fn reserve(&self, pending: &PendingCommit) -> Result<PendingCommit, String> {
+            self.inner.reserve(pending)
+        }
+
+        fn save_pending(&self, pending: &PendingCommit) -> Result<(), String> {
+            self.inner.save_pending(pending)
+        }
+
+        fn finalize(&self, pending: &PendingCommit) -> Result<ActiveState, String> {
+            if self.fail_next_finalize.swap(false, Ordering::SeqCst) {
+                Err("injected canonical finalization failure".to_owned())
+            } else {
+                self.inner.finalize(pending)
+            }
+        }
+
+        fn complete(&self, pending: &PendingCommit) -> Result<(), String> {
+            if self.fail_next_complete.swap(false, Ordering::SeqCst) {
+                Err("injected release completion failure".to_owned())
+            } else {
+                self.inner.complete(pending)
+            }
+        }
+    }
 
     fn writes() -> Vec<ConditionalWrite> {
         vec![
@@ -682,6 +836,92 @@ mod tests {
                 precondition: GenerationPrecondition::DoesNotExist,
             },
         ]
+    }
+
+    #[test]
+    fn conflict_marker_is_published_only_after_state_finalization_and_recovers() {
+        let objects = Arc::new(MemoryObjectStore::default());
+        let states = Arc::new(FailOnceStateStore::fail_finalize_once());
+        let marker_path = "Conflicts/doc/event/resolution.json";
+        let mut commit_writes = writes();
+        commit_writes.insert(
+            commit_writes.len() - 1,
+            ConditionalWrite {
+                path: marker_path.to_owned(),
+                bytes: blob(b"resolved".to_vec()),
+                metadata: BTreeMap::from([(
+                    "inkbridge-kind".to_owned(),
+                    "conflict-resolution".to_owned(),
+                )]),
+                precondition: GenerationPrecondition::DoesNotExist,
+            },
+        );
+
+        let mut storage = CloudBrokerStorage::new(objects.clone(), states.clone());
+        let error = storage.commit(commit_writes).unwrap_err();
+        assert!(matches!(
+            error,
+            CommitError::Other(message)
+                if message.contains("injected canonical finalization failure")
+        ));
+        assert!(objects.read(marker_path).unwrap().is_none());
+        let interrupted = states.record("doc").unwrap();
+        assert!(interrupted.active.is_none());
+        assert!(interrupted.pending.is_some());
+
+        assert!(storage.recover("doc").unwrap());
+        assert_eq!(
+            objects.read(marker_path).unwrap().unwrap().bytes.as_ref(),
+            b"resolved"
+        );
+        let recovered = states.record("doc").unwrap();
+        assert!(recovered.active.is_some());
+        assert!(recovered.pending.is_none());
+    }
+
+    #[test]
+    fn finalized_resolution_recovers_after_device_edits_a_released_view() {
+        let objects = Arc::new(MemoryObjectStore::default());
+        let states = Arc::new(FailOnceStateStore::fail_complete_once());
+        let marker_path = "Conflicts/doc/event/resolution.json";
+        let mut commit_writes = writes();
+        commit_writes.insert(
+            commit_writes.len() - 1,
+            ConditionalWrite {
+                path: marker_path.to_owned(),
+                bytes: blob(b"resolved".to_vec()),
+                metadata: BTreeMap::from([(
+                    "inkbridge-kind".to_owned(),
+                    "conflict-resolution".to_owned(),
+                )]),
+                precondition: GenerationPrecondition::DoesNotExist,
+            },
+        );
+
+        let mut storage = CloudBrokerStorage::new(objects.clone(), states.clone());
+        let error = storage.commit(commit_writes).unwrap_err();
+        assert!(matches!(
+            error,
+            CommitError::Other(message)
+                if message.contains("injected release completion failure")
+        ));
+        assert!(objects.read(marker_path).unwrap().is_some());
+        let interrupted = states.record("doc").unwrap();
+        assert!(interrupted.active.is_some());
+        assert!(interrupted.pending.is_some());
+
+        objects.put("BOOX_Folder/doc/view.pdf", b"device-edit".to_vec());
+        assert!(storage.recover("doc").unwrap());
+        assert_eq!(
+            objects
+                .read("BOOX_Folder/doc/view.pdf")
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_ref(),
+            b"device-edit"
+        );
+        assert!(states.record("doc").unwrap().pending.is_none());
     }
 
     #[test]

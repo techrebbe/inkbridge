@@ -2051,6 +2051,74 @@ fn explicit_keep_current_advances_the_rejected_source_frontier() {
 }
 
 #[test]
+fn keep_current_deletes_rejected_ink_on_a_page_absent_from_canonical_baselines() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let boox_current = stroke_on_page("boox-current-page-2", 1, 0.4, 0.5);
+    let boox_pdf = write_boox_view(&harness.original, [boox_current]).unwrap();
+    let boox = harness.event(
+        "boox-other-page",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        boox_pdf,
+    );
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let rejected = stroke_on_page("sn-rejected-page-1", 0, 0.2, 0.3);
+    let supernote = harness.event(
+        "sn-conflict-new-page",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_page(0, std::slice::from_ref(&rejected)),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &supernote)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-conflict-new-page",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-rejected-new-page",
+        ConflictResolutionStrategy::KeepCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let manifest: Manifest = serde_json::from_slice(
+        &harness
+            .storage
+            .object(&supernote_manifest_path(
+                &harness.document_id,
+                "resolve-rejected-new-page",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(manifest.summary.deleted, 1);
+    assert!(manifest.operations.iter().any(|operation| matches!(
+        operation,
+        Operation::DeleteStroke { source_uuid, before, .. }
+            if source_uuid == "sn-rejected-page-1" && before == &rejected
+    )));
+}
+
+#[test]
 fn older_same_device_conflict_is_superseded_without_rolling_back_revision() {
     let mut harness = Harness::new();
     let base = stroke("shared", 0.2, 0.3);

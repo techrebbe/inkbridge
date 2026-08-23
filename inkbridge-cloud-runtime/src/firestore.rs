@@ -273,7 +273,11 @@ impl CanonicalStateStore for FirestoreCanonicalStateStore {
     }
 
     fn finalize(&self, pending: &PendingCommit) -> Result<ActiveState, String> {
-        if pending.delivered.len() != pending.object_writes.len() {
+        if !pending
+            .object_writes
+            .iter()
+            .all(|write| pending.delivered.contains_key(&write.path))
+        {
             return Err("cannot publish state before every object is delivered".to_owned());
         }
         let (mut record, state_update_time) = self.state_remote(&pending.document_id)?;
@@ -284,9 +288,13 @@ impl CanonicalStateStore for FirestoreCanonicalStateStore {
         if current.commit_id != pending.commit_id {
             return Err("a different pending commit replaced this one".to_owned());
         }
-        let outbox_remote = self
-            .get_document("inkbridgeOutbox", &pending.commit_id)?
-            .ok_or_else(|| "durable outbox document disappeared".to_owned())?;
+        if let Some(active) = record.active.as_ref() {
+            if active.payload == pending.state_write.payload
+                && active.metadata == pending.state_write.metadata
+            {
+                return Ok(active.clone());
+            }
+        }
         let generation = record
             .active
             .as_ref()
@@ -297,6 +305,70 @@ impl CanonicalStateStore for FirestoreCanonicalStateStore {
             metadata: pending.state_write.metadata.clone(),
         };
         record.active = Some(active.clone());
+        record.update_token = None;
+
+        if pending.release_writes.is_empty() {
+            let outbox_remote = self
+                .get_document("inkbridgeOutbox", &pending.commit_id)?
+                .ok_or_else(|| "durable outbox document disappeared".to_owned())?;
+            record.pending = None;
+            let delivered = OutboxDocument {
+                status: OutboxStatus::Delivered,
+                pending: pending.clone(),
+            };
+            self.commit(vec![
+                self.update_write(
+                    "inkbridgeDocuments",
+                    &pending.document_id,
+                    &Self::encode_record(&record)?,
+                    state_update_time.as_deref(),
+                ),
+                self.update_write(
+                    "inkbridgeOutbox",
+                    &pending.commit_id,
+                    &Self::encode_record(&delivered)?,
+                    Some(&outbox_remote.update_time),
+                ),
+            ])?;
+        } else {
+            record.pending = Some(pending.clone());
+            self.commit(vec![self.update_write(
+                "inkbridgeDocuments",
+                &pending.document_id,
+                &Self::encode_record(&record)?,
+                state_update_time.as_deref(),
+            )])?;
+        }
+        Ok(active)
+    }
+
+    fn complete(&self, pending: &PendingCommit) -> Result<(), String> {
+        let (mut record, state_update_time) = self.state_remote(&pending.document_id)?;
+        let current = record
+            .pending
+            .as_ref()
+            .ok_or_else(|| "pending commit disappeared before completion".to_owned())?;
+        if current.commit_id != pending.commit_id {
+            return Err("a different pending commit replaced this one".to_owned());
+        }
+        let active = record
+            .active
+            .as_ref()
+            .ok_or_else(|| "canonical state was not finalized before completion".to_owned())?;
+        if active.payload != pending.state_write.payload
+            || active.metadata != pending.state_write.metadata
+            || !pending
+                .release_writes
+                .iter()
+                .all(|write| pending.delivered.contains_key(&write.path))
+        {
+            return Err(
+                "cannot complete commit before every release signal is delivered".to_owned(),
+            );
+        }
+        let outbox_remote = self
+            .get_document("inkbridgeOutbox", &pending.commit_id)?
+            .ok_or_else(|| "durable outbox document disappeared".to_owned())?;
         record.pending = None;
         record.update_token = None;
         let delivered = OutboxDocument {
@@ -316,8 +388,7 @@ impl CanonicalStateStore for FirestoreCanonicalStateStore {
                 &Self::encode_record(&delivered)?,
                 Some(&outbox_remote.update_time),
             ),
-        ])?;
-        Ok(active)
+        ])
     }
 }
 
@@ -383,6 +454,7 @@ mod tests {
                 precondition: GenerationPrecondition::DoesNotExist,
             },
             object_writes: Vec::new(),
+            release_writes: Vec::new(),
             delivered: BTreeMap::new(),
         };
         store.reserve(&pending).unwrap();

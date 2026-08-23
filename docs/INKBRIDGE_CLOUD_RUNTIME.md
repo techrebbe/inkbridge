@@ -53,8 +53,9 @@ stale destination generations, and competing decisions return HTTP 409; malforme
 400; a missing document/conflict returns 404. Cloud Run IAM remains the authorization boundary.
 
 Resolution uses the existing transactional reservation, generation-conditional object writes, and
-durable outbox. Its broker-generated `resolution.json` marker and canonical state are promoted only
-after every required BOOX/Supernote output is durable. See
+durable outbox. Every required BOOX/Supernote output is made durable before canonical state is
+promoted. The broker-generated `resolution.json` unblock marker is a post-finalization release
+write: it cannot become visible until that canonical state is active. See
 [`INKBRIDGE_CONFLICT_RESOLUTION.md`](INKBRIDGE_CONFLICT_RESOLUTION.md).
 
 ## Firestore transaction and durable outbox
@@ -71,9 +72,12 @@ pointer, never the PDF or manifest bytes. The runtime then uses an atomic
 Firestore `documents:commit` with document `updateTime` preconditions to reserve
 both records. It performs destination uploads with `ifGenerationMatch`; after
 each output, the outbox records the returned generation. Only after every
-object exists with the expected bytes and metadata does another atomic
-Firestore commit promote the pending canonical-state pointer to active and mark
-the outbox delivered. The runtime then deletes only the finalized output
+ordinary output exists with the expected bytes and metadata does another atomic
+Firestore commit promote the pending canonical-state pointer to active. Conflict-resolution
+commits retain their pending reservation while the post-finalization marker is delivered, then
+atomically clear the pending state and mark the outbox delivered. A crash in either phase resumes
+from the recorded object generations without exposing a premature unblock marker. The runtime then
+deletes only the finalized output
 payload generations from `BrokerOutbox/`; the canonical-state payload remains
 the active state evidence. Cleanup is best-effort after finalization, so failure
 can leak storage but cannot invalidate published state or block recovery.

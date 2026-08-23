@@ -382,7 +382,7 @@ impl Broker {
     ) -> Result<Manifest, BrokerError> {
         let work =
             tempfile::tempdir().map_err(|error| BrokerError::Conversion(error.to_string()))?;
-        let baselines = write_baselines(work.path(), previous_state)?;
+        let mut baselines = write_baselines(work.path(), previous_state)?;
         if conflict.source == DeviceSide::Supernote {
             let export = parse_baseline_bytes(conflict_input, &conflict.object_path)
                 .map_err(BrokerError::Conversion)?;
@@ -391,6 +391,9 @@ impl Broker {
                 .join(format!("baseline-page-{}.json", export.page_index));
             std::fs::write(&path, conflict_input)
                 .map_err(|error| BrokerError::Conversion(error.to_string()))?;
+            if !baselines.contains(&path) {
+                baselines.push(path);
+            }
         }
         let pdf_path = work.path().join("resolved.pdf");
         std::fs::write(&pdf_path, boox_pdf)

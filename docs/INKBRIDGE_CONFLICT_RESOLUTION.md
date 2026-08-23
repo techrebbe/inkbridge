@@ -76,7 +76,8 @@ The broker atomically commits:
 The original incoming and competing evidence objects are never deleted by resolution. The folder
 transport groups all evidence under one event into one conflict status. It resumes only when the
 same group contains a valid broker-generated resolution marker; forged or incomplete markers do
-not unblock it.
+not unblock it. In the cloud runtime that marker is published only after the corresponding
+canonical state is active, and its durable pending phase is recoverable.
 
 Full NeoReader PDFs and compact BOOX operation manifests are both supported. Compact inputs receive
 the same identity, geometry, style, page-bound, and fingerprint validation used by normal broker
