@@ -1990,6 +1990,97 @@ fn harness_with_mixed_supernote_conflict() -> Harness {
     harness
 }
 
+fn harness_with_rejected_compact_ancestor() -> (Harness, StrokeSnapshot, StrokeSnapshot) {
+    let mut harness = Harness::new();
+    let base = stroke("shared", 0.2, 0.3);
+    let initial = harness.event(
+        "sn-base-dependent-conflict",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let intermediate = stroke("shared", 0.4, 0.4);
+    let mut first = harness.event(
+        "boox-dependent-conflict-1",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: "shared".to_owned(),
+                page_index: 0,
+                before: Some(base.clone()),
+                after: intermediate.clone(),
+            }],
+            1,
+        ),
+    );
+    first.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &first)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let descendant = stroke("shared", 0.65, 0.55);
+    let mut second = harness.event(
+        "boox-dependent-conflict-2",
+        DeviceSide::Boox,
+        2,
+        RevisionPair {
+            boox: 1,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: "shared".to_owned(),
+                page_index: 0,
+                before: Some(intermediate),
+                after: descendant.clone(),
+            }],
+            1,
+        ),
+    );
+    second.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &second)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let first_analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-dependent-conflict-1",
+        )
+        .unwrap();
+    let first_request = resolution_request(
+        &harness,
+        &first_analysis,
+        "reject-dependent-conflict-1",
+        ConflictResolutionStrategy::KeepCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &first_request)
+        .unwrap();
+    assert_eq!(harness.state().strokes["shared"].snapshot, base);
+
+    (harness, base, descendant)
+}
+
 fn resolution_request(
     harness: &Harness,
     analysis: &ConflictAnalysis,
@@ -3390,6 +3481,68 @@ fn incremental_boox_conflicts_must_resolve_in_source_order() {
     assert!(state.strokes.contains_key("boox-a"));
     assert!(state.strokes.contains_key("boox-b"));
     assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn dependent_compact_conflict_after_rejected_ancestor_is_an_explicit_overlap() {
+    for (case, strategy, accepts_descendant) in [
+        (
+            "merge-current",
+            ConflictResolutionStrategy::MergePreservingCurrent,
+            false,
+        ),
+        (
+            "accept-descendant",
+            ConflictResolutionStrategy::AcceptIncoming,
+            true,
+        ),
+    ] {
+        let (mut harness, base, descendant) = harness_with_rejected_compact_ancestor();
+        let analysis = harness
+            .broker
+            .inspect_conflict(
+                &harness.storage,
+                &harness.document_id,
+                "boox-dependent-conflict-2",
+            )
+            .unwrap();
+        assert!(analysis.safe_changes.is_empty());
+        assert_eq!(
+            analysis
+                .overlapping_changes
+                .iter()
+                .map(|change| change.stroke_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared"]
+        );
+
+        let request = resolution_request(
+            &harness,
+            &analysis,
+            &format!("resolve-dependent-{case}"),
+            strategy,
+        );
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &request)
+            .unwrap();
+
+        let state = harness.state();
+        assert_eq!(
+            state.revisions(),
+            RevisionPair {
+                boox: 2,
+                supernote: 1,
+            }
+        );
+        let expected = if accepts_descendant {
+            &descendant
+        } else {
+            &base
+        };
+        assert_eq!(&state.strokes["shared"].snapshot, expected);
+        assert!(state.conflicts.is_empty());
+    }
 }
 
 #[test]

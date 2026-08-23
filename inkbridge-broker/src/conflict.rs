@@ -845,7 +845,7 @@ fn classify_operations(
         .map(|(stroke_id, operations)| {
             let change = describe_change(&stroke_id, &operations)?;
             let canonical = state.strokes.get(&stroke_id);
-            let safe = match change.kind {
+            let unchanged_since_baseline = match change.kind {
                 ConflictChangeKind::Add => canonical.is_none(),
                 ConflictChangeKind::Update
                 | ConflictChangeKind::Delete
@@ -854,11 +854,12 @@ fn classify_operations(
                         && !changed_after(stroke.source_revisions, conflict.based_on)
                 }),
             };
-            if safe && !operations_match_current(&operations, canonical.map(|stroke| &stroke.snapshot)) {
-                return Err(BrokerError::InvalidEvent(format!(
-                    "preserved conflict operation does not match the based-on canonical stroke {stroke_id}"
-                )));
-            }
+            // A later incremental conflict can legitimately reference an intermediate
+            // snapshot that an earlier conflict resolution rejected. Treat that mismatch
+            // as an overlap: merge-preserving-current will not apply it, while an explicit
+            // accept-incoming decision can still choose the descendant version.
+            let safe = unchanged_since_baseline
+                && operations_match_current(&operations, canonical.map(|stroke| &stroke.snapshot));
             Ok(OperationGroup {
                 change,
                 operations,
