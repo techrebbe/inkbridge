@@ -505,12 +505,28 @@ fn publish_retirement_marker(
         .and_then(|_| output.sync_all())
         .map_err(|error| format!("could not finalize {}: {error}", temporary.display()))?;
     drop(output);
-    fs::rename(&temporary, marker_path).map_err(|error| {
-        format!(
-            "could not publish BOOX retirement marker {}: {error}",
-            marker_path.display()
-        )
-    })?;
+    let published = crate::transport::publish_create_only(&temporary, marker_path)?;
+    if !published {
+        let metadata = fs::symlink_metadata(marker_path).map_err(|error| {
+            format!(
+                "could not inspect concurrently published BOOX retirement marker {}: {error}",
+                marker_path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "BOOX finalized-retirement marker {} is not a regular file",
+                marker_path.display()
+            ));
+        }
+        let existing = read_bounded_descriptor(marker_path, &metadata)?;
+        if existing != bytes {
+            return Err(format!(
+                "BOOX finalized-retirement marker {} has unexpected content",
+                marker_path.display()
+            ));
+        }
+    }
     sync_directory(outgoing)
 }
 
@@ -985,6 +1001,28 @@ mod tests {
         assert!(!first.descriptor_path.exists());
         assert!(second.pdf_path.is_file());
         assert!(second.descriptor_path.is_file());
+    }
+
+    #[test]
+    fn retirement_marker_never_overwrites_conflicting_mirrored_metadata() {
+        let root = tempdir().unwrap();
+        let document = document();
+        let outgoing = root.path().join(&document.document_id).join("outgoing");
+        fs::create_dir_all(&outgoing).unwrap();
+        let marker = FinalizedRetirementMarker {
+            schema_version: 1,
+            document_id: document.document_id,
+            event_id: "accepted-finalization".to_owned(),
+            content_sha256: "a".repeat(64),
+            pdf_file_name: "Example__boox-finalized-g1.pdf".to_owned(),
+        };
+        let marker_path = outgoing.join(retirement_marker_name(&marker.event_id));
+        fs::write(&marker_path, b"different mirrored marker").unwrap();
+
+        let error = publish_retirement_marker(&marker_path, &marker, &outgoing).unwrap_err();
+
+        assert!(error.contains("unexpected content"));
+        assert_eq!(fs::read(marker_path).unwrap(), b"different mirrored marker");
     }
 
     #[test]

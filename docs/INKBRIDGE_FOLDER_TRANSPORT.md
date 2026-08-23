@@ -40,7 +40,7 @@ Each configured document has its Supernote paths plus either the versioned BOOX 
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/acknowledged/<delivery-sha256>.ack.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/.inkbridge-accepted/r<revision>-<page-id>-<content-sha256>.json
 
-`booxHandoffRoot` points at the local mirror of `/storage/emulated/0/Documents/InkBridge`. When it is configured, `booxPdf` remains only as the legacy/testing fallback required by schema version 1; normal BOOX delivery and upload use the versioned companion directories instead.
+`booxHandoffRoot` points at the local mirror of `/storage/emulated/0/Documents/InkBridge`. When it is configured, `booxPdf` remains only as the legacy/testing fallback required by schema version 1; normal BOOX delivery and upload use the versioned companion directories instead. Each mapped `originalFileName` must then be a safe leaf filename no longer than 180 UTF-8 bytes; configuration validation reports this before the transport starts.
 
 The Supernote adapter or companion writes an export to a temporary part file and renames it to
 JSON only after the complete native page export is durable. The folder transport ignores hidden

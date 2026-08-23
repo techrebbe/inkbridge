@@ -227,6 +227,22 @@ impl TransportConfig {
                     document.document_id
                 ));
             }
+            if self.boox_handoff_root.is_some()
+                && (document.original_file_name.len() > 180
+                    || Path::new(&document.original_file_name)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        != Some(document.original_file_name.as_str())
+                    || matches!(document.original_file_name.as_str(), "." | "..")
+                    || document.original_file_name.chars().any(|character| {
+                        matches!(character, '/' | '\\' | '\0') || character.is_control()
+                    }))
+            {
+                return Err(format!(
+                    "{} originalFileName must be a safe BOOX handoff filename of at most 180 UTF-8 bytes",
+                    document.document_id
+                ));
+            }
             if document.supernote_export_directory == document.supernote_incoming_directory {
                 return Err(format!(
                     "{} must use separate Supernote outgoing and incoming directories",
@@ -1127,6 +1143,36 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("overlaps a directory"));
+    }
+
+    #[test]
+    fn configuration_rejects_overlong_file_name_when_boox_handoff_is_enabled() {
+        let mut config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::from("state.json"),
+            boox_handoff_root: Some(PathBuf::from("boox-handoff")),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: format!("{}.pdf", "a".repeat(177)),
+                boox_pdf: PathBuf::from("legacy/book.pdf"),
+                supernote_export_directory: PathBuf::from("supernote/outgoing"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+        };
+
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("at most 180 UTF-8 bytes"));
+
+        config.boox_handoff_root = None;
+        config
+            .validate()
+            .expect("the legacy path does not use the handoff filename protocol");
     }
 
     #[test]

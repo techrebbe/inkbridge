@@ -2217,7 +2217,7 @@ fn descriptor_matches(bytes: &[u8], path: &Path, metadata: &fs::Metadata) -> Res
     Ok(existing.len() as u64 <= MAX_DESCRIPTOR_BYTES && existing == bytes)
 }
 
-fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String> {
+pub(crate) fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String> {
     match rename_create_only(source, destination) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
