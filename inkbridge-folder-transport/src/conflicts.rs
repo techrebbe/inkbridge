@@ -10,8 +10,12 @@ const CONFLICT_EVENT_ID: &str = "inkbridge-conflict-event-id";
 const RESOLUTION_KIND: &str = "conflict-resolution";
 
 /// Returns one stable entry per unresolved conflict event. Preserved evidence
-/// remains in storage after resolution; the broker-authenticated marker is what
-/// removes the event from the active set.
+/// remains in storage after resolution; a marker in the broker-only conflict
+/// namespace removes the event from the active set.
+///
+/// The checks below validate marker identity and shape. Authenticity comes from
+/// bucket IAM: the folder-transport principal can create objects only below the
+/// two device prefixes and cannot write this namespace.
 pub(crate) fn unresolved_conflict_groups(
     objects: &[CloudObject],
     document_id: &str,

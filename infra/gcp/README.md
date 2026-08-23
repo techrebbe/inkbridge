@@ -55,7 +55,10 @@ saved plans. Copy `terraform.tfvars.example` to a private `.tfvars` file.
 ## Reviewed deployment sequence
 
 1. Select an isolated project, billing account, region, and unique bucket
-   names. Set a budget alert if desired; it is not a hard spending cap.
+   names. Set a budget alert if desired; it is not a hard spending cap. Set
+   `folder_transport_operator` to the `user:` or `group:` IAM member that
+   will run the local adapter; leaving it empty creates the restricted identity
+   but grants nobody permission to impersonate it.
 2. Create and configure the private remote-state bucket.
 3. Save and inspect the bootstrap plan. Apply only that exact saved plan.
 4. Build a commit-tagged Linux amd64 image:
@@ -107,6 +110,21 @@ saved plans. Copy `terraform.tfvars.example` to a private `.tfvars` file.
    the two device folders. After registration, test one finalized update from
    each device folder.
 
+After the reviewed apply, run the local folder transport through its dedicated
+identity rather than through project-owner or broker credentials:
+
+```text
+gcloud config configurations create inkbridge-folder-transport
+gcloud config set project PROJECT_ID --configuration=inkbridge-folder-transport
+gcloud config set auth/impersonate_service_account \
+  $(terraform output -raw folder_transport_service_account) \
+  --configuration=inkbridge-folder-transport
+```
+
+Set `CLOUDSDK_ACTIVE_CONFIG_NAME=inkbridge-folder-transport` for the transport
+process. The account can read broker outputs and preserved evidence, but IAM
+permits it to create objects only under the two device-folder prefixes.
+
 The Artifact Registry repository keeps the five most recent versions, retains
 every `deployed-` tagged digest, and deletes older `build-` tagged or untagged
 versions after seven days. Move `deployed-current` to the new digest only when
@@ -133,6 +151,7 @@ The enabled stages manage:
 - private, short-lived Cloud Build source bucket;
 - private versioned device-data bucket;
 - Firestore Native database with deletion protection and point-in-time recovery;
-- least-scope build, runtime, and Eventarc service accounts/IAM;
+- least-scope build, runtime, Eventarc, and local folder-transport service
+  accounts/IAM, with device uploads barred from broker-owned namespaces;
 - private Cloud Run broker; and
 - Eventarc finalized-object trigger.

@@ -90,8 +90,26 @@ must not be synced between two running transports. A process lock prevents two t
 using it concurrently. If the operating system terminates the process without allowing cleanup,
 remove the adjacent lock file only after verifying that no transport is still running.
 
-The user running the transport must already be authenticated with gcloud and authorized for the
-private InkBridge bucket. The transport uses create-only uploads with custom metadata; retrying an
+Production scans must use the Terraform-managed `inkbridge-folder-transport` service account,
+not project-owner or broker-runtime credentials. That identity can read the private bucket, but its
+create-only writes are IAM-conditioned to `BOOX_Folder/` and `Supernote_Folder/`. It cannot
+create `Conflicts/.../resolution.json`, canonical state, or broker outbox objects. Resolution
+markers are trusted only because this broker-only namespace boundary is enforced by IAM; their
+custom metadata is validation data, not authentication.
+
+Set `folder_transport_operator` to the operator's `user:` or `group:` IAM member before the
+reviewed Terraform apply. Then use a dedicated gcloud configuration:
+
+```text
+gcloud config configurations create inkbridge-folder-transport
+gcloud config set project PROJECT_ID --configuration=inkbridge-folder-transport
+gcloud config set auth/impersonate_service_account \
+  inkbridge-folder-transport@PROJECT_ID.iam.gserviceaccount.com \
+  --configuration=inkbridge-folder-transport
+```
+
+Select that configuration for the transport process (for example with
+`CLOUDSDK_ACTIVE_CONFIG_NAME=inkbridge-folder-transport`). Uploads remain create-only; retrying an
 uncertain upload succeeds only when the existing immutable object carries the exact intended hash
 and revision metadata.
 

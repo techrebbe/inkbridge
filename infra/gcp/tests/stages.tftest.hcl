@@ -58,6 +58,30 @@ run "bootstrap_omits_runtime" {
   }
 
   assert {
+    condition = (
+      length(google_service_account.folder_transport) == 1 &&
+      length(google_storage_bucket_iam_member.folder_transport_reader) == 1 &&
+      length(google_storage_bucket_iam_member.folder_transport_device_writer) == 1
+    )
+    error_message = "Bootstrap must create the dedicated folder-transport identity and bucket grants."
+  }
+
+  assert {
+    condition = (
+      google_storage_bucket_iam_member.folder_transport_device_writer[0].role == "roles/storage.objectCreator" &&
+      strcontains(one(google_storage_bucket_iam_member.folder_transport_device_writer[0].condition).expression, "/objects/BOOX_Folder/") &&
+      strcontains(one(google_storage_bucket_iam_member.folder_transport_device_writer[0].condition).expression, "/objects/Supernote_Folder/") &&
+      !strcontains(one(google_storage_bucket_iam_member.folder_transport_device_writer[0].condition).expression, "/objects/Conflicts/")
+    )
+    error_message = "The folder transport may create only device-folder objects, never conflict markers."
+  }
+
+  assert {
+    condition     = length(google_service_account_iam_member.folder_transport_impersonator) == 0
+    error_message = "No operator may impersonate the folder transport unless explicitly configured."
+  }
+
+  assert {
     condition     = length(google_storage_bucket.build_source) == 1
     error_message = "Bootstrap must create a dedicated build-source bucket."
   }
