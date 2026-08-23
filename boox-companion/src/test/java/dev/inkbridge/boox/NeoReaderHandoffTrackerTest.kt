@@ -7,13 +7,16 @@ import org.junit.Test
 
 class NeoReaderHandoffTrackerTest {
     @Test
-    fun confirmsOnlyAfterActivityPausedAndStorageCommit() {
+    fun confirmsOnlyAfterDispatchedActivityPausedAndStorageCommit() {
         val persistence = MemoryHandoffPersistence()
         val tracker = NeoReaderHandoffTracker(persistence)
         val state = state()
 
         tracker.launchStarted(state)
         assertNull(tracker.activityResumed())
+        tracker.activityPaused()
+        assertNull(tracker.activityResumed())
+        tracker.launchDispatched()
         tracker.activityPaused()
         val opened = tracker.activityResumed()
         assertEquals(expected(state), opened)
@@ -44,6 +47,7 @@ class NeoReaderHandoffTrackerTest {
         val state = state()
         NeoReaderHandoffTracker(persistence).apply {
             launchStarted(state)
+            launchDispatched()
             activityPaused()
         }
 
@@ -60,6 +64,20 @@ class NeoReaderHandoffTrackerTest {
         assertNull(persistence.value)
     }
 
+    @Test
+    fun dispatchedLaunchWithoutItsOwnPauseCannotBeConfirmedAfterProcessRestart() {
+        val persistence = MemoryHandoffPersistence()
+        NeoReaderHandoffTracker(persistence).apply {
+            launchStarted(state())
+            launchDispatched()
+        }
+
+        val recreated = NeoReaderHandoffTracker(persistence)
+        recreated.activityPaused()
+
+        assertNull(recreated.activityResumed())
+        assertEquals(false, persistence.value?.observedPause)
+    }
     private fun expected(state: HandoffState) = PendingNeoReaderHandoff(
         documentId = state.documentId,
         brokerEventId = state.brokerEventId,

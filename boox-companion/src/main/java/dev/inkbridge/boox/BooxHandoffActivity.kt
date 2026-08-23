@@ -288,6 +288,7 @@ class BooxHandoffActivity : Activity() {
                 setDataAndType(Uri.fromFile(pdf), "application/pdf")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             })
+            neoReaderHandoff.launchDispatched()
         } catch (error: Throwable) {
             neoReaderHandoff.launchFailed()
             throw error

@@ -57,8 +57,11 @@ internal class NeoReaderHandoffTracker(
     private val persistence: NeoReaderHandoffPersistence,
 ) {
     private var pending = persistence.load()
+    // Deliberately process-local: only this instance can connect a successful dispatch to its pause.
+    private var launchDispatchedInThisTracker = false
 
     fun launchStarted(state: HandoffState) {
+        launchDispatchedInThisTracker = false
         update(
             PendingNeoReaderHandoff(
                 documentId = state.documentId,
@@ -69,11 +72,19 @@ internal class NeoReaderHandoffTracker(
         )
     }
 
+    fun launchDispatched() {
+        checkNotNull(pending) { "NeoReader launch dispatch has no pending handoff" }
+        launchDispatchedInThisTracker = true
+    }
+
     fun launchFailed() {
+        launchDispatchedInThisTracker = false
         update(null)
     }
 
     fun activityPaused() {
+        if (!launchDispatchedInThisTracker) return
+        launchDispatchedInThisTracker = false
         val current = pending ?: return
         if (!current.observedPause) update(current.copy(observedPause = true))
     }
@@ -83,6 +94,7 @@ internal class NeoReaderHandoffTracker(
 
     fun confirmationCommitted(opened: PendingNeoReaderHandoff) {
         check(pending == opened) { "NeoReader handoff confirmation does not match the pending launch" }
+        launchDispatchedInThisTracker = false
         update(null)
     }
 
