@@ -969,6 +969,86 @@ fn compact_cross_page_upsert_requires_a_matching_delete() {
 }
 
 #[test]
+fn preserved_compact_cross_page_upsert_requires_a_matching_delete() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let before = stroke_on_page("preserved-cross-page", 0, 0.2, 0.3);
+    let export = harness.event(
+        "sn-before-preserved-cross-page",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&before)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &export)
+        .unwrap();
+
+    let after = stroke_on_page("preserved-cross-page", 1, 0.3, 0.4);
+    let mut event = harness.event(
+        "boox-preserved-cross-page-without-delete",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: after.source_uuid.clone(),
+                page_index: after.page_index,
+                before: Some(before.clone()),
+                after,
+            }],
+            2,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &event)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    assert!(matches!(
+        harness.broker.inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-preserved-cross-page-without-delete",
+        ),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+
+    let state_before = harness.state();
+    let request = ConflictResolutionRequest {
+        schema_version: RESOLUTION_SCHEMA_VERSION,
+        resolution_id: "resolve-malformed-preserved-cross-page".to_owned(),
+        document_id: harness.document_id.clone(),
+        conflict_event_id: "boox-preserved-cross-page-without-delete".to_owned(),
+        expected_state_revision: state_before.state_revision,
+        expected_current_revisions: state_before.revisions(),
+        strategy: ConflictResolutionStrategy::MergePreservingCurrent,
+    };
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &request),
+        Err(BrokerError::InvalidEvent(_))
+    ));
+    assert_eq!(harness.state(), state_before);
+    assert_eq!(
+        harness.state().strokes["preserved-cross-page"].snapshot,
+        before
+    );
+    assert!(harness
+        .storage
+        .object(&conflict_resolution_path(
+            &harness.document_id,
+            "boox-preserved-cross-page-without-delete"
+        ))
+        .is_none());
+}
+
+#[test]
 fn compact_manifest_rejects_duplicate_upserts_for_one_stroke() {
     let mut harness = Harness::new();
     let first = stroke("duplicate", 0.2, 0.3);

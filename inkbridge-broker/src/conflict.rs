@@ -681,7 +681,7 @@ fn validate_conflict_boox_manifest(
                 if let Some(before) = before {
                     validate_conflict_snapshot(
                         source_uuid,
-                        before.page_index,
+                        *page_index,
                         before,
                         manifest.document.page_count,
                     )?;
