@@ -1,0 +1,62 @@
+name: InkBridge BOOX companion
+
+on:
+  push:
+    branches: [master, "feat/**", "agent/**"]
+    paths:
+      - "boox-companion/**"
+      - "settings.gradle.kts"
+      - "build.gradle.kts"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - ".github/workflows/inkbridge-boox-companion.yml"
+  pull_request:
+    paths:
+      - "boox-companion/**"
+      - "settings.gradle.kts"
+      - "build.gradle.kts"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - ".github/workflows/inkbridge-boox-companion.yml"
+
+jobs:
+  build-and-test:
+    name: BOOX handoff tests + APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - name: Test, lint, and assemble
+        run: |
+          chmod +x ./gradlew
+          ./gradlew \
+            :boox-companion:testDebugUnitTest \
+            :boox-companion:lintDebug \
+            :boox-companion:assembleDebug \
+            :boox-companion:assembleRelease \
+            --console=plain
+      - name: Verify automation actions are debug-only
+        run: |
+          debug_manifest=$(find boox-companion/build/intermediates/merged_manifests/debug -name AndroidManifest.xml -print -quit)
+          release_manifest=$(find boox-companion/build/intermediates/merged_manifests/release -name AndroidManifest.xml -print -quit)
+          test -n "$debug_manifest"
+          test -n "$release_manifest"
+          grep -q 'dev.inkbridge.boox.action.INSTALL_NEXT' "$debug_manifest"
+          if grep -q 'dev.inkbridge.boox.action.INSTALL_NEXT' "$release_manifest"; then
+            echo "Release manifest exposes debug-only BOOX automation actions" >&2
+            exit 1
+          fi
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkbridge-boox-companion-debug-apk
+          path: boox-companion/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7

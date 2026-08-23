@@ -1,17 +1,21 @@
 use crate::{
-    CloudFolder, CloudObject, DocumentFolders, FileObservation, PendingUpload, SyncReport,
-    TransportAction, TransportState,
+    boox_handoff::{
+        BooxHandoffEndpoint, FinalizedBooxArtifact, InstalledBooxDelivery, MAX_DESCRIPTOR_BYTES,
+    },
+    CloudFolder, CloudObject, DocumentFolders, DocumentTransportState, FileObservation,
+    PendingUpload, SyncReport, TransportAction, TransportState, VerifiedBooxInstall,
 };
 use inkbridge_broker::{sha256_hex, DeviceSide, RevisionPair, BROKER_PRODUCER};
 use inkbridge_convert::{build_manifest, parse_baseline_bytes, BaselineExport};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GENERATED_BY: &str = "inkbridge-generated-by";
+const GENERATED_EVENT_ID: &str = "inkbridge-event-id";
 const DOCUMENT_ID: &str = "inkbridge-document-id";
 const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
 const SOURCE_REVISION: &str = "inkbridge-source-revision";
@@ -62,6 +66,7 @@ pub struct FolderTransport<'a, C, B> {
     cloud: &'a C,
     manifest_builder: &'a B,
     settle: Duration,
+    boox_handoff_root: Option<PathBuf>,
 }
 
 impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
@@ -70,7 +75,23 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             cloud,
             manifest_builder,
             settle,
+            boox_handoff_root: None,
         }
+    }
+
+    pub fn with_boox_handoff_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.boox_handoff_root = Some(root.into());
+        self
+    }
+
+    fn boox_handoff_endpoint(
+        &self,
+        document: &DocumentFolders,
+    ) -> Result<Option<BooxHandoffEndpoint>, String> {
+        self.boox_handoff_root
+            .as_deref()
+            .map(|root| BooxHandoffEndpoint::new(root, document))
+            .transpose()
     }
 
     pub fn sync_document(
@@ -416,12 +437,96 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         Ok(identity)
     }
 
+    fn restore_verified_boox_install_pair(
+        &self,
+        endpoint: &BooxHandoffEndpoint,
+        document: &DocumentFolders,
+        receipt: &VerifiedBooxInstall,
+        state: &mut TransportState,
+    ) -> Result<(), String> {
+        let object = verified_boox_install_object(receipt, document)?;
+        let delivery = endpoint.prepare_delivery(
+            document,
+            &object,
+            receipt.source_revisions,
+            &receipt.content_sha256,
+        )?;
+        if delivery.event_id != receipt.event_id {
+            return Err(format!(
+                "verified BOOX install {} reconstructed a different delivery identity",
+                receipt.event_id
+            ));
+        }
+
+        let descriptor_was_missing = metadata_if_exists(&delivery.descriptor_path)?.is_none();
+        if !descriptor_was_missing
+            && publish_bytes_create_only_or_verify(
+                &delivery.descriptor_bytes,
+                &delivery.descriptor_path,
+            )? == DescriptorPublication::Conflict
+        {
+            return Err(format!(
+                "verified BOOX recovery descriptor {} has unexpected content and was preserved for inspection",
+                delivery.descriptor_path.display()
+            ));
+        }
+
+        let pdf_metadata = metadata_if_exists(&delivery.pdf_path)?;
+        let pdf_is_ready = pdf_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file())
+            && sha256_file(&delivery.pdf_path).is_ok_and(|hash| hash == receipt.content_sha256);
+        if !pdf_is_ready {
+            if pdf_metadata.is_some() {
+                return Err(format!(
+                    "verified BOOX recovery PDF {} has unexpected content and was preserved for inspection",
+                    delivery.pdf_path.display()
+                ));
+            }
+            if receipt.source_object_path.is_none() || receipt.source_object_size.is_none() {
+                return Err(format!(
+                    "verified BOOX install {} predates recoverable broker object receipts and its local recovery PDF is missing",
+                    receipt.event_id
+                ));
+            }
+            if !self.download_verified(&object, &delivery.pdf_path, Some(&FileIdentity::Missing))? {
+                return Err(format!(
+                    "verified BOOX recovery PDF {} changed while its historical generation was downloading",
+                    delivery.pdf_path.display()
+                ));
+            }
+            remember_file_hash(
+                &delivery.pdf_path,
+                state,
+                SystemTime::now(),
+                &receipt.content_sha256,
+            )?;
+        }
+
+        if publish_bytes_create_only_or_verify(
+            &delivery.descriptor_bytes,
+            &delivery.descriptor_path,
+        )? == DescriptorPublication::Conflict
+        {
+            return Err(format!(
+                "verified BOOX recovery descriptor {} has unexpected content and was preserved for inspection",
+                delivery.descriptor_path.display()
+            ));
+        }
+        Ok(())
+    }
     fn deliver_outputs(
         &self,
         document: &DocumentFolders,
         state: &mut TransportState,
         report: &mut SyncReport,
     ) -> Result<(), String> {
+        let boox_handoff_endpoint = self.boox_handoff_endpoint(document)?;
+        let installed_boox_delivery = boox_handoff_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.installed_delivery(document))
+            .transpose()?
+            .flatten();
         let mut candidates = Vec::new();
         candidates.extend(
             self.cloud
@@ -464,10 +569,136 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             )
         });
 
+        let mut installed_is_verified = false;
+        if let (Some(endpoint), Some(installed)) = (
+            boox_handoff_endpoint.as_ref(),
+            installed_boox_delivery.as_ref(),
+        ) {
+            let matches_durable_receipt = state
+                .documents
+                .get(&document.document_id)
+                .and_then(|document_state| document_state.verified_boox_install.as_ref())
+                .is_some_and(|receipt| verified_boox_install_matches_ack(receipt, installed));
+            let live_broker_output = candidates.iter().find_map(|(side, object, revisions)| {
+                if *side != DeviceSide::Boox
+                    || *revisions != installed.source_revisions
+                    || object.generation != installed.source_generation
+                {
+                    return None;
+                }
+                let Ok(expected_hash) = required_metadata(object, CONTENT_SHA256) else {
+                    return None;
+                };
+                if expected_hash != installed.content_sha256 {
+                    return None;
+                }
+                if endpoint
+                    .prepare_delivery(document, object, *revisions, expected_hash)
+                    .is_ok_and(|delivery| delivery.event_id == installed.event_id)
+                {
+                    Some(object.clone())
+                } else {
+                    None
+                }
+            });
+            installed_is_verified = matches_durable_receipt || live_broker_output.is_some();
+            if installed_is_verified {
+                if let Some(object) = live_broker_output.as_ref() {
+                    state
+                        .document_mut(&document.document_id)
+                        .verified_boox_install = Some(verified_boox_install(installed, object));
+                }
+                let receipt = state
+                    .documents
+                    .get(&document.document_id)
+                    .and_then(|document_state| document_state.verified_boox_install.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "verified BOOX acknowledgement {} has no durable receipt",
+                            installed.event_id
+                        )
+                    })?;
+                self.restore_verified_boox_install_pair(endpoint, document, &receipt, state)?;
+                endpoint.retire_superseded_incoming(document, installed)?;
+                let current = state.document_mut(&document.document_id).revisions;
+                let known_content_hash = state
+                    .document_mut(&document.document_id)
+                    .boox
+                    .delivered_content_sha256
+                    .as_deref();
+                if installed.source_revisions == current
+                    && known_content_hash.is_some_and(|hash| hash != installed.content_sha256)
+                {
+                    return Err(format!(
+                        "BOOX installed acknowledgement {} reports different content for frontier {}:{}",
+                        installed.event_id, current.boox, current.supernote,
+                    ));
+                }
+                if dominates(installed.source_revisions, current) {
+                    record_delivered_frontier(
+                        state.document_mut(&document.document_id),
+                        installed.source_revisions,
+                        DeviceSide::Boox,
+                        installed.content_sha256.clone(),
+                    );
+                } else if !dominates(current, installed.source_revisions) {
+                    return Err(format!(
+                        "BOOX installed acknowledgement {} at {}:{} conflicts with transport frontier {}:{}",
+                        installed.event_id,
+                        installed.source_revisions.boox,
+                        installed.source_revisions.supernote,
+                        current.boox,
+                        current.supernote,
+                    ));
+                }
+            }
+        }
+        let verified_installed_boox_delivery = installed_boox_delivery
+            .as_ref()
+            .filter(|_| installed_is_verified);
         for (side, object, revisions) in candidates {
             let generation_key = object.generation_key();
+            let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
+            let boox_handoff_delivery = if side == DeviceSide::Boox {
+                boox_handoff_endpoint
+                    .as_ref()
+                    .map(|endpoint| {
+                        endpoint.prepare_delivery(document, &object, revisions, &expected_hash)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            if let (Some(installed), Some(_delivery)) = (
+                verified_installed_boox_delivery,
+                boox_handoff_delivery.as_ref(),
+            ) {
+                if revisions == installed.source_revisions {
+                    if expected_hash != installed.content_sha256 {
+                        return Err(format!(
+                            "broker BOOX output {} reports different content for installed frontier {}:{}",
+                            object.path, revisions.boox, revisions.supernote,
+                        ));
+                    }
+                    state
+                        .document_mut(&document.document_id)
+                        .delivered_generations
+                        .insert(generation_key);
+                    continue;
+                }
+                if dominates(installed.source_revisions, revisions) {
+                    state
+                        .document_mut(&document.document_id)
+                        .delivered_generations
+                        .insert(generation_key);
+                    continue;
+                }
+            }
             let local_path = match side {
-                DeviceSide::Boox => document.boox_pdf.clone(),
+                DeviceSide::Boox => boox_handoff_delivery
+                    .as_ref()
+                    .map(|delivery| delivery.pdf_path.clone())
+                    .unwrap_or_else(|| document.boox_pdf.clone()),
                 DeviceSide::Supernote => {
                     let remote_name = Path::new(&object.path)
                         .file_name()
@@ -479,13 +710,78 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     ))
                 }
             };
-            let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
             if state
                 .document_mut(&document.document_id)
                 .delivered_generations
                 .contains(&generation_key)
             {
-                if side == DeviceSide::Supernote
+                if let Some(delivery) = &boox_handoff_delivery {
+                    let descriptor_was_missing =
+                        metadata_if_exists(&delivery.descriptor_path)?.is_none();
+                    if !descriptor_was_missing
+                        && publish_bytes_create_only_or_verify(
+                            &delivery.descriptor_bytes,
+                            &delivery.descriptor_path,
+                        )? == DescriptorPublication::Conflict
+                    {
+                        report.actions.push(TransportAction::Deferred {
+                            side,
+                            reason: format!(
+                                "versioned BOOX handoff descriptor {} has unexpected content and was preserved for inspection",
+                                delivery.descriptor_path.display()
+                            ),
+                        });
+                        continue;
+                    }
+                    let installed = metadata_if_exists(&delivery.pdf_path)?
+                        .is_some_and(|metadata| metadata.is_file())
+                        && sha256_file(&delivery.pdf_path).is_ok_and(|hash| hash == expected_hash);
+                    if !installed {
+                        if metadata_if_exists(&delivery.pdf_path)?.is_some() {
+                            report.actions.push(TransportAction::Deferred {
+                                side,
+                                reason: format!(
+                                    "versioned BOOX handoff destination {} changed after delivery and was preserved for inspection",
+                                    delivery.pdf_path.display()
+                                ),
+                            });
+                            continue;
+                        }
+                        self.download_verified(
+                            &object,
+                            &delivery.pdf_path,
+                            Some(&FileIdentity::Missing),
+                        )?;
+                        remember_file_hash(
+                            &delivery.pdf_path,
+                            state,
+                            SystemTime::now(),
+                            &expected_hash,
+                        )?;
+                    }
+                    if publish_bytes_create_only_or_verify(
+                        &delivery.descriptor_bytes,
+                        &delivery.descriptor_path,
+                    )? == DescriptorPublication::Conflict
+                    {
+                        report.actions.push(TransportAction::Deferred {
+                            side,
+                            reason: format!(
+                                "versioned BOOX handoff descriptor {} has unexpected content and was preserved for inspection",
+                                delivery.descriptor_path.display()
+                            ),
+                        });
+                        continue;
+                    }
+                    if !installed || descriptor_was_missing {
+                        report.actions.push(TransportAction::Delivered {
+                            side,
+                            object_path: object.path,
+                            local_path: delivery.pdf_path.clone(),
+                            generation: object.generation,
+                        });
+                    }
+                } else if side == DeviceSide::Supernote
                     && !supernote_delivery_is_acknowledged(document, &expected_hash)?
                 {
                     let installed = metadata_if_exists(&local_path)?
@@ -530,12 +826,30 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 continue;
             }
 
+            if let Some(delivery) = &boox_handoff_delivery {
+                if metadata_if_exists(&delivery.descriptor_path)?.is_some()
+                    && publish_bytes_create_only_or_verify(
+                        &delivery.descriptor_bytes,
+                        &delivery.descriptor_path,
+                    )? == DescriptorPublication::Conflict
+                {
+                    report.actions.push(TransportAction::Deferred {
+                        side,
+                        reason: format!(
+                            "versioned BOOX handoff descriptor {} has unexpected content and was preserved for inspection",
+                            delivery.descriptor_path.display()
+                        ),
+                    });
+                    continue;
+                }
+            }
             if side == DeviceSide::Boox {
                 reconcile_staged_backup(&local_path, &expected_hash)?;
             }
-            let boox_destination_identity = (side == DeviceSide::Boox)
-                .then(|| file_identity(&local_path))
-                .transpose()?;
+            let boox_destination_identity = (side == DeviceSide::Boox
+                && boox_handoff_delivery.is_none())
+            .then(|| file_identity(&local_path))
+            .transpose()?;
             let already_installed = if let Some(identity) = &boox_destination_identity {
                 identity == &FileIdentity::Sha256(expected_hash.clone())
             } else {
@@ -543,6 +857,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     && sha256_file(&local_path).is_ok_and(|hash| hash == expected_hash)
             };
             if side == DeviceSide::Boox
+                && boox_handoff_delivery.is_none()
                 && !already_installed
                 && self.boox_has_unpublished_local_edit(
                     document,
@@ -562,12 +877,27 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 continue;
             }
 
+            if boox_handoff_delivery.is_some()
+                && !already_installed
+                && metadata_if_exists(&local_path)?.is_some()
+            {
+                report.actions.push(TransportAction::Deferred {
+                    side,
+                    reason: format!(
+                        "versioned BOOX handoff destination {} already exists with unexpected content and was preserved for inspection",
+                        local_path.display()
+                    ),
+                });
+                continue;
+            }
+            let handoff_missing = boox_handoff_delivery
+                .as_ref()
+                .map(|_| FileIdentity::Missing);
+            let expected_destination = boox_destination_identity
+                .as_ref()
+                .or(handoff_missing.as_ref());
             if !already_installed
-                && !self.download_verified(
-                    &object,
-                    &local_path,
-                    boox_destination_identity.as_ref(),
-                )?
+                && !self.download_verified(&object, &local_path, expected_destination)?
             {
                 report.actions.push(TransportAction::Deferred {
                     side,
@@ -577,6 +907,22 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     ),
                 });
                 continue;
+            }
+            if let Some(delivery) = &boox_handoff_delivery {
+                if publish_bytes_create_only_or_verify(
+                    &delivery.descriptor_bytes,
+                    &delivery.descriptor_path,
+                )? == DescriptorPublication::Conflict
+                {
+                    report.actions.push(TransportAction::Deferred {
+                        side,
+                        reason: format!(
+                            "versioned BOOX handoff descriptor {} has unexpected content and was preserved for inspection",
+                            delivery.descriptor_path.display()
+                        ),
+                    });
+                    continue;
+                }
             }
             if side == DeviceSide::Boox
                 && file_identity(&local_path)? != FileIdentity::Sha256(expected_hash.clone())
@@ -592,24 +938,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
             remember_file_hash(&local_path, state, SystemTime::now(), &expected_hash)?;
             let document_state = state.document_mut(&document.document_id);
-            document_state.revisions = revisions;
-            document_state.side_mut(side).delivered_content_sha256 = Some(expected_hash);
-            for source in [DeviceSide::Boox, DeviceSide::Supernote] {
-                let accepted_revision = revisions.get(source);
-                let accepted_pending = document_state
-                    .side(source)
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.source_revision <= accepted_revision)
-                    .then(|| document_state.side_mut(source).pending.take())
-                    .flatten();
-                if let Some(pending) = accepted_pending {
-                    document_state
-                        .side_mut(source)
-                        .accepted_local_hashes
-                        .insert(pending.local_path, pending.local_content_sha256);
-                }
-            }
+            record_delivered_frontier(document_state, revisions, side, expected_hash);
             document_state.delivered_generations.insert(generation_key);
             report.actions.push(TransportAction::Delivered {
                 side,
@@ -627,6 +956,166 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         state: &mut TransportState,
         now: SystemTime,
         report: &mut SyncReport,
+    ) -> Result<(), String> {
+        let Some(endpoint) = self.boox_handoff_endpoint(document)? else {
+            return self.upload_legacy_boox_if_ready(document, state, now, report);
+        };
+        self.upload_boox_handoff_if_ready(&endpoint, document, state, now, report)
+    }
+
+    fn upload_boox_handoff_if_ready(
+        &self,
+        endpoint: &BooxHandoffEndpoint,
+        document: &DocumentFolders,
+        state: &mut TransportState,
+        now: SystemTime,
+        report: &mut SyncReport,
+    ) -> Result<(), String> {
+        if state
+            .document_mut(&document.document_id)
+            .boox
+            .pending
+            .is_some()
+        {
+            return Ok(());
+        }
+        let installed_boox_delivery = endpoint.installed_delivery(document)?.filter(|installed| {
+            state
+                .documents
+                .get(&document.document_id)
+                .and_then(|document_state| document_state.verified_boox_install.as_ref())
+                .is_some_and(|receipt| verified_boox_install_matches_ack(receipt, installed))
+        });
+        for artifact in endpoint.finalized_artifacts(document)? {
+            let local_key = canonical_path_key(&artifact.pdf_path);
+            let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
+            let expected_source_hash = artifact.event.content_sha256.clone();
+            let (already_uploaded, accepted) = {
+                let boox_state = &state.document_mut(&document.document_id).boox;
+                let already_uploaded = boox_state
+                    .uploaded_local_hashes
+                    .get(&local_key)
+                    .is_some_and(|hash| hash == &expected_source_hash);
+                let accepted = boox_state
+                    .accepted_local_hashes
+                    .get(&local_key)
+                    .is_some_and(|hash| hash == &expected_source_hash)
+                    || boox_state
+                        .accepted_source_revisions
+                        .get(&source_local_id)
+                        .is_some_and(|revision| *revision >= artifact.event.source_revision);
+                (already_uploaded, accepted)
+            };
+            if accepted {
+                if installed_boox_delivery.as_ref().is_some_and(|installed| {
+                    installed.source_revisions.boox >= artifact.event.source_revision
+                }) {
+                    endpoint.retire_accepted_artifact(document, &artifact)?;
+                }
+                continue;
+            }
+            if already_uploaded {
+                continue;
+            }
+            if !file_is_settled(&artifact.descriptor_path, state, now, self.settle)?
+                || !file_is_settled(&artifact.pdf_path, state, now, self.settle)?
+            {
+                continue;
+            }
+            let source_hash = sha256_file(&artifact.pdf_path)?;
+            if source_hash != expected_source_hash {
+                report.actions.push(TransportAction::Deferred {
+                    side: DeviceSide::Boox,
+                    reason: format!(
+                        "finalized BOOX PDF {} has content hash {source_hash}, not descriptor hash {}, and was preserved for inspection",
+                        artifact.pdf_path.display(),
+                        expected_source_hash
+                    ),
+                });
+                continue;
+            }
+            let current = state.document_mut(&document.document_id).revisions;
+            if artifact.event.based_on == current {
+                let mut companion_document = document.clone();
+                companion_document.boox_pdf.clone_from(&artifact.pdf_path);
+                return self.upload_boox_pdf_if_ready(
+                    &companion_document,
+                    state,
+                    now,
+                    report,
+                    Some(&source_local_id),
+                );
+            }
+            return self.upload_conflicting_boox_handoff(
+                document,
+                state,
+                &artifact,
+                &source_hash,
+                report,
+            );
+        }
+        Ok(())
+    }
+
+    fn upload_conflicting_boox_handoff(
+        &self,
+        document: &DocumentFolders,
+        state: &mut TransportState,
+        artifact: &FinalizedBooxArtifact,
+        source_hash: &str,
+        report: &mut SyncReport,
+    ) -> Result<(), String> {
+        let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
+        let (object, source_revision) = self.upload_source_at(
+            document,
+            state,
+            DeviceSide::Boox,
+            &artifact.pdf_path,
+            &canonical_path_key(&artifact.pdf_path),
+            &source_local_id,
+            None,
+            source_hash,
+            source_hash,
+            "device_view",
+            "pdf",
+            artifact.event.based_on,
+            artifact.event.source_revision,
+        )?;
+        state
+            .document_mut(&document.document_id)
+            .boox
+            .uploaded_local_hashes
+            .insert(
+                canonical_path_key(&artifact.pdf_path),
+                source_hash.to_owned(),
+            );
+        report.actions.push(TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            local_path: artifact.pdf_path.clone(),
+            object_path: object.path,
+            source_revision,
+            uploaded_bytes: object.size,
+        });
+        Ok(())
+    }
+
+    fn upload_legacy_boox_if_ready(
+        &self,
+        document: &DocumentFolders,
+        state: &mut TransportState,
+        now: SystemTime,
+        report: &mut SyncReport,
+    ) -> Result<(), String> {
+        self.upload_boox_pdf_if_ready(document, state, now, report, None)
+    }
+
+    fn upload_boox_pdf_if_ready(
+        &self,
+        document: &DocumentFolders,
+        state: &mut TransportState,
+        now: SystemTime,
+        report: &mut SyncReport,
+        stable_source_local_id: Option<&str>,
     ) -> Result<(), String> {
         match metadata_if_exists(&document.boox_pdf)? {
             None => return Ok(()),
@@ -795,7 +1284,9 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         }
         let manifest_bytes = built.bytes;
         let payload_hash = sha256_hex(&manifest_bytes);
-        let source_local_id = sha256_hex(local_key.as_bytes());
+        let source_local_id = stable_source_local_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| sha256_hex(local_key.as_bytes()));
         let temporary = sibling_temporary(&document.boox_pdf, "compact-upload");
         fs::write(&temporary, &manifest_bytes)
             .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
@@ -1034,6 +1525,42 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         payload_kind: &str,
         extension: &str,
     ) -> Result<(CloudObject, u64), String> {
+        let based_on = state.document_mut(&document.document_id).revisions;
+        let source_revision = based_on.get(side) + 1;
+        self.upload_source_at(
+            document,
+            state,
+            side,
+            payload_path,
+            local_key,
+            source_local_id,
+            source_page_index,
+            local_hash,
+            payload_hash,
+            payload_kind,
+            extension,
+            based_on,
+            source_revision,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_source_at(
+        &self,
+        document: &DocumentFolders,
+        state: &mut TransportState,
+        side: DeviceSide,
+        payload_path: &Path,
+        local_key: &str,
+        source_local_id: &str,
+        source_page_index: Option<u32>,
+        local_hash: &str,
+        payload_hash: &str,
+        payload_kind: &str,
+        extension: &str,
+        based_on: RevisionPair,
+        source_revision: u64,
+    ) -> Result<(CloudObject, u64), String> {
         let document_state = state.document_mut(&document.document_id);
         if !document_state.conflicts.is_empty() {
             return Err(format!(
@@ -1041,8 +1568,12 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 document.document_id
             ));
         }
-        let based_on = document_state.revisions;
-        let source_revision = based_on.get(side) + 1;
+        if source_revision != based_on.get(side) + 1 {
+            return Err(format!(
+                "{side:?} source revision {source_revision} does not immediately follow basedOn revision {}",
+                based_on.get(side)
+            ));
+        }
         let side_name = match side {
             DeviceSide::Boox => "boox",
             DeviceSide::Supernote => "supernote",
@@ -1243,6 +1774,94 @@ fn parse_revision_metadata(object: &CloudObject) -> Result<RevisionPair, String>
 
 fn dominates(candidate: RevisionPair, current: RevisionPair) -> bool {
     candidate.boox >= current.boox && candidate.supernote >= current.supernote
+}
+
+fn verified_boox_install(
+    installed: &InstalledBooxDelivery,
+    object: &CloudObject,
+) -> VerifiedBooxInstall {
+    VerifiedBooxInstall {
+        event_id: installed.event_id.clone(),
+        source_revisions: installed.source_revisions,
+        source_generation: installed.source_generation,
+        content_sha256: installed.content_sha256.clone(),
+        source_object_path: Some(object.path.clone()),
+        source_object_size: Some(object.size),
+    }
+}
+
+fn verified_boox_install_matches_ack(
+    receipt: &VerifiedBooxInstall,
+    installed: &InstalledBooxDelivery,
+) -> bool {
+    receipt.event_id == installed.event_id
+        && receipt.source_revisions == installed.source_revisions
+        && receipt.source_generation == installed.source_generation
+        && receipt.content_sha256 == installed.content_sha256
+}
+
+fn verified_boox_install_object(
+    receipt: &VerifiedBooxInstall,
+    document: &DocumentFolders,
+) -> Result<CloudObject, String> {
+    let expected_prefix = format!("BOOX_Folder/{}/", document.document_id);
+    let object_path = match receipt.source_object_path.as_deref() {
+        Some(path) if path.starts_with(&expected_prefix) && path != expected_prefix => {
+            path.to_owned()
+        }
+        Some(path) => {
+            return Err(format!(
+                "verified BOOX install {} has invalid broker object path {}",
+                receipt.event_id, path
+            ));
+        }
+        None => format!("{expected_prefix}.legacy-receipt"),
+    };
+    let object_size = receipt.source_object_size.unwrap_or(0);
+    let mut metadata = BTreeMap::new();
+    metadata.insert(GENERATED_BY.to_owned(), BROKER_PRODUCER.to_owned());
+    metadata.insert(DOCUMENT_ID.to_owned(), document.document_id.clone());
+    metadata.insert(GENERATED_EVENT_ID.to_owned(), receipt.event_id.clone());
+    metadata.insert(
+        SOURCE_REVISIONS.to_owned(),
+        format!(
+            "{}:{}",
+            receipt.source_revisions.boox, receipt.source_revisions.supernote
+        ),
+    );
+    metadata.insert(CONTENT_SHA256.to_owned(), receipt.content_sha256.clone());
+    Ok(CloudObject {
+        path: object_path,
+        generation: receipt.source_generation,
+        size: object_size,
+        metadata,
+    })
+}
+
+fn record_delivered_frontier(
+    document_state: &mut DocumentTransportState,
+    revisions: RevisionPair,
+    side: DeviceSide,
+    content_sha256: String,
+) {
+    document_state.revisions = revisions;
+    document_state.side_mut(side).delivered_content_sha256 = Some(content_sha256);
+    for source in [DeviceSide::Boox, DeviceSide::Supernote] {
+        let accepted_revision = revisions.get(source);
+        let accepted_pending = document_state
+            .side(source)
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.source_revision <= accepted_revision)
+            .then(|| document_state.side_mut(source).pending.take())
+            .flatten();
+        if let Some(pending) = accepted_pending {
+            document_state
+                .side_mut(source)
+                .accepted_local_hashes
+                .insert(pending.local_path, pending.local_content_sha256);
+        }
+    }
 }
 
 fn supernote_export_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1716,7 +2335,70 @@ fn replace_existing_file_conditionally(
     }
 }
 
-fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescriptorPublication {
+    Ready,
+    Conflict,
+}
+
+fn publish_bytes_create_only_or_verify(
+    bytes: &[u8],
+    destination: &Path,
+) -> Result<DescriptorPublication, String> {
+    if let Some(metadata) = metadata_if_exists(destination)? {
+        if !metadata.is_file() {
+            return Ok(DescriptorPublication::Conflict);
+        }
+        return Ok(if descriptor_matches(bytes, destination, &metadata)? {
+            DescriptorPublication::Ready
+        } else {
+            DescriptorPublication::Conflict
+        });
+    }
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let temporary = sibling_temporary(destination, "descriptor");
+    remove_file_if_exists(&temporary)?;
+    let mut output = File::create(&temporary)
+        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+    output
+        .write_all(bytes)
+        .and_then(|_| output.flush())
+        .and_then(|_| output.sync_all())
+        .map_err(|error| format!("could not finalize {}: {error}", temporary.display()))?;
+    drop(output);
+    let published = publish_create_only(&temporary, destination)?;
+    if !published {
+        let Some(metadata) = metadata_if_exists(destination)? else {
+            return Err(format!(
+                "handoff descriptor {} disappeared after concurrent publication",
+                destination.display()
+            ));
+        };
+        if !metadata.is_file() {
+            return Ok(DescriptorPublication::Conflict);
+        }
+        if !descriptor_matches(bytes, destination, &metadata)? {
+            return Ok(DescriptorPublication::Conflict);
+        }
+    }
+    Ok(DescriptorPublication::Ready)
+}
+fn descriptor_matches(bytes: &[u8], path: &Path, metadata: &fs::Metadata) -> Result<bool, String> {
+    if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES || metadata.len() > MAX_DESCRIPTOR_BYTES {
+        return Ok(false);
+    }
+    let mut existing = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?
+        .take(MAX_DESCRIPTOR_BYTES + 1)
+        .read_to_end(&mut existing)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    Ok(existing.len() as u64 <= MAX_DESCRIPTOR_BYTES && existing == bytes)
+}
+
+pub(crate) fn publish_create_only(source: &Path, destination: &Path) -> Result<bool, String> {
     match rename_create_only(source, destination) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2121,6 +2803,27 @@ mod snapshot_tests {
             supernote_export_directory: root.join("supernote/outgoing"),
             supernote_incoming_directory: root.join("supernote/incoming"),
         }
+    }
+
+    #[test]
+    fn descriptor_comparison_rejects_oversized_existing_file() {
+        let directory = tempdir().unwrap();
+        let descriptor = directory.path().join("delivery.inkbridge.json");
+        fs::write(&descriptor, vec![b'x'; MAX_DESCRIPTOR_BYTES as usize + 1]).unwrap();
+        let metadata = fs::metadata(&descriptor).unwrap();
+
+        assert!(!descriptor_matches(b"expected", &descriptor, &metadata).unwrap());
+    }
+
+    #[test]
+    fn descriptor_comparison_bounds_file_that_grows_after_metadata_check() {
+        let directory = tempdir().unwrap();
+        let descriptor = directory.path().join("delivery.inkbridge.json");
+        fs::write(&descriptor, b"expected").unwrap();
+        let stale_metadata = fs::metadata(&descriptor).unwrap();
+        fs::write(&descriptor, vec![b'x'; MAX_DESCRIPTOR_BYTES as usize + 1]).unwrap();
+
+        assert!(!descriptor_matches(b"expected", &descriptor, &stale_metadata).unwrap());
     }
 
     #[test]

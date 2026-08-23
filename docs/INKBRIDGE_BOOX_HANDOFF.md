@@ -1,0 +1,102 @@
+# BOOX NeoReader handoff companion
+
+`boox-companion` is a small, BOOX-only Android app that transfers revisioned InkBridge PDF views into and out of NeoReader. It is not a PDF reader and does not replace NeoReader.
+
+## Why the handoff is versioned
+
+Real-device testing established two important NeoReader behaviors:
+
+1. Replacing bytes at an already-open path can display new annotations without adopting them as editable NeoReader ink.
+2. Keeping a stable copy and a revisioned copy visible can cause NeoReader to embed edits into the wrong file.
+
+The companion therefore gives every broker output a fresh filename and keeps exactly one active view for a logical document. The immediate predecessor moves into a hidden `.retired` directory while NeoReader releases it; after the companion has paused for NeoReader and then resumed from that foreground round trip, the next install safely compacts the older predecessor so retained full-PDF storage remains bounded.
+
+## Device layout
+
+The local root is `/storage/emulated/0/Documents/InkBridge`:
+
+```text
+InkBridge/
+  inkbridge-doc-v1-<original-pdf-sha256>/
+    incoming/
+      delivery.pdf
+      delivery.inkbridge.json
+    active/
+      Original__ib-b2-s4-g19.pdf
+    .retired/
+      Original__ib-b1-s4-g18.pdf
+    outgoing/
+      Original__ib-b2-s4-g19__boox-finalized-g1-<hash>.pdf
+      Original__ib-b2-s4-g19__boox-finalized-g1-<hash>.pdf.inkbridge.json
+    .inkbridge-state.json
+    .inkbridge-installed.json # durable current broker-view acknowledgement
+    .inkbridge-install.json  # present only while an install is being committed/recovered
+```
+
+The stable document ID is the broker's `inkbridge-doc-v1-<SHA-256 of immutable original PDF>`. Filenames never define identity.
+
+## Broker delivery descriptor
+
+The folder transport places a create-only PDF and JSON descriptor together in `incoming/`, publishing the descriptor last:
+
+```json
+{
+  "schemaVersion": 1,
+  "producer": "inkbridge-broker",
+  "eventId": "broker-event-123",
+  "documentId": "inkbridge-doc-v1-<64 lowercase hex characters>",
+  "originalFileName": "Example.pdf",
+  "sourceRevisions": { "boox": 2, "supernote": 4 },
+  "sourceGeneration": 19,
+  "contentSha256": "<PDF SHA-256>",
+  "pdfFileName": "broker-b00000000000000000002-s00000000000000000004-g00000000000000000019-<hash>.pdf"
+}
+```
+
+The companion validates the producer, document ID, filenames, source generation, content hash, and revision frontier before installing anything.
+
+## Safety rules
+
+- Duplicate events are idempotent and cannot create a second active PDF.
+- After an install commits, the companion atomically publishes `.inkbridge-installed.json`. The transport uses this acknowledgement to keep the current incoming PDF/descriptor as the active recovery pair while durably retiring older dominated pairs. Losing the transport checkpoint therefore cannot recreate obsolete 300–500 MB deliveries. Before trusting it, the transport matches the full event/generation/revision/hash identity against live broker metadata and persists one bounded verified-install receipt, including the broker object path, generation, and size. That receipt remains authoritative when the broker later replaces its stable cloud path with a newer generation. If the acknowledged local pair disappears, the transport downloads that exact historical Cloud Storage generation, verifies its hash, and republishes the descriptor last before processing newer deliveries. This recovery relies on the deployment's documented Cloud Storage object versioning and retention policy.
+- Incoming descriptors whose revisions are already dominated by the active frontier are ignored even after their event IDs age out of the bounded replay cache. The cache retains 64 recent byte-bounded IDs so two worst-case handoff states still fit in one crash-recovery intent.
+- Malformed descriptors and descriptor/PDF pairs that are not complete yet are skipped, allowing later valid deliveries to remain installable.
+- A stale or incomparable revision is rejected; there is no latest-file-wins behavior.
+- A storage-generation republish of the already installed revision and content is ignored before download and any equivalent staged pair is retired; a same-revision PDF with different bytes is rejected as conflicting content.
+- If NeoReader changed the active PDF, a new broker view is refused until those changes are finalized.
+- Even after finalization, the old view is retained until a new broker delivery advances the BOOX revision, proving that the broker accepted the finalized BOOX edit.
+- Incoming and outgoing PDFs are streamed, so a 500 MB PDF is never loaded wholly into memory.
+- Hashing, copying, synchronization, state recovery, and finalization run on one serialized background worker. The activity disables actions while work is running and performs only status updates and the final NeoReader launch on Android's main thread.
+- Files and state use synchronized temporary files plus create-only publication. Existing destination bytes are never overwritten, and each streamed PDF copy is hash-verified before its temporary file is published.
+- A durable install intent keeps the previous active PDF in place until the replacement PDF and state are committed. After interruption or power loss, the next companion action completes the install or safely discards an unpublished attempt before retiring the predecessor.
+- Returning to the companion after it paused for a successfully dispatched NeoReader launch records the versioned-path handoff boundary; merely preparing or dispatching the asynchronous Android intent does not. The pending target is persisted before dispatch, but a pause can be recorded only when the same in-memory tracker was armed after `startActivity` returned successfully. A process restart therefore cannot turn an unrelated permission/Home pause into a false confirmation. Once that armed pause is durably observed, the pending marker survives activity/process recreation and is cleared only after the handoff-state confirmation commits. InkBridge retains and watches at most one full predecessor PDF; the next confirmed install rechecks late bytes, publishes any final edit, and crash-safely removes the older predecessor. If the active handoff was never opened, a further install is refused instead of deleting uncertain data or growing storage without a bound.
+- Before broker acceptance, if either member of an already-finalized outgoing PDF/descriptor pair disappears, the next finalize action deterministically reconstructs the missing artifact from the unchanged active PDF and saved revision state.
+- After the broker accepts a finalized BOOX revision and the companion installs a broker view containing that revision, the transport writes a synchronized retirement marker and removes the acknowledged outgoing PDF/descriptor pair. An interrupted cleanup resumes from the marker, so normal finalizations do not accumulate full-document snapshots.
+
+## User flow
+
+1. **Install next update** validates and installs the next broker delivery at a fresh active path, then opens that exact path in NeoReader. When you later return to the companion, it records the completed foreground handoff before enabling the next operation.
+2. **Open active document in NeoReader** can reopen the current authoritative path later and renews the same durable handoff confirmation.
+3. After editing and using NeoReader's **Embed Data to PDF**, return to the companion.
+4. **Finalize BOOX changes** creates an immutable outgoing PDF and a broker `StorageEvent` sidecar.
+5. The folder transport validates both files. At the current frontier it uploads compact operations; if the finalized view is stale or concurrent, it uploads the full PDF with its original `basedOn` revisions as conflict evidence. The broker processes the event conditionally and eventually returns a newer broker delivery.
+
+The outgoing event is based on the active revision pair and advances the BOOX source revision by one. Its deterministic event ID makes repeated finalization idempotent.
+
+## Folder-transport integration
+
+Set `booxHandoffRoot` in the folder-transport configuration to the local mirror of `/storage/emulated/0/Documents/InkBridge`. The folder transport downloads broker-generated BOOX views into the matching stable-document `incoming` directory and scans finalized companion artifacts from `outgoing`. The Android app itself has no cloud credentials and performs no background upload.
+
+This milestone does not add cloud resources or change deployed broker infrastructure. Folder mirroring between the computer and BOOX remains an adapter/setup concern; the descriptor, identity, revision, and create-only publication rules do not depend on the mirroring tool.
+
+## ADB test actions
+
+The debug build exposes three explicit actions. Their intent filters exist only in the debug manifest, and release builds ignore explicit automation actions even if another app targets the launcher activity directly. Always select the physical BOOX serial when more than one Android device is connected:
+
+```powershell
+adb -s <BOOX_SERIAL> shell am start -a dev.inkbridge.boox.action.INSTALL_NEXT
+adb -s <BOOX_SERIAL> shell am start -a dev.inkbridge.boox.action.OPEN_ACTIVE
+adb -s <BOOX_SERIAL> shell am start -a dev.inkbridge.boox.action.FINALIZE_ACTIVE
+```
+
+Relevant logs use the `INKBRIDGE_BOOX_HANDOFF` tag.

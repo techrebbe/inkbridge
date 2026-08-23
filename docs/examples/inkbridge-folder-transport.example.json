@@ -5,6 +5,7 @@
   "pollSeconds": 15,
   "settleSeconds": 10,
   "statePath": ".inkbridge-folder-state.json",
+  "booxHandoffRoot": "BOOX_Device/Documents/InkBridge",
   "documents": [
     {
       "documentId": "inkbridge-doc-v1-REPLACE_WITH_ORIGINAL_PDF_SHA256",

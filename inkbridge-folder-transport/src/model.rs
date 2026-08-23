@@ -20,6 +20,11 @@ pub struct TransportConfig {
     pub settle_seconds: u64,
     #[serde(default)]
     pub state_path: PathBuf,
+    /// Local mirror of `/storage/emulated/0/Documents/InkBridge` on the BOOX.
+    /// When present, generated BOOX views use the versioned companion handoff
+    /// instead of replacing each document's legacy `booxPdf` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boox_handoff_root: Option<PathBuf>,
     pub documents: Vec<DocumentFolders>,
 }
 
@@ -64,6 +69,9 @@ impl TransportConfig {
         if config.gcloud_command.is_relative() && config.gcloud_command.components().count() > 1 {
             config.gcloud_command = base.join(&config.gcloud_command);
         }
+        if let Some(root) = &mut config.boox_handoff_root {
+            resolve_path(base, root);
+        }
         for document in &mut config.documents {
             resolve_path(base, &mut document.boox_pdf);
             resolve_path(base, &mut document.supernote_export_directory);
@@ -83,6 +91,16 @@ impl TransportConfig {
                     "configuration file {} collides with statePath or checkpoint companion {}",
                     path.display(),
                     reserved.display()
+                ));
+            }
+        }
+        if let Some(root) = &self.boox_handoff_root {
+            let root_paths = path_key_variants(root)?;
+            if path_sets_overlap(&config_paths, &root_paths) {
+                return Err(format!(
+                    "configuration file {} must be outside booxHandoffRoot {}",
+                    path.display(),
+                    root.display()
                 ));
             }
         }
@@ -143,6 +161,22 @@ impl TransportConfig {
                 }
             }
         }
+        if let Some(root) = &self.boox_handoff_root {
+            reject_boox_handoff_leaf_symlink(root)?;
+            let root_paths = path_key_variants(root)?;
+            if let Some((reserved_path, _)) = state_paths.iter().find(|(_, state)| {
+                root_paths
+                    .iter()
+                    .any(|root| key_contains_path(root, state) || key_contains_path(state, root))
+            }) {
+                return Err(format!(
+                    "statePath or companion {} must be outside booxHandoffRoot {}",
+                    reserved_path.display(),
+                    root.display()
+                ));
+            }
+            boox_paths.extend(root_paths);
+        }
         for document in &self.documents {
             if !is_stable_document_id(&document.document_id) {
                 return Err(format!(
@@ -190,6 +224,22 @@ impl TransportConfig {
             if document.original_file_name.trim().is_empty() {
                 return Err(format!(
                     "{} has an empty originalFileName",
+                    document.document_id
+                ));
+            }
+            if self.boox_handoff_root.is_some()
+                && (document.original_file_name.len() > 180
+                    || Path::new(&document.original_file_name)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        != Some(document.original_file_name.as_str())
+                    || matches!(document.original_file_name.as_str(), "." | "..")
+                    || document.original_file_name.chars().any(|character| {
+                        matches!(character, '/' | '\\' | '\0') || character.is_control()
+                    }))
+            {
+                return Err(format!(
+                    "{} originalFileName must be a safe BOOX handoff filename of at most 180 UTF-8 bytes",
                     document.document_id
                 ));
             }
@@ -322,6 +372,21 @@ fn reject_boox_leaf_symlink(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
             "could not inspect booxPdf entry {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn reject_boox_handoff_leaf_symlink(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "booxHandoffRoot {} must not be a leaf symlink; use its target path or a symlinked parent directory",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not inspect booxHandoffRoot entry {}: {error}",
             path.display()
         )),
     }
@@ -590,6 +655,8 @@ pub struct DocumentTransportState {
     pub supernote: SideTransportState,
     #[serde(default)]
     pub delivered_generations: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_boox_install: Option<VerifiedBooxInstall>,
     #[serde(default)]
     pub conflicts: BTreeSet<String>,
 }
@@ -608,6 +675,19 @@ impl DocumentTransportState {
             DeviceSide::Supernote => &mut self.supernote,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedBooxInstall {
+    pub event_id: String,
+    pub source_revisions: RevisionPair,
+    pub source_generation: u64,
+    pub content_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_object_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_object_size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -736,6 +816,7 @@ mod tests {
                 poll_seconds: 1,
                 settle_seconds: 0,
                 state_path: PathBuf::new(),
+                boox_handoff_root: None,
                 documents: vec![DocumentFolders {
                     document_id,
                     original_file_name: "book.pdf".to_owned(),
@@ -762,6 +843,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -783,6 +865,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![
                 DocumentFolders {
                     document_id: test_document_id('a'),
@@ -822,6 +905,7 @@ mod tests {
                 poll_seconds: 1,
                 settle_seconds: 0,
                 state_path: PathBuf::new(),
+                boox_handoff_root: None,
                 documents: vec![
                     DocumentFolders {
                         document_id: test_document_id('a'),
@@ -856,6 +940,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::from("boox/.book.pdf.g7.part"),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -868,6 +953,7 @@ mod tests {
 
         let supernote_collision = TransportConfig {
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -884,6 +970,7 @@ mod tests {
 
         let generation_descendant_collision = TransportConfig {
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -908,6 +995,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![
                 DocumentFolders {
                     document_id: test_document_id('a'),
@@ -941,6 +1029,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![
                 DocumentFolders {
                     document_id: test_document_id('a'),
@@ -974,6 +1063,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![
                 DocumentFolders {
                     document_id: test_document_id('a'),
@@ -1014,12 +1104,14 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![document.clone()],
         };
         assert!(boox_collision.validate().unwrap_err().contains("BOOX"));
 
         let state_collision = TransportConfig {
             state_path: PathBuf::from("supernote/.inkbridge-accepted/state.json"),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 boox_pdf: PathBuf::from("boox/book.pdf"),
                 ..document
@@ -1041,6 +1133,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![
                 DocumentFolders {
                     document_id: test_document_id('a'),
@@ -1068,6 +1161,86 @@ mod tests {
     }
 
     #[test]
+    fn configuration_rejects_overlong_file_name_when_boox_handoff_is_enabled() {
+        let mut config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::from("state.json"),
+            boox_handoff_root: Some(PathBuf::from("boox-handoff")),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: format!("{}.pdf", "a".repeat(177)),
+                boox_pdf: PathBuf::from("legacy/book.pdf"),
+                supernote_export_directory: PathBuf::from("supernote/outgoing"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+        };
+
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("at most 180 UTF-8 bytes"));
+
+        config.boox_handoff_root = None;
+        config
+            .validate()
+            .expect("the legacy path does not use the handoff filename protocol");
+    }
+
+    #[test]
+    fn configuration_load_resolves_relative_boox_handoff_root() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("inkbridge-folder-transport.json");
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::from("state.json"),
+            boox_handoff_root: Some(PathBuf::from("boox-handoff")),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: PathBuf::from("legacy/book.pdf"),
+                supernote_export_directory: PathBuf::from("supernote/outgoing"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+        };
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let loaded = TransportConfig::load(&config_path).unwrap();
+        assert_eq!(
+            loaded.boox_handoff_root,
+            Some(directory.path().join("boox-handoff"))
+        );
+    }
+
+    #[test]
+    fn configuration_rejects_supernote_directory_inside_boox_handoff_root() {
+        let config = TransportConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            bucket: "bucket".to_owned(),
+            gcloud_command: default_gcloud(),
+            poll_seconds: 1,
+            settle_seconds: 0,
+            state_path: PathBuf::from("state.json"),
+            boox_handoff_root: Some(PathBuf::from("boox-handoff")),
+            documents: vec![DocumentFolders {
+                document_id: test_document_id('a'),
+                original_file_name: "book.pdf".to_owned(),
+                boox_pdf: PathBuf::from("legacy/book.pdf"),
+                supernote_export_directory: PathBuf::from("boox-handoff/supernote/outgoing"),
+                supernote_incoming_directory: PathBuf::from("supernote/incoming"),
+            }],
+        };
+
+        assert!(config.validate().unwrap_err().contains("overlaps"));
+    }
+    #[test]
     fn configuration_load_rejects_its_file_inside_supernote_outgoing() {
         let directory = tempdir().unwrap();
         let outgoing = directory.path().join("supernote/outgoing");
@@ -1080,6 +1253,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: directory.path().join("state.json"),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -1109,6 +1283,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: directory.path().join("state.json"),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -1136,6 +1311,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path,
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -1160,6 +1336,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::from("supernote/outgoing/state.json"),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -1182,6 +1359,7 @@ mod tests {
                 poll_seconds: 1,
                 settle_seconds: 0,
                 state_path: PathBuf::from("state.json"),
+                boox_handoff_root: None,
                 documents: vec![DocumentFolders {
                     document_id: test_document_id('a'),
                     original_file_name: "book.pdf".to_owned(),
@@ -1204,6 +1382,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::from("supernote"),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -1235,6 +1414,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::from("state.json"),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -1256,6 +1436,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::from("state.json"),
+            boox_handoff_root: None,
             documents: vec![
                 DocumentFolders {
                     document_id: test_document_id('a'),
@@ -1323,6 +1504,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: directory.path().join("state.json"),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "book.pdf".to_owned(),
@@ -1360,6 +1542,7 @@ mod tests {
             poll_seconds: 1,
             settle_seconds: 0,
             state_path: PathBuf::new(),
+            boox_handoff_root: None,
             documents: vec![DocumentFolders {
                 document_id: test_document_id('a'),
                 original_file_name: "first.pdf".to_owned(),
