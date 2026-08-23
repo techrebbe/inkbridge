@@ -83,9 +83,10 @@ Full NeoReader PDFs and compact BOOX operation manifests are both supported. Com
 the same identity, geometry, style, page-bound, and fingerprint validation used by normal broker
 processing. Only operations that still match the based-on canonical stroke qualify for automatic
 safe merging.
-Because compact manifests are incremental, active conflicts from the same BOOX source must be
-resolved in source-revision order. A newer compact conflict is rejected until every earlier active
-source revision is resolved, preventing a later delta from silently superseding an earlier delta.
+Page-scoped Supernote exports and compact BOOX manifests are incremental, so active conflicts from
+either source must be resolved in source-revision order. A newer incremental conflict is rejected
+until every earlier active source revision is resolved, preventing a later page or operation delta
+from silently superseding an earlier one. Full NeoReader PDFs remain self-contained snapshots.
 
 ## Current UX boundary
 

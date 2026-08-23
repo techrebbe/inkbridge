@@ -428,7 +428,9 @@ fn ensure_incremental_conflict_resolution_order(
     state: &CanonicalDocumentState,
     conflict: &PreservedInput,
 ) -> Result<(), BrokerError> {
-    if conflict.payload_kind != DevicePayloadKind::BooxOperationManifest {
+    if conflict.source != DeviceSide::Supernote
+        && conflict.payload_kind != DevicePayloadKind::BooxOperationManifest
+    {
         return Ok(());
     }
 
