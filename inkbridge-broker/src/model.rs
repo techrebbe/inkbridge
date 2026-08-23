@@ -221,6 +221,8 @@ pub struct ConflictResolutionRecord {
     pub resolution_id: String,
     pub conflict_event_id: String,
     pub strategy: ConflictResolutionStrategy,
+    #[serde(default)]
+    pub superseded: bool,
     pub source: DeviceSide,
     pub previous_revisions: RevisionPair,
     pub resulting_revisions: RevisionPair,
@@ -249,6 +251,12 @@ pub enum ConflictResolutionOutcome {
         applied_stroke_ids: Vec<String>,
         preserved_current_stroke_ids: Vec<String>,
         outputs: Vec<GeneratedResolutionOutput>,
+    },
+    Superseded {
+        document_id: String,
+        conflict_event_id: String,
+        resolution_id: String,
+        source_revisions: RevisionPair,
     },
     Duplicate {
         document_id: String,

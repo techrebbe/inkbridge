@@ -2051,6 +2051,135 @@ fn explicit_keep_current_advances_the_rejected_source_frontier() {
 }
 
 #[test]
+fn older_same_device_conflict_is_superseded_without_rolling_back_revision() {
+    let mut harness = Harness::new();
+    let base = stroke("shared", 0.2, 0.3);
+    let initial = harness.event(
+        "sn-base-supersession",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let boox_pdf = write_boox_view(
+        &harness.original,
+        [base.clone(), stroke("boox-current", 0.55, 0.55)],
+    )
+    .unwrap();
+    let boox = harness.event(
+        "boox-current-supersession",
+        DeviceSide::Boox,
+        1,
+        common,
+        boox_pdf,
+    );
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let older = harness.event(
+        "sn-older-conflict",
+        DeviceSide::Supernote,
+        2,
+        common,
+        supernote_export(&[base.clone(), stroke("sn-older", 0.7, 0.65)]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &older)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+    let newer = harness.event(
+        "sn-newer-conflict",
+        DeviceSide::Supernote,
+        3,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        },
+        supernote_export(&[base, stroke("sn-newer", 0.8, 0.75)]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &newer)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let newer_analysis = harness
+        .broker
+        .inspect_conflict(&harness.storage, &harness.document_id, "sn-newer-conflict")
+        .unwrap();
+    let newer_request = resolution_request(
+        &harness,
+        &newer_analysis,
+        "resolve-newer-first",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &newer_request)
+        .unwrap();
+    let before_superseding = harness.state();
+    assert_eq!(
+        before_superseding.revisions(),
+        RevisionPair {
+            boox: 1,
+            supernote: 3,
+        }
+    );
+    assert_eq!(before_superseding.conflicts.len(), 1);
+
+    let older_analysis = harness
+        .broker
+        .inspect_conflict(&harness.storage, &harness.document_id, "sn-older-conflict")
+        .unwrap();
+    let older_request = resolution_request(
+        &harness,
+        &older_analysis,
+        "supersede-older",
+        ConflictResolutionStrategy::AcceptIncoming,
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &older_request)
+            .unwrap(),
+        ConflictResolutionOutcome::Superseded {
+            source_revisions: RevisionPair {
+                boox: 1,
+                supernote: 3
+            },
+            ..
+        }
+    ));
+
+    let state = harness.state();
+    assert_eq!(state.revisions(), before_superseding.revisions());
+    assert_eq!(state.strokes, before_superseding.strokes);
+    assert!(state.conflicts.is_empty());
+    let record = &state.resolved_conflicts["sn-older-conflict"];
+    assert!(record.superseded);
+    assert_eq!(record.strategy, ConflictResolutionStrategy::KeepCurrent);
+    assert!(harness
+        .storage
+        .object(&conflict_resolution_path(
+            &harness.document_id,
+            "sn-older-conflict"
+        ))
+        .is_some());
+}
+
+#[test]
 fn accept_incoming_replaces_overlaps_and_deletes_current_only_ink() {
     let mut harness = harness_with_mixed_supernote_conflict();
     let analysis = harness
@@ -2150,6 +2279,138 @@ fn stale_conflict_analysis_or_destination_cannot_commit_a_resolution() {
             "sn-concurrent"
         ))
         .is_none());
+}
+
+#[test]
+fn compact_conflict_recovers_legacy_page_count_before_validating_pages() {
+    let mut harness = Harness::new();
+    let initial = harness.event(
+        "sn-base-legacy-conflict",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("sn-current", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+    let mut legacy = harness.state();
+    legacy.original_page_count = 0;
+    harness.storage.put_unchecked(
+        state_path(&harness.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+
+    let mut invalid_page = stroke("boox-impossible-page", 0.7, 0.7);
+    invalid_page.page_index = 1;
+    let mut event = harness.event(
+        "boox-legacy-invalid-page-conflict",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: invalid_page.source_uuid.clone(),
+                page_index: invalid_page.page_index,
+                before: None,
+                after: invalid_page,
+            }],
+            2,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &event)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    assert!(matches!(
+        harness.broker.inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-legacy-invalid-page-conflict",
+        ),
+        Err(BrokerError::InvalidEvent(message))
+            if message.contains("page count 2 does not match original page count 1")
+    ));
+}
+
+#[test]
+fn resolving_valid_compact_conflict_persists_recovered_legacy_page_count() {
+    let mut harness = Harness::new();
+    let initial = harness.event(
+        "sn-base-legacy-valid-conflict",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("sn-current", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+    let mut legacy = harness.state();
+    legacy.original_page_count = 0;
+    harness.storage.put_unchecked(
+        state_path(&harness.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+
+    let snapshot = stroke("boox-valid-page", 0.7, 0.7);
+    let mut event = harness.event(
+        "boox-legacy-valid-page-conflict",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: snapshot.source_uuid.clone(),
+                page_index: snapshot.page_index,
+                before: None,
+                after: snapshot,
+            }],
+            1,
+        ),
+    );
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-legacy-valid-page-conflict",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-legacy-valid-page",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(state.original_page_count, 1);
+    assert_eq!(
+        state.revisions(),
+        RevisionPair {
+            boox: 1,
+            supernote: 1,
+        }
+    );
 }
 
 #[test]

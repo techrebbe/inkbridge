@@ -1,8 +1,8 @@
 use crate::broker::{
-    add_newline, apply_manifest, decode_state, destination_precondition, event_path_segment,
-    normalize_supernote_pen_color, output_metadata, refresh_manifest_id, state_write,
-    valid_supernote_native_style, write_baselines, GENERATED_BY_KEY, GENERATED_DOCUMENT_KEY,
-    GENERATED_EVENT_KEY,
+    add_newline, apply_manifest, decode_state, destination_precondition,
+    ensure_original_page_count, event_path_segment, normalize_supernote_pen_color, output_metadata,
+    refresh_manifest_id, state_write, valid_supernote_native_style, write_baselines,
+    GENERATED_BY_KEY, GENERATED_DOCUMENT_KEY, GENERATED_EVENT_KEY,
 };
 use crate::model::*;
 use crate::pdf_view::write_boox_view_with_tombstones_owned;
@@ -129,6 +129,11 @@ impl Broker {
 
         let context =
             load_context_from_state(storage, state_object, state, &request.conflict_event_id)?;
+        if context.conflict.source_revision < context.state.device(context.conflict.source).revision
+        {
+            return supersede_conflict(storage, context, request);
+        }
+
         let proposed = self.proposed_conflict_manifest(
             &context.state,
             &context.conflict,
@@ -277,6 +282,7 @@ impl Broker {
             resolution_id: request.resolution_id.clone(),
             conflict_event_id: request.conflict_event_id.clone(),
             strategy: request.strategy,
+            superseded: false,
             source: context.conflict.source,
             previous_revisions,
             resulting_revisions,
@@ -409,6 +415,79 @@ pub fn conflict_resolution_path(document_id: &str, conflict_event_id: &str) -> S
     )
 }
 
+fn supersede_conflict<S: BrokerStorage>(
+    storage: &mut S,
+    context: ConflictContext,
+    request: &ConflictResolutionRequest,
+) -> Result<ConflictResolutionOutcome, BrokerError> {
+    let mut state = context.state;
+    let revisions = state.revisions();
+    state
+        .processed_event_ids
+        .insert(request.resolution_id.clone());
+    state.state_revision += 1;
+    state
+        .conflicts
+        .retain(|conflict| conflict.event_id != request.conflict_event_id);
+
+    let marker_path = conflict_resolution_path(&request.document_id, &request.conflict_event_id);
+    let record = ConflictResolutionRecord {
+        resolution_id: request.resolution_id.clone(),
+        conflict_event_id: request.conflict_event_id.clone(),
+        strategy: ConflictResolutionStrategy::KeepCurrent,
+        superseded: true,
+        source: context.conflict.source,
+        previous_revisions: revisions,
+        resulting_revisions: revisions,
+        applied_stroke_ids: Vec::new(),
+        preserved_current_stroke_ids: Vec::new(),
+        marker_path: marker_path.clone(),
+    };
+    state
+        .resolved_conflicts
+        .insert(request.conflict_event_id.clone(), record.clone());
+    let marker_bytes = add_newline(
+        serde_json::to_vec_pretty(&record)
+            .map_err(|error| BrokerError::CorruptState(error.to_string()))?,
+    );
+    storage
+        .commit(vec![
+            ConditionalWrite {
+                path: marker_path,
+                bytes: blob(marker_bytes),
+                metadata: BTreeMap::from([
+                    (GENERATED_BY_KEY.to_owned(), BROKER_PRODUCER.to_owned()),
+                    (
+                        GENERATED_DOCUMENT_KEY.to_owned(),
+                        request.document_id.clone(),
+                    ),
+                    (
+                        GENERATED_EVENT_KEY.to_owned(),
+                        request.resolution_id.clone(),
+                    ),
+                    ("inkbridge-kind".to_owned(), RESOLUTION_KIND.to_owned()),
+                    (
+                        "inkbridge-conflict-event-id".to_owned(),
+                        request.conflict_event_id.clone(),
+                    ),
+                ]),
+                precondition: GenerationPrecondition::DoesNotExist,
+            },
+            state_write(
+                &state_path(&request.document_id),
+                &state,
+                GenerationPrecondition::Match(context.state_object.generation),
+            )?,
+        ])
+        .map_err(BrokerError::ConditionalWrite)?;
+
+    Ok(ConflictResolutionOutcome::Superseded {
+        document_id: request.document_id.clone(),
+        conflict_event_id: request.conflict_event_id.clone(),
+        resolution_id: request.resolution_id.clone(),
+        source_revisions: revisions,
+    })
+}
 fn load_context<S: BrokerStorage>(
     storage: &S,
     document_id: &str,
@@ -427,7 +506,7 @@ fn load_context<S: BrokerStorage>(
 fn load_context_from_state<S: BrokerStorage>(
     storage: &S,
     state_object: StoredObject,
-    state: CanonicalDocumentState,
+    mut state: CanonicalDocumentState,
     conflict_event_id: &str,
 ) -> Result<ConflictContext, BrokerError> {
     let conflict = state
@@ -441,6 +520,11 @@ fn load_context_from_state<S: BrokerStorage>(
                 state.document_id
             ))
         })?;
+    if conflict.source == DeviceSide::Boox
+        && conflict.payload_kind == DevicePayloadKind::BooxOperationManifest
+    {
+        ensure_original_page_count(storage, &mut state)?;
+    }
     let input = storage
         .read(&conflict.preserved_path)
         .map_err(BrokerError::Storage)?

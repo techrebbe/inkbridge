@@ -281,29 +281,8 @@ impl Broker {
                 &source.bytes,
             );
         }
-        if event.payload_kind == DevicePayloadKind::BooxOperationManifest
-            && state.original_page_count == 0
-        {
-            let original = storage
-                .read(&state.original_object_path)
-                .map_err(BrokerError::Storage)?
-                .ok_or_else(|| BrokerError::MissingObject(state.original_object_path.clone()))?;
-            if sha256_hex(&original.bytes) != state.original_pdf_sha256 {
-                return Err(BrokerError::CorruptState(
-                    "immutable original PDF hash changed".to_owned(),
-                ));
-            }
-            let document = lopdf::Document::load_mem(&original.bytes).map_err(|error| {
-                BrokerError::CorruptState(format!(
-                    "immutable original is not a readable PDF: {error}"
-                ))
-            })?;
-            state.original_page_count = document.get_pages().len();
-            if state.original_page_count == 0 {
-                return Err(BrokerError::CorruptState(
-                    "immutable original PDF contains no pages".to_owned(),
-                ));
-            }
+        if event.payload_kind == DevicePayloadKind::BooxOperationManifest {
+            ensure_original_page_count(storage, &mut state)?;
         }
 
         let source_bytes = source.bytes;
@@ -1096,6 +1075,33 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, Broke
     Ok(state)
 }
 
+pub(crate) fn ensure_original_page_count<S: BrokerStorage>(
+    storage: &S,
+    state: &mut CanonicalDocumentState,
+) -> Result<(), BrokerError> {
+    if state.original_page_count != 0 {
+        return Ok(());
+    }
+    let original = storage
+        .read(&state.original_object_path)
+        .map_err(BrokerError::Storage)?
+        .ok_or_else(|| BrokerError::MissingObject(state.original_object_path.clone()))?;
+    if sha256_hex(&original.bytes) != state.original_pdf_sha256 {
+        return Err(BrokerError::CorruptState(
+            "immutable original PDF hash changed".to_owned(),
+        ));
+    }
+    let document = lopdf::Document::load_mem(&original.bytes).map_err(|error| {
+        BrokerError::CorruptState(format!("immutable original is not a readable PDF: {error}"))
+    })?;
+    state.original_page_count = document.get_pages().len();
+    if state.original_page_count == 0 {
+        return Err(BrokerError::CorruptState(
+            "immutable original PDF contains no pages".to_owned(),
+        ));
+    }
+    Ok(())
+}
 pub(crate) fn add_newline(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.push(b'\n');
     bytes
