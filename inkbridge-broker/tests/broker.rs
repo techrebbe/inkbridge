@@ -2228,6 +2228,116 @@ fn merge_preserving_current_applies_safe_changes_and_is_idempotent() {
 }
 
 #[test]
+fn supernote_conflict_without_a_filename_preserves_the_tracked_name() {
+    let mut harness = Harness::new();
+    let shared = stroke("shared-renamed-document", 0.2, 0.3);
+    let mut renamed_export = serde_json::from_slice::<serde_json::Value>(&supernote_export(
+        std::slice::from_ref(&shared),
+    ))
+    .unwrap();
+    renamed_export["sourceFileName"] = json!("renamed-on-supernote.pdf");
+    let initial = harness.event(
+        "sn-renamed-document",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        serde_json::to_vec(&renamed_export).unwrap(),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+    assert_eq!(
+        harness.state().supernote.source_file_name.as_deref(),
+        Some("renamed-on-supernote.pdf")
+    );
+
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let boox_pdf = write_boox_view(
+        &harness.original,
+        [
+            shared.clone(),
+            stroke("boox-current-renamed-document", 0.55, 0.55),
+        ],
+    )
+    .unwrap();
+    let boox = harness.event(
+        "boox-current-renamed-document",
+        DeviceSide::Boox,
+        1,
+        common,
+        boox_pdf,
+    );
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let mut unnamed_export = serde_json::from_slice::<serde_json::Value>(&supernote_export(&[
+        shared,
+        stroke("sn-new-renamed-document", 0.75, 0.7),
+    ]))
+    .unwrap();
+    unnamed_export
+        .as_object_mut()
+        .unwrap()
+        .remove("sourceFileName");
+    let conflict = harness.event(
+        "sn-unnamed-conflict",
+        DeviceSide::Supernote,
+        2,
+        common,
+        serde_json::to_vec(&unnamed_export).unwrap(),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &conflict)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-unnamed-conflict",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-unnamed-supernote-conflict",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    assert_eq!(
+        harness.state().supernote.source_file_name.as_deref(),
+        Some("renamed-on-supernote.pdf")
+    );
+    let manifest: Manifest = serde_json::from_slice(
+        &harness
+            .storage
+            .object(&supernote_manifest_path(
+                &harness.document_id,
+                "resolve-unnamed-supernote-conflict",
+            ))
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(
+        manifest.document.target_file_names,
+        vec!["renamed-on-supernote.pdf"]
+    );
+}
+
+#[test]
 fn explicit_keep_current_advances_the_rejected_source_frontier() {
     let mut harness = harness_with_mixed_supernote_conflict();
     let expected = harness.state();

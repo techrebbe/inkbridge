@@ -798,6 +798,7 @@ fn supernote_export_manifest(
         document: DocumentIdentity {
             source_file_name: export
                 .source_file_name
+                .or_else(|| state.supernote.source_file_name.clone())
                 .unwrap_or_else(|| state.original_file_name.clone()),
             target_file_names: vec![state.original_file_name.clone()],
             page_count: state.original_page_count,
