@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GENERATED_BY: &str = "inkbridge-generated-by";
+const GENERATED_EVENT_ID: &str = "inkbridge-event-id";
 const DOCUMENT_ID: &str = "inkbridge-document-id";
 const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
 const SOURCE_REVISION: &str = "inkbridge-source-revision";
@@ -436,6 +437,84 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         Ok(identity)
     }
 
+    fn restore_verified_boox_install_pair(
+        &self,
+        endpoint: &BooxHandoffEndpoint,
+        document: &DocumentFolders,
+        receipt: &VerifiedBooxInstall,
+        state: &mut TransportState,
+    ) -> Result<(), String> {
+        let object = verified_boox_install_object(receipt, document)?;
+        let delivery = endpoint.prepare_delivery(
+            document,
+            &object,
+            receipt.source_revisions,
+            &receipt.content_sha256,
+        )?;
+        if delivery.event_id != receipt.event_id {
+            return Err(format!(
+                "verified BOOX install {} reconstructed a different delivery identity",
+                receipt.event_id
+            ));
+        }
+
+        let descriptor_was_missing = metadata_if_exists(&delivery.descriptor_path)?.is_none();
+        if !descriptor_was_missing
+            && publish_bytes_create_only_or_verify(
+                &delivery.descriptor_bytes,
+                &delivery.descriptor_path,
+            )? == DescriptorPublication::Conflict
+        {
+            return Err(format!(
+                "verified BOOX recovery descriptor {} has unexpected content and was preserved for inspection",
+                delivery.descriptor_path.display()
+            ));
+        }
+
+        let pdf_metadata = metadata_if_exists(&delivery.pdf_path)?;
+        let pdf_is_ready = pdf_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file())
+            && sha256_file(&delivery.pdf_path).is_ok_and(|hash| hash == receipt.content_sha256);
+        if !pdf_is_ready {
+            if pdf_metadata.is_some() {
+                return Err(format!(
+                    "verified BOOX recovery PDF {} has unexpected content and was preserved for inspection",
+                    delivery.pdf_path.display()
+                ));
+            }
+            if receipt.source_object_path.is_none() || receipt.source_object_size.is_none() {
+                return Err(format!(
+                    "verified BOOX install {} predates recoverable broker object receipts and its local recovery PDF is missing",
+                    receipt.event_id
+                ));
+            }
+            if !self.download_verified(&object, &delivery.pdf_path, Some(&FileIdentity::Missing))? {
+                return Err(format!(
+                    "verified BOOX recovery PDF {} changed while its historical generation was downloading",
+                    delivery.pdf_path.display()
+                ));
+            }
+            remember_file_hash(
+                &delivery.pdf_path,
+                state,
+                SystemTime::now(),
+                &receipt.content_sha256,
+            )?;
+        }
+
+        if publish_bytes_create_only_or_verify(
+            &delivery.descriptor_bytes,
+            &delivery.descriptor_path,
+        )? == DescriptorPublication::Conflict
+        {
+            return Err(format!(
+                "verified BOOX recovery descriptor {} has unexpected content and was preserved for inspection",
+                delivery.descriptor_path.display()
+            ));
+        }
+        Ok(())
+    }
     fn deliver_outputs(
         &self,
         document: &DocumentFolders,
@@ -495,36 +574,51 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             boox_handoff_endpoint.as_ref(),
             installed_boox_delivery.as_ref(),
         ) {
-            let verified_identity = verified_boox_install(installed);
             let matches_durable_receipt = state
                 .documents
                 .get(&document.document_id)
                 .and_then(|document_state| document_state.verified_boox_install.as_ref())
-                == Some(&verified_identity);
-            let matches_live_broker_output = candidates.iter().any(|(side, object, revisions)| {
+                .is_some_and(|receipt| verified_boox_install_matches_ack(receipt, installed));
+            let live_broker_output = candidates.iter().find_map(|(side, object, revisions)| {
                 if *side != DeviceSide::Boox
                     || *revisions != installed.source_revisions
                     || object.generation != installed.source_generation
                 {
-                    return false;
+                    return None;
                 }
                 let Ok(expected_hash) = required_metadata(object, CONTENT_SHA256) else {
-                    return false;
+                    return None;
                 };
                 if expected_hash != installed.content_sha256 {
-                    return false;
+                    return None;
                 }
-                endpoint
+                if endpoint
                     .prepare_delivery(document, object, *revisions, expected_hash)
                     .is_ok_and(|delivery| delivery.event_id == installed.event_id)
+                {
+                    Some(object.clone())
+                } else {
+                    None
+                }
             });
-            installed_is_verified = matches_durable_receipt || matches_live_broker_output;
+            installed_is_verified = matches_durable_receipt || live_broker_output.is_some();
             if installed_is_verified {
-                if matches_live_broker_output {
+                if let Some(object) = live_broker_output.as_ref() {
                     state
                         .document_mut(&document.document_id)
-                        .verified_boox_install = Some(verified_identity);
+                        .verified_boox_install = Some(verified_boox_install(installed, object));
                 }
+                let receipt = state
+                    .documents
+                    .get(&document.document_id)
+                    .and_then(|document_state| document_state.verified_boox_install.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "verified BOOX acknowledgement {} has no durable receipt",
+                            installed.event_id
+                        )
+                    })?;
+                self.restore_verified_boox_install_pair(endpoint, document, &receipt, state)?;
                 endpoint.retire_superseded_incoming(document, installed)?;
                 let current = state.document_mut(&document.document_id).revisions;
                 let known_content_hash = state
@@ -880,7 +974,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 .documents
                 .get(&document.document_id)
                 .and_then(|document_state| document_state.verified_boox_install.as_ref())
-                == Some(&verified_boox_install(installed))
+                .is_some_and(|receipt| verified_boox_install_matches_ack(receipt, installed))
         });
         for artifact in endpoint.finalized_artifacts(document)? {
             let local_key = canonical_path_key(&artifact.pdf_path);
@@ -1672,13 +1766,66 @@ fn dominates(candidate: RevisionPair, current: RevisionPair) -> bool {
     candidate.boox >= current.boox && candidate.supernote >= current.supernote
 }
 
-fn verified_boox_install(installed: &InstalledBooxDelivery) -> VerifiedBooxInstall {
+fn verified_boox_install(
+    installed: &InstalledBooxDelivery,
+    object: &CloudObject,
+) -> VerifiedBooxInstall {
     VerifiedBooxInstall {
         event_id: installed.event_id.clone(),
         source_revisions: installed.source_revisions,
         source_generation: installed.source_generation,
         content_sha256: installed.content_sha256.clone(),
+        source_object_path: Some(object.path.clone()),
+        source_object_size: Some(object.size),
     }
+}
+
+fn verified_boox_install_matches_ack(
+    receipt: &VerifiedBooxInstall,
+    installed: &InstalledBooxDelivery,
+) -> bool {
+    receipt.event_id == installed.event_id
+        && receipt.source_revisions == installed.source_revisions
+        && receipt.source_generation == installed.source_generation
+        && receipt.content_sha256 == installed.content_sha256
+}
+
+fn verified_boox_install_object(
+    receipt: &VerifiedBooxInstall,
+    document: &DocumentFolders,
+) -> Result<CloudObject, String> {
+    let expected_prefix = format!("BOOX_Folder/{}/", document.document_id);
+    let object_path = match receipt.source_object_path.as_deref() {
+        Some(path) if path.starts_with(&expected_prefix) && path != expected_prefix => {
+            path.to_owned()
+        }
+        Some(path) => {
+            return Err(format!(
+                "verified BOOX install {} has invalid broker object path {}",
+                receipt.event_id, path
+            ));
+        }
+        None => format!("{expected_prefix}.legacy-receipt"),
+    };
+    let object_size = receipt.source_object_size.unwrap_or(0);
+    let mut metadata = BTreeMap::new();
+    metadata.insert(GENERATED_BY.to_owned(), BROKER_PRODUCER.to_owned());
+    metadata.insert(DOCUMENT_ID.to_owned(), document.document_id.clone());
+    metadata.insert(GENERATED_EVENT_ID.to_owned(), receipt.event_id.clone());
+    metadata.insert(
+        SOURCE_REVISIONS.to_owned(),
+        format!(
+            "{}:{}",
+            receipt.source_revisions.boox, receipt.source_revisions.supernote
+        ),
+    );
+    metadata.insert(CONTENT_SHA256.to_owned(), receipt.content_sha256.clone());
+    Ok(CloudObject {
+        path: object_path,
+        generation: receipt.source_generation,
+        size: object_size,
+        metadata,
+    })
 }
 
 fn record_delivered_frontier(

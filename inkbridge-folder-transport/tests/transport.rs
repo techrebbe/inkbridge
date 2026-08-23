@@ -28,6 +28,7 @@ const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 #[derive(Default)]
 struct FakeCloud {
     objects: Mutex<Vec<(CloudObject, Vec<u8>)>>,
+    historical_objects: Mutex<Vec<(CloudObject, Vec<u8>)>>,
     next_generation: Mutex<u64>,
     downloads: Mutex<u64>,
 }
@@ -48,10 +49,20 @@ impl FakeCloud {
     }
 
     fn replace_live(&self, path: &str, bytes: Vec<u8>, metadata: BTreeMap<String, String>) {
-        self.objects
-            .lock()
-            .unwrap()
-            .retain(|(object, _)| object.path != path);
+        let replaced = {
+            let mut objects = self.objects.lock().unwrap();
+            let mut replaced = Vec::new();
+            let mut index = 0;
+            while index < objects.len() {
+                if objects[index].0.path == path {
+                    replaced.push(objects.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            replaced
+        };
+        self.historical_objects.lock().unwrap().extend(replaced);
         self.put(path, bytes, metadata);
     }
 }
@@ -91,12 +102,17 @@ impl CloudFolder for FakeCloud {
     fn download(&self, object: &CloudObject, destination: &Path) -> Result<(), String> {
         *self.downloads.lock().unwrap() += 1;
         let objects = self.objects.lock().unwrap();
-        let (_, bytes) = objects
+        let historical_objects = self.historical_objects.lock().unwrap();
+        let bytes = objects
             .iter()
+            .chain(historical_objects.iter())
             .find(|(candidate, _)| {
                 candidate.path == object.path && candidate.generation == object.generation
             })
-            .ok_or_else(|| "missing fake object".to_owned())?;
+            .map(|(_, bytes)| bytes.clone())
+            .ok_or_else(|| "missing fake object generation".to_owned())?;
+        drop(historical_objects);
+        drop(objects);
         fs::write(destination, bytes).map_err(|error| error.to_string())
     }
 }
@@ -486,7 +502,7 @@ fn installed_boox_ack_bounds_incoming_history_and_recovers_lost_checkpoint() {
 }
 
 #[test]
-fn verified_installed_ack_survives_live_broker_generation_replacement() {
+fn verified_installed_ack_restores_its_pair_after_live_broker_generation_replacement() {
     let root = tempdir().unwrap();
     let handoff_root = root.path().join("boox-handoff");
     let state_path = root.path().join("transport-state.json");
@@ -520,16 +536,30 @@ fn verified_installed_ack_survives_live_broker_generation_replacement() {
     transport
         .sync_document(&document, &mut state, SystemTime::now())
         .unwrap();
+    let verified_install = state.documents[&document.document_id]
+        .verified_boox_install
+        .as_ref()
+        .unwrap();
     assert_eq!(
-        state.documents[&document.document_id]
-            .verified_boox_install
-            .as_ref()
-            .unwrap()
-            .event_id,
+        verified_install.event_id,
         format!("broker-event-{first_hash}")
+    );
+    assert_eq!(
+        verified_install.source_object_path.as_deref(),
+        Some(object_path.as_str())
+    );
+    assert_eq!(
+        verified_install.source_object_size,
+        Some(first.len() as u64)
     );
     state.save(&state_path).unwrap();
     state = TransportState::load(&state_path).unwrap();
+
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    for entry in fs::read_dir(&incoming).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    assert_eq!(fs::read_dir(&incoming).unwrap().count(), 0);
 
     let second = b"replacement live broker PDF".to_vec();
     cloud.replace_live(
@@ -565,8 +595,99 @@ fn verified_installed_ack_survives_live_broker_generation_replacement() {
         format!("broker-event-{first_hash}"),
         "the durable receipt remains valid after the cloud path advances"
     );
+    let incoming_entries = fs::read_dir(&incoming)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        incoming_entries.len(),
+        4,
+        "the acknowledged recovery pair and the newer uninstalled pair must both exist"
+    );
+    assert!(incoming_entries.iter().any(|path| {
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&first_hash[..12])
+    }));
+    assert_eq!(
+        *cloud.downloads.lock().unwrap(),
+        3,
+        "the lost acknowledged PDF must be restored from its historical generation before the newer live view is delivered"
+    );
 }
 
+#[test]
+fn legacy_verified_ack_with_intact_pair_does_not_block_new_delivery() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let state_path = root.path().join("transport-state.json");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let object_path = format!("BOOX_Folder/{}/book.pdf", document.document_id);
+    let first = b"legacy receipt broker PDF".to_vec();
+    let first_hash = sha256_hex(&first);
+    cloud.put(
+        &object_path,
+        first.clone(),
+        generated_metadata(&document.document_id, "0:1", &first),
+    );
+    let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    write_installed_boox_ack(
+        &handoff_root,
+        &document,
+        &format!("broker-event-{first_hash}"),
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        1,
+        &first_hash,
+    );
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    let receipt = state
+        .documents
+        .get_mut(&document.document_id)
+        .unwrap()
+        .verified_boox_install
+        .as_mut()
+        .unwrap();
+    receipt.source_object_path = None;
+    receipt.source_object_size = None;
+    state.save(&state_path).unwrap();
+    state = TransportState::load(&state_path).unwrap();
+
+    let second = b"newer broker PDF after legacy receipt".to_vec();
+    cloud.replace_live(
+        &object_path,
+        second.clone(),
+        generated_metadata(&document.document_id, "0:2", &second),
+    );
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            generation: 2,
+            ..
+        }
+    )));
+    assert_eq!(
+        *cloud.downloads.lock().unwrap(),
+        2,
+        "an intact legacy recovery pair must not require historical object identity"
+    );
+}
 #[test]
 fn unverified_installed_ack_does_not_advance_frontier_or_block_real_delivery() {
     let root = tempdir().unwrap();

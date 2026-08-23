@@ -684,6 +684,10 @@ pub struct VerifiedBooxInstall {
     pub source_revisions: RevisionPair,
     pub source_generation: u64,
     pub content_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_object_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_object_size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
