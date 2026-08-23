@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const BROKER_PRODUCER: &str = "inkbridge-broker";
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
+pub const RESOLUTION_SCHEMA_VERSION: u32 = 1;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -138,6 +139,8 @@ pub struct PreservedInput {
     pub event_id: String,
     pub source: DeviceSide,
     pub object_path: String,
+    #[serde(default)]
+    pub payload_kind: DevicePayloadKind,
     pub preserved_path: String,
     #[serde(default)]
     pub competing_preserved_paths: Vec<String>,
@@ -146,6 +149,112 @@ pub struct PreservedInput {
     pub content_sha256: String,
     pub based_on: RevisionPair,
     pub current_revisions: RevisionPair,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictResolutionStrategy {
+    KeepCurrent,
+    AcceptIncoming,
+    MergePreservingCurrent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictChangeKind {
+    Add,
+    Update,
+    Delete,
+    Move,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictStrokeChange {
+    pub stroke_id: String,
+    pub kind: ConflictChangeKind,
+    pub page_index: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictAnalysis {
+    pub document_id: String,
+    pub conflict_event_id: String,
+    pub source: DeviceSide,
+    pub source_revision: u64,
+    pub based_on: RevisionPair,
+    pub current_revisions: RevisionPair,
+    pub state_revision: u64,
+    pub safe_changes: Vec<ConflictStrokeChange>,
+    pub overlapping_changes: Vec<ConflictStrokeChange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictSummary {
+    pub document_id: String,
+    pub conflict_event_id: String,
+    pub source: DeviceSide,
+    pub source_revision: u64,
+    pub based_on: RevisionPair,
+    pub current_revisions: RevisionPair,
+    pub state_revision: u64,
+    pub payload_kind: DevicePayloadKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictResolutionRequest {
+    pub schema_version: u32,
+    pub resolution_id: String,
+    pub document_id: String,
+    pub conflict_event_id: String,
+    pub expected_state_revision: u64,
+    pub expected_current_revisions: RevisionPair,
+    pub strategy: ConflictResolutionStrategy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictResolutionRecord {
+    pub resolution_id: String,
+    pub conflict_event_id: String,
+    pub strategy: ConflictResolutionStrategy,
+    pub source: DeviceSide,
+    pub previous_revisions: RevisionPair,
+    pub resulting_revisions: RevisionPair,
+    pub applied_stroke_ids: Vec<String>,
+    pub preserved_current_stroke_ids: Vec<String>,
+    pub marker_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedResolutionOutput {
+    pub side: DeviceSide,
+    pub object_path: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ConflictResolutionOutcome {
+    Resolved {
+        document_id: String,
+        conflict_event_id: String,
+        resolution_id: String,
+        strategy: ConflictResolutionStrategy,
+        source_revisions: RevisionPair,
+        applied_stroke_ids: Vec<String>,
+        preserved_current_stroke_ids: Vec<String>,
+        outputs: Vec<GeneratedResolutionOutput>,
+    },
+    Duplicate {
+        document_id: String,
+        conflict_event_id: String,
+        resolution_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -172,6 +281,8 @@ pub struct CanonicalDocumentState {
     pub generated_views: BTreeMap<String, GeneratedView>,
     #[serde(default)]
     pub conflicts: Vec<PreservedInput>,
+    #[serde(default)]
+    pub resolved_conflicts: BTreeMap<String, ConflictResolutionRecord>,
 }
 
 impl CanonicalDocumentState {

@@ -1,5 +1,6 @@
 mod boox_handoff;
 mod companion;
+mod conflicts;
 mod gcloud;
 mod model;
 mod transport;

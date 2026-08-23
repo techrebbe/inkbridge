@@ -1801,3 +1801,666 @@ fn real_device_manifest_is_byte_identical_to_proven_converter_output() {
         .bytes;
     assert_eq!(actual.as_ref(), expected.as_slice());
 }
+
+fn harness_with_mixed_supernote_conflict() -> Harness {
+    let mut harness = Harness::new();
+    let initial = harness.event(
+        "sn-base",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("shared", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let current_pdf = write_boox_view(
+        &harness.original,
+        [
+            stroke("shared", 0.35, 0.3),
+            stroke("boox-current", 0.55, 0.55),
+        ],
+    )
+    .unwrap();
+    let current = harness.event("boox-current", DeviceSide::Boox, 1, common, current_pdf);
+    harness
+        .broker
+        .process(&mut harness.storage, &current)
+        .unwrap();
+
+    let incoming = harness.event(
+        "sn-concurrent",
+        DeviceSide::Supernote,
+        2,
+        common,
+        supernote_export(&[stroke("shared", 0.2, 0.45), stroke("sn-new", 0.75, 0.7)]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &incoming)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+    harness
+}
+
+fn resolution_request(
+    harness: &Harness,
+    analysis: &ConflictAnalysis,
+    id: &str,
+    strategy: ConflictResolutionStrategy,
+) -> ConflictResolutionRequest {
+    ConflictResolutionRequest {
+        schema_version: RESOLUTION_SCHEMA_VERSION,
+        resolution_id: id.to_owned(),
+        document_id: harness.document_id.clone(),
+        conflict_event_id: analysis.conflict_event_id.clone(),
+        expected_state_revision: analysis.state_revision,
+        expected_current_revisions: analysis.current_revisions,
+        strategy,
+    }
+}
+
+#[test]
+fn conflict_inspection_separates_safe_changes_from_overlaps() {
+    let harness = harness_with_mixed_supernote_conflict();
+    let analysis = harness
+        .broker
+        .inspect_conflict(&harness.storage, &harness.document_id, "sn-concurrent")
+        .unwrap();
+    let summaries = harness
+        .broker
+        .list_conflicts(&harness.storage, &harness.document_id)
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].conflict_event_id, "sn-concurrent");
+    assert_eq!(summaries[0].current_revisions, analysis.current_revisions);
+    assert_eq!(summaries[0].state_revision, analysis.state_revision);
+
+    assert_eq!(
+        analysis.current_revisions,
+        RevisionPair {
+            boox: 1,
+            supernote: 1
+        }
+    );
+    assert_eq!(
+        analysis.based_on,
+        RevisionPair {
+            boox: 0,
+            supernote: 1
+        }
+    );
+    assert_eq!(
+        analysis
+            .safe_changes
+            .iter()
+            .map(|change| (change.stroke_id.as_str(), change.kind))
+            .collect::<Vec<_>>(),
+        vec![("sn-new", ConflictChangeKind::Add)]
+    );
+    assert_eq!(
+        analysis
+            .overlapping_changes
+            .iter()
+            .map(|change| change.stroke_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["boox-current", "shared"])
+    );
+}
+
+#[test]
+fn merge_preserving_current_applies_safe_changes_and_is_idempotent() {
+    let mut harness = harness_with_mixed_supernote_conflict();
+    let before = harness.state();
+    let preserved_path = before.conflicts[0].preserved_path.clone();
+    let expected_shared = before.strokes["shared"].snapshot.clone();
+    let expected_current = before.strokes["boox-current"].snapshot.clone();
+    let analysis = harness
+        .broker
+        .inspect_conflict(&harness.storage, &harness.document_id, "sn-concurrent")
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-merge",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+
+    let outcome = harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+    let ConflictResolutionOutcome::Resolved {
+        source_revisions,
+        applied_stroke_ids,
+        preserved_current_stroke_ids,
+        outputs,
+        ..
+    } = outcome
+    else {
+        panic!("first resolution was not applied")
+    };
+    assert_eq!(
+        source_revisions,
+        RevisionPair {
+            boox: 1,
+            supernote: 2
+        }
+    );
+    assert_eq!(applied_stroke_ids, vec!["sn-new"]);
+    assert_eq!(
+        preserved_current_stroke_ids
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["boox-current".to_owned(), "shared".to_owned()])
+    );
+    assert_eq!(outputs.len(), 2);
+
+    let state = harness.state();
+    assert_eq!(
+        state.revisions(),
+        RevisionPair {
+            boox: 1,
+            supernote: 2
+        }
+    );
+    assert!(state.conflicts.is_empty());
+    assert!(harness
+        .broker
+        .list_conflicts(&harness.storage, &harness.document_id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(state.strokes["shared"].snapshot, expected_shared);
+    assert_eq!(state.strokes["boox-current"].snapshot, expected_current);
+    assert!(state.strokes.contains_key("sn-new"));
+    assert!(harness.storage.object(&preserved_path).is_some());
+    let marker_path = conflict_resolution_path(&harness.document_id, "sn-concurrent");
+    let marker = harness.storage.object(&marker_path).unwrap();
+    assert_eq!(
+        marker.metadata.get("inkbridge-kind").map(String::as_str),
+        Some("conflict-resolution")
+    );
+
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &request)
+            .unwrap(),
+        ConflictResolutionOutcome::Duplicate { .. }
+    ));
+}
+
+#[test]
+fn explicit_keep_current_advances_the_rejected_source_frontier() {
+    let mut harness = harness_with_mixed_supernote_conflict();
+    let expected = harness.state();
+    let analysis = harness
+        .broker
+        .inspect_conflict(&harness.storage, &harness.document_id, "sn-concurrent")
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-keep-current",
+        ConflictResolutionStrategy::KeepCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(
+        state.revisions(),
+        RevisionPair {
+            boox: 1,
+            supernote: 2
+        }
+    );
+    assert_eq!(state.strokes, expected.strokes);
+    assert!(state.conflicts.is_empty());
+
+    let reconciled = harness.event(
+        "sn-after-resolution",
+        DeviceSide::Supernote,
+        3,
+        RevisionPair {
+            boox: 1,
+            supernote: 2,
+        },
+        supernote_export(&[
+            state.strokes["shared"].snapshot.clone(),
+            state.strokes["boox-current"].snapshot.clone(),
+        ]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &reconciled)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
+}
+
+#[test]
+fn accept_incoming_replaces_overlaps_and_deletes_current_only_ink() {
+    let mut harness = harness_with_mixed_supernote_conflict();
+    let analysis = harness
+        .broker
+        .inspect_conflict(&harness.storage, &harness.document_id, "sn-concurrent")
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-accept-incoming",
+        ConflictResolutionStrategy::AcceptIncoming,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(
+        state.revisions(),
+        RevisionPair {
+            boox: 1,
+            supernote: 2
+        }
+    );
+    assert_eq!(
+        state.strokes["shared"].snapshot.samples,
+        stroke("shared", 0.2, 0.45).samples
+    );
+    assert!(state.strokes["boox-current"].tombstone.is_some());
+    assert!(state.strokes["sn-new"].tombstone.is_none());
+}
+
+#[test]
+fn stale_conflict_analysis_or_destination_cannot_commit_a_resolution() {
+    let mut stale_analysis = harness_with_mixed_supernote_conflict();
+    let analysis = stale_analysis
+        .broker
+        .inspect_conflict(
+            &stale_analysis.storage,
+            &stale_analysis.document_id,
+            "sn-concurrent",
+        )
+        .unwrap();
+    let mut request = resolution_request(
+        &stale_analysis,
+        &analysis,
+        "resolve-stale-analysis",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    request.expected_state_revision += 1;
+    assert!(matches!(
+        stale_analysis
+            .broker
+            .resolve_conflict(&mut stale_analysis.storage, &request),
+        Err(BrokerError::InvalidEvent(message)) if message.contains("analysis is stale")
+    ));
+    assert!(stale_analysis
+        .storage
+        .object(&conflict_resolution_path(
+            &stale_analysis.document_id,
+            "sn-concurrent"
+        ))
+        .is_none());
+
+    let mut stale_destination = harness_with_mixed_supernote_conflict();
+    let analysis = stale_destination
+        .broker
+        .inspect_conflict(
+            &stale_destination.storage,
+            &stale_destination.document_id,
+            "sn-concurrent",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &stale_destination,
+        &analysis,
+        "resolve-stale-destination",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    let path = boox_view_path(&stale_destination.state());
+    stale_destination
+        .storage
+        .put_unchecked(&path, b"newer destination".to_vec(), BTreeMap::new());
+    let state_before = stale_destination.state();
+    assert!(matches!(
+        stale_destination
+            .broker
+            .resolve_conflict(&mut stale_destination.storage, &request),
+        Err(BrokerError::StaleDestination { .. })
+    ));
+    assert_eq!(stale_destination.state(), state_before);
+    assert!(stale_destination
+        .storage
+        .object(&conflict_resolution_path(
+            &stale_destination.document_id,
+            "sn-concurrent"
+        ))
+        .is_none());
+}
+
+#[test]
+fn compact_boox_conflict_merges_safe_operations_and_preserves_current_supernote_edits() {
+    let mut harness = Harness::new();
+    let base = stroke("shared", 0.2, 0.3);
+    let initial = harness.event(
+        "sn-base-compact-conflict",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let supernote_shared = stroke("shared", 0.2, 0.45);
+    let supernote_new = stroke("sn-current", 0.55, 0.55);
+    let current = harness.event(
+        "sn-current-compact-conflict",
+        DeviceSide::Supernote,
+        2,
+        common,
+        supernote_export(&[supernote_shared.clone(), supernote_new.clone()]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &current)
+        .unwrap();
+
+    let boox_shared = stroke("shared", 0.4, 0.3);
+    let boox_new = stroke("boox-new", 0.75, 0.7);
+    let bytes = compact_manifest(
+        vec![
+            Operation::UpsertStroke {
+                source_uuid: "shared".to_owned(),
+                page_index: 0,
+                before: Some(base),
+                after: boox_shared,
+            },
+            Operation::UpsertStroke {
+                source_uuid: "boox-new".to_owned(),
+                page_index: 0,
+                before: None,
+                after: boox_new,
+            },
+        ],
+        1,
+    );
+    let mut incoming = harness.event(
+        "boox-compact-concurrent",
+        DeviceSide::Boox,
+        1,
+        common,
+        bytes,
+    );
+    incoming.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &incoming)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-compact-concurrent",
+        )
+        .unwrap();
+    assert_eq!(
+        analysis
+            .safe_changes
+            .iter()
+            .map(|change| (change.stroke_id.as_str(), change.kind))
+            .collect::<Vec<_>>(),
+        vec![("boox-new", ConflictChangeKind::Add)]
+    );
+    assert_eq!(
+        analysis
+            .overlapping_changes
+            .iter()
+            .map(|change| (change.stroke_id.as_str(), change.kind))
+            .collect::<Vec<_>>(),
+        vec![("shared", ConflictChangeKind::Move)]
+    );
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-compact-boox",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(
+        state.revisions(),
+        RevisionPair {
+            boox: 1,
+            supernote: 2
+        }
+    );
+    assert_eq!(state.strokes["shared"].snapshot, supernote_shared);
+    assert_eq!(state.strokes["sn-current"].snapshot, supernote_new);
+    assert!(state.strokes.contains_key("boox-new"));
+    assert!(state.conflicts.is_empty());
+}
+
+fn fixture_file(directory: &PathBuf, prefix: &str, suffix: &str) -> Vec<u8> {
+    let mut matches = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix) && name.ends_with(suffix))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    assert_eq!(matches.len(), 1, "fixture match for {prefix}*{suffix}");
+    std::fs::read(&matches[0]).unwrap()
+}
+
+fn process_fixture_event(
+    harness: &mut Harness,
+    event_id: &str,
+    side: DeviceSide,
+    revision: u64,
+    based_on: RevisionPair,
+    kind: DevicePayloadKind,
+    bytes: Vec<u8>,
+) -> ProcessOutcome {
+    let mut event = harness.event(event_id, side, revision, based_on, bytes);
+    event.payload_kind = kind;
+    harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap()
+}
+
+#[test]
+#[ignore = "requires the private real-device E2E conflict fixture directory"]
+fn real_device_simultaneous_edit_evidence_resolves_without_losing_either_side() {
+    let root = std::env::var_os("INKBRIDGE_CONFLICT_FIXTURE_ROOT")
+        .map(PathBuf::from)
+        .expect("set INKBRIDGE_CONFLICT_FIXTURE_ROOT to inkbridge-runs/e2e-925715a-20260823");
+    let original_directory = root.join("original");
+    let original = fixture_file(&original_directory, "InkBridge-E2E-", ".pdf");
+    let mut harness = Harness::with_original(original);
+    let document_root = root.join("Supernote_Folder").join(&harness.document_id);
+    let accepted = document_root.join(".inkbridge-accepted");
+    let incoming = document_root.join("incoming");
+
+    assert!(matches!(
+        process_fixture_event(
+            &mut harness,
+            "real-sn-1",
+            DeviceSide::Supernote,
+            1,
+            RevisionPair::default(),
+            DevicePayloadKind::DeviceView,
+            fixture_file(&accepted, "r00000000000000000001-", ".json"),
+        ),
+        ProcessOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        process_fixture_event(
+            &mut harness,
+            "real-boox-1",
+            DeviceSide::Boox,
+            1,
+            RevisionPair {
+                boox: 0,
+                supernote: 1
+            },
+            DevicePayloadKind::BooxOperationManifest,
+            fixture_file(&incoming, "r00000000000000000001-r", ".operations.json"),
+        ),
+        ProcessOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        process_fixture_event(
+            &mut harness,
+            "real-sn-2",
+            DeviceSide::Supernote,
+            2,
+            RevisionPair {
+                boox: 1,
+                supernote: 1
+            },
+            DevicePayloadKind::DeviceView,
+            fixture_file(&accepted, "r00000000000000000002-", ".json"),
+        ),
+        ProcessOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        process_fixture_event(
+            &mut harness,
+            "real-boox-2",
+            DeviceSide::Boox,
+            2,
+            RevisionPair {
+                boox: 1,
+                supernote: 2
+            },
+            DevicePayloadKind::BooxOperationManifest,
+            fixture_file(&incoming, "r00000000000000000002-r", ".operations.json"),
+        ),
+        ProcessOutcome::Applied { .. }
+    ));
+    for (revision, based_on) in [
+        (
+            3,
+            RevisionPair {
+                boox: 2,
+                supernote: 2,
+            },
+        ),
+        (
+            4,
+            RevisionPair {
+                boox: 2,
+                supernote: 3,
+            },
+        ),
+        (
+            5,
+            RevisionPair {
+                boox: 2,
+                supernote: 4,
+            },
+        ),
+    ] {
+        assert!(matches!(
+            process_fixture_event(
+                &mut harness,
+                &format!("real-sn-{revision}"),
+                DeviceSide::Supernote,
+                revision,
+                based_on,
+                DevicePayloadKind::DeviceView,
+                fixture_file(&accepted, &format!("r{revision:020}-"), ".json"),
+            ),
+            ProcessOutcome::Applied { .. }
+        ));
+    }
+
+    let conflict = process_fixture_event(
+        &mut harness,
+        "real-boox-concurrent",
+        DeviceSide::Boox,
+        3,
+        RevisionPair {
+            boox: 2,
+            supernote: 4,
+        },
+        DevicePayloadKind::DeviceView,
+        std::fs::read(root.join("conflict-evidence/incoming.pdf")).unwrap(),
+    );
+    assert!(matches!(conflict, ProcessOutcome::Conflict { .. }));
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "real-boox-concurrent",
+        )
+        .unwrap();
+    assert!(analysis
+        .safe_changes
+        .iter()
+        .any(|change| change.kind == ConflictChangeKind::Add));
+    assert!(analysis
+        .overlapping_changes
+        .iter()
+        .any(|change| change.kind == ConflictChangeKind::Delete));
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-real-device-conflict",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+    let state = harness.state();
+    assert_eq!(
+        state.revisions(),
+        RevisionPair {
+            boox: 3,
+            supernote: 5
+        }
+    );
+    assert!(state.conflicts.is_empty());
+    assert!(state
+        .strokes
+        .values()
+        .any(|stroke| stroke.last_modified_by == DeviceSide::Boox && stroke.tombstone.is_none()));
+    assert!(state.strokes.values().any(
+        |stroke| stroke.last_modified_by == DeviceSide::Supernote && stroke.tombstone.is_none()
+    ));
+}

@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-const GENERATED_BY_KEY: &str = "inkbridge-generated-by";
-const GENERATED_EVENT_KEY: &str = "inkbridge-event-id";
-const GENERATED_DOCUMENT_KEY: &str = "inkbridge-document-id";
-const GENERATED_REVISIONS_KEY: &str = "inkbridge-source-revisions";
-const GENERATED_CONTENT_HASH_KEY: &str = "inkbridge-content-sha256";
+pub(crate) const GENERATED_BY_KEY: &str = "inkbridge-generated-by";
+pub(crate) const GENERATED_EVENT_KEY: &str = "inkbridge-event-id";
+pub(crate) const GENERATED_DOCUMENT_KEY: &str = "inkbridge-document-id";
+pub(crate) const GENERATED_REVISIONS_KEY: &str = "inkbridge-source-revisions";
+pub(crate) const GENERATED_CONTENT_HASH_KEY: &str = "inkbridge-content-sha256";
 
 #[derive(Default)]
 struct CompactOperationSet<'a> {
@@ -60,7 +60,7 @@ impl fmt::Display for BrokerError {
 impl std::error::Error for BrokerError {}
 
 pub struct Broker {
-    normalized_y_offset: f64,
+    pub(crate) normalized_y_offset: f64,
 }
 
 impl Default for Broker {
@@ -141,6 +141,7 @@ impl Broker {
             source_generations: BTreeMap::new(),
             generated_views: BTreeMap::new(),
             conflicts: Vec::new(),
+            resolved_conflicts: BTreeMap::new(),
         };
         let writes = vec![
             ConditionalWrite {
@@ -436,7 +437,7 @@ impl Broker {
         })
     }
 
-    fn boox_to_supernote(
+    pub(crate) fn boox_to_supernote(
         &self,
         state: &CanonicalDocumentState,
         event: &StorageEvent,
@@ -711,6 +712,7 @@ impl Broker {
             source_generation: event.source_generation,
             source_revision: event.source_revision,
             content_sha256: event.content_sha256.clone(),
+            payload_kind: event.payload_kind,
             based_on: event.based_on,
             current_revisions: current,
         });
@@ -734,7 +736,7 @@ impl Broker {
     }
 }
 
-fn refresh_manifest_id(manifest: &mut Manifest) {
+pub(crate) fn refresh_manifest_id(manifest: &mut Manifest) {
     let upserted = manifest
         .operations
         .iter()
@@ -790,7 +792,7 @@ fn is_broker_output(
     metadata_matches && envelope_matches
 }
 
-fn output_metadata(marker: &BrokerOutputMarker, hash: &str) -> BTreeMap<String, String> {
+pub(crate) fn output_metadata(marker: &BrokerOutputMarker, hash: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (GENERATED_BY_KEY.to_owned(), marker.producer.clone()),
         (GENERATED_EVENT_KEY.to_owned(), marker.event_id.clone()),
@@ -809,7 +811,7 @@ fn output_metadata(marker: &BrokerOutputMarker, hash: &str) -> BTreeMap<String, 
     ])
 }
 
-fn destination_precondition(
+pub(crate) fn destination_precondition(
     state: &CanonicalDocumentState,
     path: &str,
     current: &Option<StoredObject>,
@@ -862,7 +864,7 @@ fn mark_event_only<S: BrokerStorage>(
     Ok(())
 }
 
-fn valid_supernote_native_style(style: &inkbridge_convert::NativeStyle) -> bool {
+pub(crate) fn valid_supernote_native_style(style: &inkbridge_convert::NativeStyle) -> bool {
     // The plugin crosses both the JavaScript number bridge and Android integer APIs. Keep the
     // compact wire format inside the narrower native integer domain, which is exactly
     // representable by JavaScript and rejects values the Supernote host cannot preserve.
@@ -872,7 +874,7 @@ fn valid_supernote_native_style(style: &inkbridge_convert::NativeStyle) -> bool 
         && native_integer.contains(&style.pen_type)
 }
 
-fn normalize_supernote_pen_color(snapshot: &mut StrokeSnapshot) {
+pub(crate) fn normalize_supernote_pen_color(snapshot: &mut StrokeSnapshot) {
     let normalized = if snapshot.native_style.pen_color == 0x00 {
         0x00
     } else {
@@ -891,7 +893,11 @@ fn normalized_supernote_snapshot(snapshot: &StrokeSnapshot) -> StrokeSnapshot {
     normalized
 }
 
-fn apply_manifest(state: &mut CanonicalDocumentState, manifest: &Manifest, event: &StorageEvent) {
+pub(crate) fn apply_manifest(
+    state: &mut CanonicalDocumentState,
+    manifest: &Manifest,
+    event: &StorageEvent,
+) {
     let mut revisions = event.based_on;
     revisions.set(event.source, event.source_revision);
     let upserted_ids = manifest
@@ -957,7 +963,7 @@ fn apply_manifest(state: &mut CanonicalDocumentState, manifest: &Manifest, event
     }
 }
 
-fn apply_supernote_export(
+pub(crate) fn apply_supernote_export(
     state: &mut CanonicalDocumentState,
     event: &StorageEvent,
     bytes: &[u8],
@@ -1004,7 +1010,7 @@ fn apply_supernote_export(
     Ok(())
 }
 
-fn write_baselines(
+pub(crate) fn write_baselines(
     directory: &Path,
     state: &CanonicalDocumentState,
 ) -> Result<Vec<PathBuf>, BrokerError> {
@@ -1059,7 +1065,7 @@ fn write_baselines(
     Ok(paths)
 }
 
-fn state_write(
+pub(crate) fn state_write(
     path: &str,
     state: &CanonicalDocumentState,
     precondition: GenerationPrecondition,
@@ -1078,7 +1084,7 @@ fn state_write(
     })
 }
 
-fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, BrokerError> {
+pub(crate) fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, BrokerError> {
     let state: CanonicalDocumentState = serde_json::from_slice(bytes)
         .map_err(|error| BrokerError::CorruptState(error.to_string()))?;
     if state.schema_version != STATE_SCHEMA_VERSION {
@@ -1090,7 +1096,7 @@ fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, BrokerError> {
     Ok(state)
 }
 
-fn add_newline(mut bytes: Vec<u8>) -> Vec<u8> {
+pub(crate) fn add_newline(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.push(b'\n');
     bytes
 }
@@ -1113,7 +1119,7 @@ fn readable_segment(value: &str) -> String {
     }
 }
 
-fn event_path_segment(event_id: &str) -> String {
+pub(crate) fn event_path_segment(event_id: &str) -> String {
     let prefix = readable_segment(event_id)
         .chars()
         .take(48)

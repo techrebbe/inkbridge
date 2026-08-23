@@ -89,6 +89,33 @@ Set `booxHandoffRoot` in the folder-transport configuration to the local mirror 
 
 This milestone does not add cloud resources or change deployed broker infrastructure. Folder mirroring between the computer and BOOX remains an adapter/setup concern; the descriptor, identity, revision, and create-only publication rules do not depend on the mirroring tool.
 
+## Planned integrated-cloud outbound experiment
+
+BOOX documents integrated Google Drive, OneDrive, and Dropbox reading-data synchronization, but the
+current official material does not establish strongly enough that simply closing a cloud-backed PDF
+always embeds live NeoReader stroke data and uploads it. Do not replace the proven manual **Embed
+Data to PDF → Finalize BOOX changes** flow until this is verified on the Note Air 4C.
+
+Use a disposable copy in a dedicated Google Drive folder:
+
+1. open it through BOOX integrated storage and add uniquely identifiable handwriting;
+2. close NeoReader without manually embedding;
+3. wait for BOOX synchronization and download that exact Drive revision;
+4. inspect it for live `#ONYX-STROKE`/`onyxpoints` data, not merely visible flattened ink;
+5. record close-to-upload timing, revision behavior, and whether the whole PDF is transferred;
+6. repeat with a large document, including provider behavior above 200 MB;
+7. separately replace the Drive file externally and test whether BOOX detects/imports the update.
+
+If the test passes, integrated Drive sync can become the preferred **outbound** BOOX adapter:
+NeoReader close → Drive revision → immutable GCS evidence → existing broker. Drive remains transport,
+never canonical state or “latest file wins.” The companion is still required for inbound
+versioned-path adoption, installed acknowledgements, conflict/status UI, and recovery.
+
+Official background:
+
+- [BOOX integrated third-party cloud storage](https://shop.boox.com/en-ca/blogs/news/new-feature-integrated-third-party-cloud-storage)
+- [BOOX reading-data syncing](https://help.boox.com/hc/en-us/articles/10701453841044-Reading-Data-Syncing)
+
 ## ADB test actions
 
 The debug build exposes three explicit actions. Their intent filters exist only in the debug manifest, and release builds ignore explicit automation actions even if another app targets the launcher activity directly. Always select the physical BOOX serial when more than one Android device is connected:

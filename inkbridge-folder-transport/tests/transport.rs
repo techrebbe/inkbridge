@@ -1,6 +1,7 @@
 use inkbridge_broker::{
-    sha256_hex, supernote_manifest_path, Broker, BrokerStorage, DevicePayloadKind, DeviceSide,
-    MemoryStorage, RevisionPair, StorageEvent, BROKER_PRODUCER, EVENT_SCHEMA_VERSION,
+    conflict_resolution_path, sha256_hex, supernote_manifest_path, Broker, BrokerStorage,
+    DevicePayloadKind, DeviceSide, MemoryStorage, RevisionPair, StorageEvent, BROKER_PRODUCER,
+    EVENT_SCHEMA_VERSION,
 };
 use inkbridge_convert::{geometry_fingerprint, Manifest, Operation, StrokeSnapshot};
 use inkbridge_folder_transport::{
@@ -2906,6 +2907,14 @@ fn conflict_object_blocks_new_uploads_and_is_reported() {
         b"conflict".to_vec(),
         BTreeMap::new(),
     );
+    cloud.put(
+        &format!(
+            "Conflicts/{}/event/current-supernote.json",
+            document.document_id
+        ),
+        b"competing evidence".to_vec(),
+        BTreeMap::new(),
+    );
     let builder = FakeBuilder;
     let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
     let mut state = TransportState::empty();
@@ -2913,13 +2922,71 @@ fn conflict_object_blocks_new_uploads_and_is_reported() {
     let report = transport
         .sync_document(&document, &mut state, SystemTime::now())
         .unwrap();
-    assert!(report
-        .actions
-        .iter()
-        .any(|action| matches!(action, TransportAction::Conflict { .. })));
+    assert_eq!(
+        report
+            .actions
+            .iter()
+            .filter(|action| matches!(action, TransportAction::Conflict { .. }))
+            .count(),
+        1,
+        "one broker conflict must not be reported once per preserved evidence object"
+    );
     assert_eq!(state.documents[&document.document_id].conflicts.len(), 1);
 }
 
+#[test]
+fn broker_resolution_marker_unblocks_transport_without_deleting_evidence() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let cloud = FakeCloud::default();
+    let resolution_path = conflict_resolution_path(&document.document_id, "event");
+    let group = resolution_path.strip_suffix("/resolution.json").unwrap();
+    cloud.put(
+        &format!("{group}/incoming.json"),
+        b"preserved conflict".to_vec(),
+        BTreeMap::new(),
+    );
+    cloud.put(
+        &format!("{group}/current-boox.pdf"),
+        b"preserved current".to_vec(),
+        BTreeMap::new(),
+    );
+    cloud.put(
+        &resolution_path,
+        b"resolution record".to_vec(),
+        BTreeMap::from([
+            (GENERATED_BY.to_owned(), BROKER_PRODUCER.to_owned()),
+            (GENERATED_EVENT_ID.to_owned(), "resolution-1".to_owned()),
+            (DOCUMENT_ID.to_owned(), document.document_id.clone()),
+            (
+                "inkbridge-kind".to_owned(),
+                "conflict-resolution".to_owned(),
+            ),
+            ("inkbridge-conflict-event-id".to_owned(), "event".to_owned()),
+        ]),
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let mut state = TransportState::empty();
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(state.documents[&document.document_id].conflicts.is_empty());
+    assert!(!report
+        .actions
+        .iter()
+        .any(|action| matches!(action, TransportAction::Conflict { .. })));
+    assert_eq!(
+        cloud
+            .list(&format!("Conflicts/{}/", document.document_id))
+            .unwrap()
+            .len(),
+        3,
+        "resolution must retain both preserved inputs and its audit marker"
+    );
+}
 #[test]
 fn failed_scan_does_not_publish_partial_transport_state() {
     let root = tempdir().unwrap();

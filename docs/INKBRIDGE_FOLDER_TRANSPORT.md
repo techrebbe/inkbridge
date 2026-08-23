@@ -145,9 +145,11 @@ the complete editable PDF. The broker continues rebuilding that view from the im
   deferred; no implicit latest-file-wins decision is made. A sibling page exported at the same
   original frontier can safely rebase across accepted Supernote-only page revisions, while any
   intervening BOOX revision or accepted revision of that same page requires a fresh export.
-- Simultaneous device edits are preserved by the broker under Conflicts; the transport reports
-  the conflict and stops new source uploads instead of choosing a winner. It resumes only after an
-  explicit reconciliation workflow has safely retired those conflict objects.
+- Simultaneous device edits are preserved by the broker under `Conflicts/`; the transport reports
+  one conflict per event and stops new source uploads instead of choosing a winner. Resolution
+  retains both evidence objects and adds a broker-authenticated `resolution.json` marker. The
+  transport ignores resolved groups only when that marker has the expected producer, document,
+  event, and kind metadata; forged or incomplete markers remain blocking.
 - Accepted Supernote baselines survive working-file replacement and checkpoint loss through the
   immutable `.inkbridge-accepted` cache; a missing or hash-mismatched cache entry is recovered from
   its accepted cloud generation before BOOX conversion proceeds.
@@ -166,5 +168,6 @@ the complete editable PDF. The broker continues rebuilding that view from the im
 
 The tests cover duplicate scans, revision acknowledgement, broker-manifest delivery, bounded versioned BOOX handoff retention and checkpoint recovery, accepted outgoing retirement, immutable
 baseline recovery, simultaneous local edits, compact BOOX uploads, unpublished-edit protection,
-and conflict blocking. Broker and converter suites remain the authority for stroke parity,
+conflict grouping, forged-marker rejection, and resolution unblocking. Broker and converter suites
+remain the authority for stroke parity,
 malformed NeoReader recovery, moves, and deletions.

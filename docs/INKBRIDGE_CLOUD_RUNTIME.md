@@ -35,6 +35,28 @@ explicit `rejected` result and acknowledges them with HTTP 200 so Eventarc does
 not retry an immutable bad event forever. Cloud Storage, Firestore, and pending
 outbox failures still return 500 and remain eligible for Eventarc retry.
 
+## Private conflict API
+
+The same private Cloud Run service exposes:
+
+```text
+GET  /v1/documents/<document-id>/conflicts
+GET  /v1/documents/<document-id>/conflicts/<conflict-event-id>
+POST /v1/documents/<document-id>/conflicts/<conflict-event-id>
+```
+
+The collection GET returns active conflict summaries and the raw event IDs needed by the item
+routes. The item GET returns safe and overlapping stroke changes plus the state/revision
+preconditions required by POST. POST accepts an explicit `merge_preserving_current`,
+`keep_current`, or `accept_incoming` decision. The runtime recovers any pending durable outbox.
+stale destination generations, and competing decisions return HTTP 409; malformed requests return
+400; a missing document/conflict returns 404. Cloud Run IAM remains the authorization boundary.
+
+Resolution uses the existing transactional reservation, generation-conditional object writes, and
+durable outbox. Its broker-generated `resolution.json` marker and canonical state are promoted only
+after every required BOOX/Supernote output is durable. See
+[`INKBRIDGE_CONFLICT_RESOLUTION.md`](INKBRIDGE_CONFLICT_RESOLUTION.md).
+
 ## Firestore transaction and durable outbox
 
 `inkbridgeDocuments/{documentId}` stores a generation/hash pointer to the last
@@ -98,7 +120,7 @@ BOOX_Folder/<documentId>/<name>.pdf       # generated/editable BOOX view
 Supernote_Folder/<documentId>/incoming/   # native-operation manifests
 Canonical/<documentId>/states/            # immutable canonical-state blobs
 BrokerOutbox/<documentId>/<commitId>/      # immutable staged output payloads
-Conflicts/<documentId>/<event>/           # both sides preserved
+Conflicts/<documentId>/<event>/           # both inputs + durable resolution marker
 ```
 
 Canonical active state and the durable outbox live in Firestore. Device folder
