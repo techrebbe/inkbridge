@@ -46,6 +46,14 @@ impl FakeCloud {
             bytes,
         ));
     }
+
+    fn replace_live(&self, path: &str, bytes: Vec<u8>, metadata: BTreeMap<String, String>) {
+        self.objects
+            .lock()
+            .unwrap()
+            .retain(|(object, _)| object.path != path);
+        self.put(path, bytes, metadata);
+    }
 }
 
 impl CloudFolder for FakeCloud {
@@ -478,7 +486,89 @@ fn installed_boox_ack_bounds_incoming_history_and_recovers_lost_checkpoint() {
 }
 
 #[test]
-fn unverified_installed_ack_does_not_advance_frontier_or_retire_deliveries() {
+fn verified_installed_ack_survives_live_broker_generation_replacement() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let state_path = root.path().join("transport-state.json");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let object_path = format!("BOOX_Folder/{}/book.pdf", document.document_id);
+    let first = b"first live broker PDF".to_vec();
+    let first_hash = sha256_hex(&first);
+    cloud.put(
+        &object_path,
+        first.clone(),
+        generated_metadata(&document.document_id, "0:1", &first),
+    );
+    let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    write_installed_boox_ack(
+        &handoff_root,
+        &document,
+        &format!("broker-event-{first_hash}"),
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        1,
+        &first_hash,
+    );
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert_eq!(
+        state.documents[&document.document_id]
+            .verified_boox_install
+            .as_ref()
+            .unwrap()
+            .event_id,
+        format!("broker-event-{first_hash}")
+    );
+    state.save(&state_path).unwrap();
+    state = TransportState::load(&state_path).unwrap();
+
+    let second = b"replacement live broker PDF".to_vec();
+    cloud.replace_live(
+        &object_path,
+        second.clone(),
+        generated_metadata(&document.document_id, "0:2", &second),
+    );
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            generation: 2,
+            ..
+        }
+    )));
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        }
+    );
+    assert_eq!(
+        state.documents[&document.document_id]
+            .verified_boox_install
+            .as_ref()
+            .unwrap()
+            .event_id,
+        format!("broker-event-{first_hash}"),
+        "the durable receipt remains valid after the cloud path advances"
+    );
+}
+
+#[test]
+fn unverified_installed_ack_does_not_advance_frontier_or_block_real_delivery() {
     let root = tempdir().unwrap();
     let handoff_root = root.path().join("boox-handoff");
     let document = mapping(root.path());
@@ -505,24 +595,30 @@ fn unverified_installed_ack_does_not_advance_frontier_or_retire_deliveries() {
     let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
         .with_boox_handoff_root(&handoff_root);
     let mut state = TransportState::empty();
-    let error = transport
+    let report = transport
         .sync_document(&document, &mut state, SystemTime::now())
-        .unwrap_err();
+        .unwrap();
 
-    assert!(error.contains("does not match an authoritative broker output"));
-    assert!(
-        state.documents.is_empty(),
-        "an unverified acknowledgement must not mutate the transaction state"
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Delivered {
+            side: DeviceSide::Boox,
+            generation: 1,
+            ..
+        }
+    )));
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        "the unverified acknowledgement must not claim its forged frontier"
     );
-    assert!(
-        !handoff_root
-            .join(&document.document_id)
-            .join("incoming")
-            .exists(),
-        "an unverified acknowledgement must not trigger incoming cleanup or delivery"
-    );
+    assert!(state.documents[&document.document_id]
+        .verified_boox_install
+        .is_none());
 }
-
 #[test]
 fn accepted_finalized_boox_snapshot_is_retired_after_installed_broker_view() {
     let root = tempdir().unwrap();

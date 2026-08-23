@@ -655,6 +655,8 @@ pub struct DocumentTransportState {
     pub supernote: SideTransportState,
     #[serde(default)]
     pub delivered_generations: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_boox_install: Option<VerifiedBooxInstall>,
     #[serde(default)]
     pub conflicts: BTreeSet<String>,
 }
@@ -673,6 +675,15 @@ impl DocumentTransportState {
             DeviceSide::Supernote => &mut self.supernote,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedBooxInstall {
+    pub event_id: String,
+    pub source_revisions: RevisionPair,
+    pub source_generation: u64,
+    pub content_sha256: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

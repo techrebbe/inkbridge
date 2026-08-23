@@ -1,7 +1,9 @@
 use crate::{
-    boox_handoff::{BooxHandoffEndpoint, FinalizedBooxArtifact, MAX_DESCRIPTOR_BYTES},
+    boox_handoff::{
+        BooxHandoffEndpoint, FinalizedBooxArtifact, InstalledBooxDelivery, MAX_DESCRIPTOR_BYTES,
+    },
     CloudFolder, CloudObject, DocumentFolders, DocumentTransportState, FileObservation,
-    PendingUpload, SyncReport, TransportAction, TransportState,
+    PendingUpload, SyncReport, TransportAction, TransportState, VerifiedBooxInstall,
 };
 use inkbridge_broker::{sha256_hex, DeviceSide, RevisionPair, BROKER_PRODUCER};
 use inkbridge_convert::{build_manifest, parse_baseline_bytes, BaselineExport};
@@ -488,11 +490,18 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             )
         });
 
+        let mut installed_is_verified = false;
         if let (Some(endpoint), Some(installed)) = (
             boox_handoff_endpoint.as_ref(),
             installed_boox_delivery.as_ref(),
         ) {
-            let matches_broker_output = candidates.iter().any(|(side, object, revisions)| {
+            let verified_identity = verified_boox_install(installed);
+            let matches_durable_receipt = state
+                .documents
+                .get(&document.document_id)
+                .and_then(|document_state| document_state.verified_boox_install.as_ref())
+                == Some(&verified_identity);
+            let matches_live_broker_output = candidates.iter().any(|(side, object, revisions)| {
                 if *side != DeviceSide::Boox
                     || *revisions != installed.source_revisions
                     || object.generation != installed.source_generation
@@ -509,50 +518,50 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .prepare_delivery(document, object, *revisions, expected_hash)
                     .is_ok_and(|delivery| delivery.event_id == installed.event_id)
             });
-            if !matches_broker_output {
-                return Err(format!(
-                    "BOOX installed acknowledgement {} does not match an authoritative broker output at generation {} and revisions {}:{}",
-                    installed.event_id,
-                    installed.source_generation,
-                    installed.source_revisions.boox,
-                    installed.source_revisions.supernote,
-                ));
-            }
-
-            endpoint.retire_superseded_incoming(document, installed)?;
-            let current = state.document_mut(&document.document_id).revisions;
-            let known_content_hash = state
-                .document_mut(&document.document_id)
-                .boox
-                .delivered_content_sha256
-                .as_deref();
-            if installed.source_revisions == current
-                && known_content_hash.is_some_and(|hash| hash != installed.content_sha256)
-            {
-                return Err(format!(
-                    "BOOX installed acknowledgement {} reports different content for frontier {}:{}",
-                    installed.event_id, current.boox, current.supernote,
-                ));
-            }
-            if dominates(installed.source_revisions, current) {
-                record_delivered_frontier(
-                    state.document_mut(&document.document_id),
-                    installed.source_revisions,
-                    DeviceSide::Boox,
-                    installed.content_sha256.clone(),
-                );
-            } else if !dominates(current, installed.source_revisions) {
-                return Err(format!(
-                    "BOOX installed acknowledgement {} at {}:{} conflicts with transport frontier {}:{}",
-                    installed.event_id,
-                    installed.source_revisions.boox,
-                    installed.source_revisions.supernote,
-                    current.boox,
-                    current.supernote,
-                ));
+            installed_is_verified = matches_durable_receipt || matches_live_broker_output;
+            if installed_is_verified {
+                if matches_live_broker_output {
+                    state
+                        .document_mut(&document.document_id)
+                        .verified_boox_install = Some(verified_identity);
+                }
+                endpoint.retire_superseded_incoming(document, installed)?;
+                let current = state.document_mut(&document.document_id).revisions;
+                let known_content_hash = state
+                    .document_mut(&document.document_id)
+                    .boox
+                    .delivered_content_sha256
+                    .as_deref();
+                if installed.source_revisions == current
+                    && known_content_hash.is_some_and(|hash| hash != installed.content_sha256)
+                {
+                    return Err(format!(
+                        "BOOX installed acknowledgement {} reports different content for frontier {}:{}",
+                        installed.event_id, current.boox, current.supernote,
+                    ));
+                }
+                if dominates(installed.source_revisions, current) {
+                    record_delivered_frontier(
+                        state.document_mut(&document.document_id),
+                        installed.source_revisions,
+                        DeviceSide::Boox,
+                        installed.content_sha256.clone(),
+                    );
+                } else if !dominates(current, installed.source_revisions) {
+                    return Err(format!(
+                        "BOOX installed acknowledgement {} at {}:{} conflicts with transport frontier {}:{}",
+                        installed.event_id,
+                        installed.source_revisions.boox,
+                        installed.source_revisions.supernote,
+                        current.boox,
+                        current.supernote,
+                    ));
+                }
             }
         }
-
+        let verified_installed_boox_delivery = installed_boox_delivery
+            .as_ref()
+            .filter(|_| installed_is_verified);
         for (side, object, revisions) in candidates {
             let generation_key = object.generation_key();
             let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
@@ -567,7 +576,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 None
             };
             if let (Some(installed), Some(delivery)) = (
-                installed_boox_delivery.as_ref(),
+                verified_installed_boox_delivery,
                 boox_handoff_delivery.as_ref(),
             ) {
                 if installed.event_id != delivery.event_id
@@ -866,7 +875,13 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         {
             return Ok(());
         }
-        let installed_boox_delivery = endpoint.installed_delivery(document)?;
+        let installed_boox_delivery = endpoint.installed_delivery(document)?.filter(|installed| {
+            state
+                .documents
+                .get(&document.document_id)
+                .and_then(|document_state| document_state.verified_boox_install.as_ref())
+                == Some(&verified_boox_install(installed))
+        });
         for artifact in endpoint.finalized_artifacts(document)? {
             let local_key = canonical_path_key(&artifact.pdf_path);
             let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
@@ -1655,6 +1670,15 @@ fn parse_revision_metadata(object: &CloudObject) -> Result<RevisionPair, String>
 
 fn dominates(candidate: RevisionPair, current: RevisionPair) -> bool {
     candidate.boox >= current.boox && candidate.supernote >= current.supernote
+}
+
+fn verified_boox_install(installed: &InstalledBooxDelivery) -> VerifiedBooxInstall {
+    VerifiedBooxInstall {
+        event_id: installed.event_id.clone(),
+        source_revisions: installed.source_revisions,
+        source_generation: installed.source_generation,
+        content_sha256: installed.content_sha256.clone(),
+    }
 }
 
 fn record_delivered_frontier(

@@ -58,7 +58,7 @@ The companion validates the producer, document ID, filenames, source generation,
 ## Safety rules
 
 - Duplicate events are idempotent and cannot create a second active PDF.
-- After an install commits, the companion atomically publishes `.inkbridge-installed.json`. The transport uses this acknowledgement to keep the current incoming PDF/descriptor as the active recovery pair while durably retiring older dominated pairs. Losing the transport checkpoint therefore cannot recreate obsolete 300–500 MB deliveries.
+- After an install commits, the companion atomically publishes `.inkbridge-installed.json`. The transport uses this acknowledgement to keep the current incoming PDF/descriptor as the active recovery pair while durably retiring older dominated pairs. Losing the transport checkpoint therefore cannot recreate obsolete 300–500 MB deliveries. Before trusting it, the transport matches the full event/generation/revision/hash identity against live broker metadata and persists one bounded verified-install receipt; that receipt remains authoritative when the broker later replaces its stable cloud path with a newer generation.
 - Incoming descriptors whose revisions are already dominated by the active frontier are ignored even after their event IDs age out of the bounded replay cache. The cache retains 64 recent byte-bounded IDs so two worst-case handoff states still fit in one crash-recovery intent.
 - Malformed descriptors and descriptor/PDF pairs that are not complete yet are skipped, allowing later valid deliveries to remain installable.
 - A stale or incomparable revision is rejected; there is no latest-file-wins behavior.
