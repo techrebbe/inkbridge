@@ -134,6 +134,8 @@ impl Broker {
             return supersede_conflict(storage, context, request);
         }
 
+        ensure_incremental_conflict_resolution_order(&context.state, &context.conflict)?;
+
         let proposed = self.proposed_conflict_manifest(
             &context.state,
             &context.conflict,
@@ -420,6 +422,36 @@ pub fn conflict_resolution_path(document_id: &str, conflict_event_id: &str) -> S
         document_id,
         event_path_segment(conflict_event_id)
     )
+}
+
+fn ensure_incremental_conflict_resolution_order(
+    state: &CanonicalDocumentState,
+    conflict: &PreservedInput,
+) -> Result<(), BrokerError> {
+    if conflict.payload_kind != DevicePayloadKind::BooxOperationManifest {
+        return Ok(());
+    }
+
+    if let Some(predecessor) = state
+        .conflicts
+        .iter()
+        .filter(|candidate| {
+            candidate.source == conflict.source
+                && candidate.event_id != conflict.event_id
+                && candidate.source_revision < conflict.source_revision
+        })
+        .min_by_key(|candidate| (candidate.source_revision, candidate.event_id.as_str()))
+    {
+        return Err(BrokerError::InvalidEvent(format!(
+            "incremental conflict {} at source revision {} cannot be resolved before earlier active conflict {} at source revision {}; resolve the earlier conflict first",
+            conflict.event_id,
+            conflict.source_revision,
+            predecessor.event_id,
+            predecessor.source_revision
+        )));
+    }
+
+    Ok(())
 }
 
 fn resolution_destination_precondition(

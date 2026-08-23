@@ -2631,6 +2631,151 @@ fn resolving_valid_compact_conflict_persists_recovered_legacy_page_count() {
 }
 
 #[test]
+fn incremental_boox_conflicts_must_resolve_in_source_order() {
+    let mut harness = Harness::new();
+    let initial = harness.event(
+        "sn-base-incremental-order",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("sn-current", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let first_bytes = compact_manifest(
+        vec![Operation::UpsertStroke {
+            source_uuid: "boox-a".to_owned(),
+            page_index: 0,
+            before: None,
+            after: stroke("boox-a", 0.55, 0.55),
+        }],
+        1,
+    );
+    let mut first = harness.event(
+        "boox-compact-conflict-1",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        first_bytes,
+    );
+    first.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &first)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let second_bytes = compact_manifest(
+        vec![Operation::UpsertStroke {
+            source_uuid: "boox-b".to_owned(),
+            page_index: 0,
+            before: None,
+            after: stroke("boox-b", 0.75, 0.7),
+        }],
+        1,
+    );
+    let mut second = harness.event(
+        "boox-compact-conflict-2",
+        DeviceSide::Boox,
+        2,
+        RevisionPair {
+            boox: 1,
+            supernote: 0,
+        },
+        second_bytes,
+    );
+    second.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &second)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let newer_analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-compact-conflict-2",
+        )
+        .unwrap();
+    let newer_request = resolution_request(
+        &harness,
+        &newer_analysis,
+        "resolve-compact-2-too-early",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    let state_before = harness.state();
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &newer_request),
+        Err(BrokerError::InvalidEvent(message))
+            if message.contains("boox-compact-conflict-1")
+                && message.contains("resolve the earlier conflict first")
+    ));
+    assert_eq!(harness.state(), state_before);
+
+    let older_analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-compact-conflict-1",
+        )
+        .unwrap();
+    let older_request = resolution_request(
+        &harness,
+        &older_analysis,
+        "resolve-compact-1",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &older_request)
+        .unwrap();
+    assert!(harness.state().strokes.contains_key("boox-a"));
+
+    let newer_analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-compact-conflict-2",
+        )
+        .unwrap();
+    let newer_request = resolution_request(
+        &harness,
+        &newer_analysis,
+        "resolve-compact-2",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &newer_request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(
+        state.revisions(),
+        RevisionPair {
+            boox: 2,
+            supernote: 1
+        }
+    );
+    assert!(state.strokes.contains_key("boox-a"));
+    assert!(state.strokes.contains_key("boox-b"));
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
 fn compact_boox_conflict_merges_safe_operations_and_preserves_current_supernote_edits() {
     let mut harness = Harness::new();
     let base = stroke("shared", 0.2, 0.3);
