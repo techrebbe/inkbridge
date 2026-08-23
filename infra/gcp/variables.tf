@@ -72,7 +72,7 @@ variable "firestore_database" {
 }
 
 variable "folder_transport_operator" {
-  description = "Optional IAM member (for example user:name@example.com) allowed to impersonate the least-privilege folder-transport service account."
+  description = "Operator IAM member (for example user:name@example.com) allowed to impersonate the folder transport and invoke the private conflict API; required for runtime deployment."
   type        = string
   default     = ""
 

@@ -145,6 +145,7 @@ run "immutable_digest_enables_runtime" {
     bucket_name                    = "inkbridge-plan-test-sync"
     cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
     cloud_run_image                = "me-west1-docker.pkg.dev/inkbridge-plan-test/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    folder_transport_operator      = "user:operator@example.com"
   }
 
   assert {
@@ -163,6 +164,20 @@ run "immutable_digest_enables_runtime" {
   }
 
   assert {
+    condition     = google_cloud_run_v2_service.runtime[0].ingress == "INGRESS_TRAFFIC_ALL"
+    error_message = "Runtime must be network-reachable so the IAM-authorized operator can use the conflict API."
+  }
+
+  assert {
+    condition = (
+      length(google_cloud_run_v2_service_iam_member.operator_invoker) == 1 &&
+      google_cloud_run_v2_service_iam_member.operator_invoker[0].member == "user:operator@example.com" &&
+      google_cloud_run_v2_service_iam_member.operator_invoker[0].role == "roles/run.invoker"
+    )
+    error_message = "Runtime must grant only the configured operator Cloud Run invocation."
+  }
+
+  assert {
     condition = (
       google_cloud_run_v2_service.runtime[0].template[0].timeout == "900s" &&
       google_cloud_run_v2_service.runtime[0].template[0].max_instance_request_concurrency == 1 &&
@@ -173,7 +188,7 @@ run "immutable_digest_enables_runtime" {
   }
 }
 
-run "foreign_image_digest_is_rejected" {
+run "runtime_requires_conflict_operator" {
   command = plan
 
   variables {
@@ -184,7 +199,25 @@ run "foreign_image_digest_is_rejected" {
     region                         = "me-west1"
     bucket_name                    = "inkbridge-plan-test-sync"
     cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
+    cloud_run_image                = "me-west1-docker.pkg.dev/inkbridge-plan-test/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+
+  expect_failures = [terraform_data.deployment_guard[0]]
+}
+
+
+run "foreign_image_digest_is_rejected" {
+  command = plan
+  variables {
+    enable_deployment              = true
+    deployment_acknowledgement     = "I_UNDERSTAND_THIS_CREATES_BILLABLE_RESOURCES"
+    project_id                     = "inkbridge-plan-test"
+    project_number                 = "123456789012"
+    region                         = "me-west1"
+    bucket_name                    = "inkbridge-plan-test-sync"
+    cloud_build_source_bucket_name = "inkbridge-plan-test-build-source"
     cloud_run_image                = "me-west1-docker.pkg.dev/another-project/inkbridge/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    folder_transport_operator      = "user:operator@example.com"
   }
 
   expect_failures = [terraform_data.deployment_guard[0]]

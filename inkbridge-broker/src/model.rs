@@ -262,6 +262,7 @@ pub enum ConflictResolutionOutcome {
         document_id: String,
         conflict_event_id: String,
         resolution_id: String,
+        strategy: ConflictResolutionStrategy,
     },
 }
 

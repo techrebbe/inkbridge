@@ -60,9 +60,10 @@ Content-Type: application/json
 }
 ```
 
-`schemaVersion` defaults to the current resolution schema. Repeating the same `resolutionId` is
-idempotent. A different resolution for an already-resolved conflict, stale analysis, or a changed
-destination generation returns HTTP 409 and commits nothing.
+`schemaVersion` defaults to the current resolution schema. Repeating the same `resolutionId` with
+the same recorded strategy is idempotent. Reusing that ID with a different strategy, submitting a
+different resolution for an already-resolved conflict, using stale analysis, or encountering a
+changed destination generation returns HTTP 409 and commits nothing.
 
 ## Persistence and transport behavior
 
@@ -101,6 +102,21 @@ should summarize:
 
 It should default to `merge_preserving_current`, require confirmation for `accept_incoming`, and
 never offer an unqualified “latest wins” action.
+
+Terraform grants `roles/run.invoker` only to Eventarc and the configured
+`folder_transport_operator`; it does not grant `allUsers` or `allAuthenticatedUsers`. The service
+accepts network ingress so that operator can reach the IAM-protected API. From an authenticated
+operator configuration, start a local proxy:
+
+```text
+gcloud run services proxy inkbridge-broker \
+  --project=PROJECT_ID \
+  --region=REGION \
+  --port=8080 \
+  --configuration=inkbridge-operator
+```
+
+Then issue the GET and POST requests above against `http://localhost:8080`.
 
 ## Validation
 

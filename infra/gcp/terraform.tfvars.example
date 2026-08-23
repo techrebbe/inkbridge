@@ -5,8 +5,9 @@ project_id     = "replace-with-project-id"
 project_number = "000000000000"
 region         = "me-west1"
 bucket_name    = "replace-with-globally-unique-bucket"
-# Optional. Grants this user/group permission to impersonate the restricted
-# local folder-transport identity; do not run the transport as a project owner.
+# Required for runtime deployment; optional for bootstrap. Grants this user/group permission to
+# impersonate the restricted local folder-transport identity and invoke the IAM-private conflict
+# API. Do not run the transport as a project owner.
 folder_transport_operator = ""
 cloud_build_source_bucket_name = "replace-with-globally-unique-build-source-bucket"
 

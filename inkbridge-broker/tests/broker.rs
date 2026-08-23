@@ -2314,7 +2314,22 @@ fn merge_preserving_current_applies_safe_changes_and_is_idempotent() {
             .broker
             .resolve_conflict(&mut harness.storage, &request)
             .unwrap(),
-        ConflictResolutionOutcome::Duplicate { .. }
+        ConflictResolutionOutcome::Duplicate {
+            strategy: ConflictResolutionStrategy::MergePreservingCurrent,
+            ..
+        }
+    ));
+
+    let mut changed_decision = request.clone();
+    changed_decision.strategy = ConflictResolutionStrategy::AcceptIncoming;
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &changed_decision),
+        Err(BrokerError::InvalidEvent(message))
+            if message.contains("already recorded strategy")
+                && message.contains("MergePreservingCurrent")
+                && message.contains("AcceptIncoming")
     ));
 }
 

@@ -102,12 +102,20 @@ impl Broker {
             })?;
         let state = decode_state(&state_object.bytes)?;
         if let Some(record) = state.resolved_conflicts.get(&request.conflict_event_id) {
-            return if record.resolution_id == request.resolution_id {
+            return if record.resolution_id == request.resolution_id
+                && record.strategy == request.strategy
+            {
                 Ok(ConflictResolutionOutcome::Duplicate {
                     document_id: request.document_id.clone(),
                     conflict_event_id: request.conflict_event_id.clone(),
                     resolution_id: request.resolution_id.clone(),
+                    strategy: record.strategy,
                 })
+            } else if record.resolution_id == request.resolution_id {
+                Err(BrokerError::InvalidEvent(format!(
+                    "resolution ID {} already recorded strategy {:?}; requested {:?}",
+                    request.resolution_id, record.strategy, request.strategy
+                )))
             } else {
                 Err(BrokerError::InvalidEvent(format!(
                     "conflict {} was already resolved by {}",

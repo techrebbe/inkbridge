@@ -320,7 +320,9 @@ fn conflict_error_response(error: BrokerError) -> Response {
             StatusCode::NOT_FOUND
         }
         BrokerError::InvalidEvent(message)
-            if message.contains("stale") || message.contains("already resolved") =>
+            if message.contains("stale")
+                || message.contains("already resolved")
+                || message.contains("already recorded strategy") =>
         {
             StatusCode::CONFLICT
         }
@@ -883,9 +885,23 @@ mod tests {
         assert!(state.strokes.contains_key("sn-new"));
         assert!(matches!(
             service
-                .resolve_conflict(&document_id, "sn-concurrent", request)
+                .resolve_conflict(&document_id, "sn-concurrent", request.clone())
                 .unwrap(),
             ConflictResolutionOutcome::Duplicate { .. }
         ));
+
+        let mut changed_strategy = request;
+        changed_strategy.strategy = ConflictResolutionStrategy::AcceptIncoming;
+        let changed_strategy_response = resolve_conflict_handler(
+            State(service.clone()),
+            Path((document_id, "sn-concurrent".to_owned())),
+            Json(changed_strategy),
+        )
+        .await;
+        assert_eq!(
+            changed_strategy_response.status(),
+            StatusCode::CONFLICT,
+            "reusing a resolution ID with different parameters must not be accepted as a duplicate"
+        );
     }
 }

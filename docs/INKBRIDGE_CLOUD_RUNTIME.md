@@ -49,8 +49,10 @@ The collection GET returns active conflict summaries and the raw event IDs neede
 routes. The item GET returns safe and overlapping stroke changes plus the state/revision
 preconditions required by POST. POST accepts an explicit `merge_preserving_current`,
 `keep_current`, or `accept_incoming` decision. The runtime recovers any pending durable outbox.
-stale destination generations, and competing decisions return HTTP 409; malformed requests return
-400; a missing document/conflict returns 404. Cloud Run IAM remains the authorization boundary.
+Stale destination generations, competing decisions, and reuse of a resolution ID with a changed
+strategy return HTTP 409; malformed requests return 400; a missing document/conflict returns 404.
+Cloud Run IAM remains the authorization boundary; Terraform grants invocation only to Eventarc and
+the configured operator.
 
 Resolution uses the existing transactional reservation, generation-conditional object writes, and
 durable outbox. Every required BOOX/Supernote output is made durable before canonical state is
@@ -107,8 +109,8 @@ inkbridge-register-original=true
 inkbridge-original-file-name=<logical file name>
 ```
 
-The finalized-object event reaches the same internal-only Cloud Run endpoint as
-device events. The broker verifies the exact object generation, validates the
+The finalized-object event reaches the same IAM-authenticated Cloud Run endpoint as device events.
+The broker verifies the exact object generation, validates the
 PDF, derives its stable content-based document ID, and stores the immutable
 original under `Originals/<documentId>/original.pdf`. Duplicate delivery is
 idempotent. Unmarked staging objects are ignored. The HTTP
@@ -171,6 +173,22 @@ INKBRIDGE_GCS_BUCKET
 INKBRIDGE_FIRESTORE_DATABASE  # defaults to (default)
 PORT                          # defaults to 8080
 ```
+
+The deployed service accepts network ingress but remains IAM-private: there is no `allUsers` or
+`allAuthenticatedUsers` invoker binding. Eventarc and the configured
+`folder_transport_operator` are the only provisioned invokers. An operator uses their own
+authenticated gcloud configuration:
+
+```text
+gcloud run services proxy inkbridge-broker \
+  --project=PROJECT_ID \
+  --region=REGION \
+  --port=8080 \
+  --configuration=inkbridge-operator
+```
+
+The private conflict endpoints are then available through `http://localhost:8080`; ordinary
+unauthenticated requests to the Cloud Run URL remain rejected.
 
 The runtime container includes `inkbridge-convert` and qpdf 12.2 or newer and
 targets Linux `amd64`. The minimum qpdf version is enforced while the image is

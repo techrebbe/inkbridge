@@ -56,9 +56,9 @@ saved plans. Copy `terraform.tfvars.example` to a private `.tfvars` file.
 
 1. Select an isolated project, billing account, region, and unique bucket
    names. Set a budget alert if desired; it is not a hard spending cap. Set
-   `folder_transport_operator` to the `user:` or `group:` IAM member that
-   will run the local adapter; leaving it empty creates the restricted identity
-   but grants nobody permission to impersonate it.
+   `folder_transport_operator` to the `user:` or `group:` IAM member that will run the local
+   adapter and operate the private conflict API. Runtime deployment refuses an empty operator so
+   every preserved conflict has an authenticated resolution path.
 2. Create and configure the private remote-state bucket.
 3. Save and inspect the bootstrap plan. Apply only that exact saved plan.
 4. Build a commit-tagged Linux amd64 image:
@@ -125,6 +125,24 @@ Set `CLOUDSDK_ACTIVE_CONFIG_NAME=inkbridge-folder-transport` for the transport
 process. The account can read broker outputs and preserved evidence, but IAM
 permits it to create objects only under the two device-folder prefixes.
 
+Use a separate authenticated gcloud configuration for the conflict API. Do not impersonate the
+folder-transport service account for this path:
+
+```text
+gcloud config configurations create inkbridge-operator
+gcloud config set project PROJECT_ID --configuration=inkbridge-operator
+gcloud auth login --configuration=inkbridge-operator
+gcloud run services proxy inkbridge-broker \
+  --project=PROJECT_ID \
+  --region=REGION \
+  --port=8080 \
+  --configuration=inkbridge-operator
+```
+
+Terraform grants the configured operator `roles/run.invoker`; it never grants anonymous
+invocation. With the proxy running, inspect and resolve conflicts through
+`http://localhost:8080/v1/documents/...`.
+
 The Artifact Registry repository keeps the five most recent versions, retains
 every `deployed-` tagged digest, and deletes older `build-` tagged or untagged
 versions after seven days. Move `deployed-current` to the new digest only when
@@ -137,10 +155,10 @@ its exact generation indefinitely; the runtime deletes each output payload by
 generation only after that commit is finalized. Cleanup failure may leak a
 delivered payload but cannot break recovery. Originals, conflicts, and device
 generations that may still be revision evidence are not automatically deleted.
-Cloud Run remains private, uses zero minimum instances, one maximum instance,
-concurrency one, 2 vCPU, 8 GiB memory, and a 15-minute request timeout. Those
-resources are billed only while a request is active because the service still
-scales to zero.
+Cloud Run remains IAM-private with no anonymous invoker, while accepting network ingress for the
+configured operator. It uses zero minimum instances, one maximum instance, concurrency one, 2 vCPU,
+8 GiB memory, and a 15-minute request timeout. Those resources are billed only while a request is
+active because the service still scales to zero.
 
 ## Planned resources
 
@@ -153,5 +171,5 @@ The enabled stages manage:
 - Firestore Native database with deletion protection and point-in-time recovery;
 - least-scope build, runtime, Eventarc, and local folder-transport service
   accounts/IAM, with device uploads barred from broker-owned namespaces;
-- private Cloud Run broker; and
+- IAM-private Cloud Run broker with explicit Eventarc and operator invokers; and
 - Eventarc finalized-object trigger.

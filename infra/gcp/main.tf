@@ -37,6 +37,10 @@ resource "terraform_data" "deployment_guard" {
       )
       error_message = "cloud_run_image must come from the configured project, region, and Artifact Registry repository."
     }
+    precondition {
+      condition     = !local.runtime_enabled || var.folder_transport_operator != ""
+      error_message = "folder_transport_operator is required when Cloud Run is enabled so conflicts have an authenticated operator path."
+    }
   }
 }
 
@@ -314,7 +318,7 @@ resource "google_cloud_run_v2_service" "runtime" {
   project             = var.project_id
   name                = "inkbridge-broker"
   location            = var.region
-  ingress             = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  ingress             = "INGRESS_TRAFFIC_ALL"
   deletion_protection = true
 
   template {
@@ -368,6 +372,16 @@ resource "google_cloud_run_v2_service_iam_member" "eventarc_invoker" {
   name     = google_cloud_run_v2_service.runtime[0].name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.eventarc[0].email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "operator_invoker" {
+  count = local.runtime_enabled && var.folder_transport_operator != "" ? 1 : 0
+
+  project  = var.project_id
+  location = google_cloud_run_v2_service.runtime[0].location
+  name     = google_cloud_run_v2_service.runtime[0].name
+  role     = "roles/run.invoker"
+  member   = var.folder_transport_operator
 }
 
 resource "google_eventarc_trigger" "storage_finalized" {
