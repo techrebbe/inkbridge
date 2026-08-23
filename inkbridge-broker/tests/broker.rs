@@ -2390,6 +2390,134 @@ fn explicit_keep_current_advances_the_rejected_source_frontier() {
 }
 
 #[test]
+fn equal_revision_alternate_payload_can_only_be_discarded() {
+    let mut harness = Harness::new();
+    let accepted = stroke("accepted-at-revision-one", 0.2, 0.3);
+    let initial = harness.event(
+        "sn-accepted-revision-one",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&accepted)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+    let accepted_state = harness.state();
+
+    let alternate = stroke("alternate-at-revision-one", 0.7, 0.65);
+    let conflicting = harness.event(
+        "sn-alternate-revision-one",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&alternate)),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &conflicting)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-alternate-revision-one",
+        )
+        .unwrap();
+    let conflicted_state = harness.state();
+    for (resolution_id, strategy) in [
+        (
+            "reject-equal-revision-accept",
+            ConflictResolutionStrategy::AcceptIncoming,
+        ),
+        (
+            "reject-equal-revision-merge",
+            ConflictResolutionStrategy::MergePreservingCurrent,
+        ),
+    ] {
+        let request = resolution_request(&harness, &analysis, resolution_id, strategy);
+        assert!(
+            matches!(
+                harness
+                    .broker
+                    .resolve_conflict(&mut harness.storage, &request),
+                Err(BrokerError::InvalidEvent(message))
+                    if message.contains("only keep_current is safe")
+            ),
+            "{strategy:?} must not change content at an accepted revision"
+        );
+        assert_eq!(harness.state(), conflicted_state);
+        assert!(harness
+            .storage
+            .object(&conflict_resolution_path(
+                &harness.document_id,
+                "sn-alternate-revision-one",
+            ))
+            .is_none());
+    }
+
+    let keep = resolution_request(
+        &harness,
+        &analysis,
+        "discard-equal-revision-alternate",
+        ConflictResolutionStrategy::KeepCurrent,
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &keep)
+            .unwrap(),
+        ConflictResolutionOutcome::Superseded { .. }
+    ));
+
+    let discarded_state = harness.state();
+    assert_eq!(discarded_state.revisions(), accepted_state.revisions());
+    assert_eq!(
+        discarded_state.supernote.content_sha256,
+        accepted_state.supernote.content_sha256
+    );
+    assert_eq!(
+        discarded_state.strokes["accepted-at-revision-one"].snapshot,
+        accepted
+    );
+    assert!(!discarded_state
+        .strokes
+        .contains_key("alternate-at-revision-one"));
+    assert!(discarded_state.conflicts.is_empty());
+    let record = &discarded_state.resolved_conflicts["sn-alternate-revision-one"];
+    assert!(record.superseded);
+    assert_eq!(record.strategy, ConflictResolutionStrategy::KeepCurrent);
+
+    let retry = harness.event(
+        "sn-alternate-retried-at-revision-two",
+        DeviceSide::Supernote,
+        2,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        supernote_export(&[accepted, alternate.clone()]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &retry)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        harness.state().strokes["alternate-at-revision-one"].snapshot,
+        alternate
+    );
+}
+
+#[test]
 fn keep_current_deletes_rejected_ink_on_a_page_absent_from_canonical_baselines() {
     let mut harness = Harness::with_original(original_pdf_with_pages(2));
     let boox_current = stroke_on_page("boox-current-page-2", 1, 0.4, 0.5);

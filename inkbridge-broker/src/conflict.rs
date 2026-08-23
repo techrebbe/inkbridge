@@ -129,8 +129,18 @@ impl Broker {
 
         let context =
             load_context_from_state(storage, state_object, state, &request.conflict_event_id)?;
-        if context.conflict.source_revision < context.state.device(context.conflict.source).revision
-        {
+        let current_source_revision = context.state.device(context.conflict.source).revision;
+        if context.conflict.source_revision <= current_source_revision {
+            if context.conflict.source_revision == current_source_revision
+                && request.strategy != ConflictResolutionStrategy::KeepCurrent
+            {
+                return Err(BrokerError::InvalidEvent(format!(
+                    "conflict {} is an alternate payload for already accepted {:?} revision {}; only keep_current is safe, and incoming changes must be re-exported as a newer revision",
+                    context.conflict.event_id,
+                    context.conflict.source,
+                    current_source_revision
+                )));
+            }
             return supersede_conflict(storage, context, request);
         }
 
