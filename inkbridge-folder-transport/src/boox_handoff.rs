@@ -204,8 +204,17 @@ impl BooxHandoffEndpoint {
             else {
                 continue;
             };
-            if delivery.event_id == installed.event_id
-                || !strictly_dominates(installed.source_revisions, delivery.source_revisions)
+            let exact_installed = delivery.event_id == installed.event_id
+                && delivery.source_revisions == installed.source_revisions
+                && delivery.source_generation == installed.source_generation
+                && delivery.content_sha256 == installed.content_sha256;
+            if exact_installed {
+                continue;
+            }
+            let same_installed_view = delivery.source_revisions == installed.source_revisions
+                && delivery.content_sha256 == installed.content_sha256;
+            if !same_installed_view
+                && !strictly_dominates(installed.source_revisions, delivery.source_revisions)
             {
                 continue;
             }
@@ -967,9 +976,29 @@ mod tests {
             },
             b"second",
         );
+        let same_view_republish = prepare(
+            "broker-event-3",
+            3,
+            RevisionPair {
+                boox: 1,
+                supernote: 2,
+            },
+            b"second",
+        );
+        let same_revision_conflict = prepare(
+            "broker-event-4",
+            4,
+            RevisionPair {
+                boox: 1,
+                supernote: 2,
+            },
+            b"different",
+        );
         for (delivery, bytes) in [
             (&first, b"first".as_slice()),
             (&second, b"second".as_slice()),
+            (&same_view_republish, b"second".as_slice()),
+            (&same_revision_conflict, b"different".as_slice()),
         ] {
             fs::write(&delivery.pdf_path, bytes).unwrap();
             fs::write(&delivery.descriptor_path, &delivery.descriptor_bytes).unwrap();
@@ -1001,8 +1030,11 @@ mod tests {
         assert!(!first.descriptor_path.exists());
         assert!(second.pdf_path.is_file());
         assert!(second.descriptor_path.is_file());
+        assert!(!same_view_republish.pdf_path.exists());
+        assert!(!same_view_republish.descriptor_path.exists());
+        assert!(same_revision_conflict.pdf_path.is_file());
+        assert!(same_revision_conflict.descriptor_path.is_file());
     }
-
     #[test]
     fn retirement_marker_never_overwrites_conflicting_mirrored_metadata() {
         let root = tempdir().unwrap();

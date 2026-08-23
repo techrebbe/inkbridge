@@ -62,7 +62,7 @@ The companion validates the producer, document ID, filenames, source generation,
 - Incoming descriptors whose revisions are already dominated by the active frontier are ignored even after their event IDs age out of the bounded replay cache. The cache retains 64 recent byte-bounded IDs so two worst-case handoff states still fit in one crash-recovery intent.
 - Malformed descriptors and descriptor/PDF pairs that are not complete yet are skipped, allowing later valid deliveries to remain installable.
 - A stale or incomparable revision is rejected; there is no latest-file-wins behavior.
-- A same-revision PDF with different bytes is rejected.
+- A storage-generation republish of the already installed revision and content is ignored before download and any equivalent staged pair is retired; a same-revision PDF with different bytes is rejected as conflicting content.
 - If NeoReader changed the active PDF, a new broker view is refused until those changes are finalized.
 - Even after finalization, the old view is retained until a new broker delivery advances the BOOX revision, proving that the broker accepted the finalized BOOX edit.
 - Incoming and outgoing PDFs are streamed, so a 500 MB PDF is never loaded wholly into memory.

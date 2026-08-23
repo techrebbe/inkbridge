@@ -669,14 +669,24 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             } else {
                 None
             };
-            if let (Some(installed), Some(delivery)) = (
+            if let (Some(installed), Some(_delivery)) = (
                 verified_installed_boox_delivery,
                 boox_handoff_delivery.as_ref(),
             ) {
-                if installed.event_id != delivery.event_id
-                    && installed.source_revisions != revisions
-                    && dominates(installed.source_revisions, revisions)
-                {
+                if revisions == installed.source_revisions {
+                    if expected_hash != installed.content_sha256 {
+                        return Err(format!(
+                            "broker BOOX output {} reports different content for installed frontier {}:{}",
+                            object.path, revisions.boox, revisions.supernote,
+                        ));
+                    }
+                    state
+                        .document_mut(&document.document_id)
+                        .delivered_generations
+                        .insert(generation_key);
+                    continue;
+                }
+                if dominates(installed.source_revisions, revisions) {
                     state
                         .document_mut(&document.document_id)
                         .delivered_generations

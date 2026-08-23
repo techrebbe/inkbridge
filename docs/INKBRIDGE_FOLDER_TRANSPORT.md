@@ -134,7 +134,7 @@ the complete editable PDF. The broker continues rebuilding that view from the im
 ## Failure behavior
 
 - Repeated scans do not duplicate uploads or downloaded manifests.
-- The current acknowledged BOOX delivery pair is retained as active recovery data and is reconstructed from its immutable cloud generation if it disappears. Older dominated incoming pairs are removed and are not recreated even after transport checkpoint loss. The descriptor is always published only after the PDF is durable.
+- The current acknowledged BOOX delivery pair is retained as active recovery data and is reconstructed from its immutable cloud generation if it disappears. Older dominated incoming pairs are removed and are not recreated even after transport checkpoint loss. Republishing the same installed revision and content at a new storage generation is ignored before download and any equivalent staged pair is retired, while same-revision different-content objects remain an explicit error. The descriptor is always published only after the PDF is durable.
 - Accepted finalized BOOX snapshots remain local until the companion installs a broker view containing their BOOX revision. They are then retired through a synchronized marker; a crash during either file deletion completes the same cleanup on the next scan.
 - A downloaded Supernote manifest that disappears before its valid acknowledgement is restored
   from the immutable cloud generation; an acknowledged delivery does not need to remain local.

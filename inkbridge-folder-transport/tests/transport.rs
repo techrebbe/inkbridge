@@ -689,6 +689,134 @@ fn legacy_verified_ack_with_intact_pair_does_not_block_new_delivery() {
     );
 }
 #[test]
+fn acknowledged_same_revision_republishes_are_not_downloaded_or_retained() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let object_path = format!("BOOX_Folder/{}/book.pdf", document.document_id);
+    let generated = b"installed broker PDF".to_vec();
+    let generated_hash = sha256_hex(&generated);
+    cloud.put(
+        &object_path,
+        generated.clone(),
+        generated_metadata(&document.document_id, "0:1", &generated),
+    );
+    let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    write_installed_boox_ack(
+        &handoff_root,
+        &document,
+        &format!("broker-event-{generated_hash}"),
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        1,
+        &generated_hash,
+    );
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    for _ in 0..3 {
+        cloud.replace_live(
+            &object_path,
+            generated.clone(),
+            generated_metadata(&document.document_id, "0:1", &generated),
+        );
+        let report = transport
+            .sync_document(&document, &mut state, SystemTime::now())
+            .unwrap();
+        assert!(!report.actions.iter().any(|action| matches!(
+            action,
+            TransportAction::Delivered {
+                side: DeviceSide::Boox,
+                ..
+            }
+        )));
+    }
+
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    assert_eq!(
+        fs::read_dir(incoming).unwrap().count(),
+        2,
+        "only the installed recovery pair should remain"
+    );
+    assert_eq!(
+        *cloud.downloads.lock().unwrap(),
+        1,
+        "storage-generation churn must not redownload an installed large PDF"
+    );
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        }
+    );
+}
+
+#[test]
+fn acknowledged_same_revision_with_different_content_is_rejected() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let object_path = format!("BOOX_Folder/{}/book.pdf", document.document_id);
+    let installed_bytes = b"installed broker PDF".to_vec();
+    let installed_hash = sha256_hex(&installed_bytes);
+    cloud.put(
+        &object_path,
+        installed_bytes.clone(),
+        generated_metadata(&document.document_id, "0:1", &installed_bytes),
+    );
+    let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    write_installed_boox_ack(
+        &handoff_root,
+        &document,
+        &format!("broker-event-{installed_hash}"),
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        1,
+        &installed_hash,
+    );
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    let conflicting = b"different broker PDF at same revision".to_vec();
+    cloud.replace_live(
+        &object_path,
+        conflicting.clone(),
+        generated_metadata(&document.document_id, "0:1", &conflicting),
+    );
+    let error = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap_err();
+
+    assert!(error.contains("different content for installed frontier 0:1"));
+    assert_eq!(*cloud.downloads.lock().unwrap(), 1);
+    assert_eq!(
+        fs::read_dir(handoff_root.join(&document.document_id).join("incoming"))
+            .unwrap()
+            .count(),
+        2,
+        "the conflicting same-revision object must not replace the installed recovery pair"
+    );
+}
+#[test]
 fn unverified_installed_ack_does_not_advance_frontier_or_block_real_delivery() {
     let root = tempdir().unwrap();
     let handoff_root = root.path().join("boox-handoff");
