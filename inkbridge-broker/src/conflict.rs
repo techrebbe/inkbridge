@@ -223,8 +223,12 @@ impl Broker {
 
         let boox_path = boox_view_path(&state);
         let boox_destination = storage.read(&boox_path).map_err(BrokerError::Storage)?;
-        let boox_precondition =
-            destination_precondition(&previous_state, &boox_path, &boox_destination)?;
+        let boox_precondition = resolution_destination_precondition(
+            &previous_state,
+            &context.conflict,
+            &boox_path,
+            &boox_destination,
+        )?;
         let boox_hash = sha256_hex(&boox_pdf);
         let marker = BrokerOutputMarker {
             producer: BROKER_PRODUCER.to_owned(),
@@ -416,6 +420,28 @@ pub fn conflict_resolution_path(document_id: &str, conflict_event_id: &str) -> S
         document_id,
         event_path_segment(conflict_event_id)
     )
+}
+
+fn resolution_destination_precondition(
+    previous_state: &CanonicalDocumentState,
+    conflict: &PreservedInput,
+    destination_path: &str,
+    destination: &Option<StoredObject>,
+) -> Result<GenerationPrecondition, BrokerError> {
+    if conflict.source == DeviceSide::Boox
+        && conflict.payload_kind == DevicePayloadKind::DeviceView
+        && conflict.object_path == destination_path
+    {
+        if let Some(destination) = destination {
+            if destination.generation == conflict.source_generation
+                && sha256_hex(&destination.bytes) == conflict.content_sha256
+            {
+                return Ok(GenerationPrecondition::Match(destination.generation));
+            }
+        }
+    }
+
+    destination_precondition(previous_state, destination_path, destination)
 }
 
 fn supersede_conflict<S: BrokerStorage>(

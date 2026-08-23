@@ -1802,6 +1802,65 @@ fn real_device_manifest_is_byte_identical_to_proven_converter_output() {
     assert_eq!(actual.as_ref(), expected.as_slice());
 }
 
+fn harness_with_in_place_boox_conflict() -> Harness {
+    let mut harness = Harness::new();
+    let initial = harness.event(
+        "sn-base-in-place-conflict",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(&[stroke("shared", 0.2, 0.3)]),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let boox_path = boox_view_path(&harness.state());
+    let generated = harness.storage.object(&boox_path).unwrap().clone();
+    let edited_pdf = write_boox_view(
+        &harness.original,
+        [
+            stroke("shared", 0.35, 0.4),
+            stroke("boox-concurrent", 0.65, 0.65),
+        ],
+    )
+    .unwrap();
+    let edited_hash = sha256_hex(&edited_pdf);
+    let edited_object = harness
+        .storage
+        .put_unchecked(&boox_path, edited_pdf, generated.metadata);
+    let event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-in-place-conflict".to_owned(),
+        document_id: harness.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: boox_path,
+        source_generation: edited_object.generation,
+        source_revision: 1,
+        based_on: RevisionPair::default(),
+        content_sha256: edited_hash,
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: Some(BrokerOutputMarker {
+            producer: BROKER_PRODUCER.to_owned(),
+            event_id: "sn-base-in-place-conflict".to_owned(),
+            document_id: harness.document_id.clone(),
+            source_revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+        }),
+    };
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &event)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+    harness
+}
+
 fn harness_with_mixed_supernote_conflict() -> Harness {
     let mut harness = Harness::new();
     let initial = harness.event(
@@ -1866,6 +1925,96 @@ fn resolution_request(
         expected_current_revisions: analysis.current_revisions,
         strategy,
     }
+}
+
+#[test]
+fn tracked_in_place_boox_conflict_resolves_against_its_exact_generation() {
+    let mut harness = harness_with_in_place_boox_conflict();
+    let boox_path = boox_view_path(&harness.state());
+    let conflict_generation = harness.storage.object(&boox_path).unwrap().generation;
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-in-place-conflict",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-boox-in-place",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &request)
+            .unwrap(),
+        ConflictResolutionOutcome::Resolved { .. }
+    ));
+
+    let state = harness.state();
+    assert!(state.conflicts.is_empty());
+    assert_eq!(state.boox.revision, 1);
+    assert!(state.strokes["boox-concurrent"].tombstone.is_none());
+    assert!(
+        harness.storage.object(&boox_path).unwrap().generation > conflict_generation,
+        "the exact conflicting generation should be accepted as the write baseline"
+    );
+    assert!(harness
+        .storage
+        .object(&conflict_resolution_path(
+            &harness.document_id,
+            "boox-in-place-conflict"
+        ))
+        .is_some());
+}
+
+#[test]
+fn tracked_in_place_boox_conflict_rejects_a_later_destination_edit() {
+    let mut harness = harness_with_in_place_boox_conflict();
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-in-place-conflict",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-boox-in-place-after-newer-edit",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    let boox_path = boox_view_path(&harness.state());
+    let newer = harness.storage.put_unchecked(
+        &boox_path,
+        b"newer post-preservation BOOX edit".to_vec(),
+        BTreeMap::new(),
+    );
+    let state_before = harness.state();
+
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &request),
+        Err(BrokerError::StaleDestination { .. })
+    ));
+    assert_eq!(harness.state(), state_before);
+    assert_eq!(
+        harness.storage.object(&boox_path).unwrap().generation,
+        newer.generation
+    );
+    assert!(harness
+        .storage
+        .object(&conflict_resolution_path(
+            &harness.document_id,
+            "boox-in-place-conflict"
+        ))
+        .is_none());
 }
 
 #[test]
