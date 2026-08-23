@@ -6,6 +6,7 @@ import java.io.File
 import java.security.MessageDigest
 
 internal const val BROKER_PRODUCER = "inkbridge-broker"
+internal const val COMPANION_PRODUCER = "inkbridge-boox-companion"
 internal const val DESCRIPTOR_SCHEMA_VERSION = 1
 internal const val MAX_DESCRIPTOR_BYTES = 256 * 1024L
 internal const val SAFE_FILE_NAME_MAX_BYTES = 180
@@ -79,6 +80,59 @@ data class BrokerDelivery(
             sourceGeneration = value.getLong("sourceGeneration"),
             contentSha256 = value.getString("contentSha256"),
             pdfFileName = value.getString("pdfFileName"),
+        ).also { it.validate() }
+    }
+}
+
+data class InstalledDeliveryAcknowledgement(
+    val schemaVersion: Int = 1,
+    val producer: String = COMPANION_PRODUCER,
+    val eventId: String,
+    val documentId: String,
+    val sourceRevisions: RevisionPair,
+    val sourceGeneration: Long,
+    val contentSha256: String,
+    val activeFileName: String,
+) {
+    fun validate() {
+        require(schemaVersion == 1) { "Unsupported installed-delivery acknowledgement version" }
+        require(producer == COMPANION_PRODUCER) { "Not an InkBridge BOOX acknowledgement" }
+        requireEventId(eventId, "acknowledged event ID")
+        require(DOCUMENT_ID.matches(documentId)) { "Invalid stable document ID" }
+        require(sourceGeneration >= 1) { "Invalid source generation" }
+        require(SHA256.matches(contentSha256)) { "Invalid installed PDF hash" }
+        requireSafeFileName(activeFileName, "active file name")
+    }
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("schemaVersion", schemaVersion)
+        .put("producer", producer)
+        .put("eventId", eventId)
+        .put("documentId", documentId)
+        .put("sourceRevisions", sourceRevisions.toJson())
+        .put("sourceGeneration", sourceGeneration)
+        .put("contentSha256", contentSha256)
+        .put("activeFileName", activeFileName)
+
+    companion object {
+        fun fromState(state: HandoffState) = InstalledDeliveryAcknowledgement(
+            eventId = state.brokerEventId,
+            documentId = state.documentId,
+            sourceRevisions = state.activeRevisions,
+            sourceGeneration = state.sourceGeneration,
+            contentSha256 = state.installedBrokerSha256,
+            activeFileName = state.activeFileName,
+        ).also { it.validate() }
+
+        fun fromJson(value: JSONObject) = InstalledDeliveryAcknowledgement(
+            schemaVersion = value.getInt("schemaVersion"),
+            producer = value.getString("producer"),
+            eventId = value.getString("eventId"),
+            documentId = value.getString("documentId"),
+            sourceRevisions = RevisionPair.fromJson(value.getJSONObject("sourceRevisions")),
+            sourceGeneration = value.getLong("sourceGeneration"),
+            contentSha256 = value.getString("contentSha256"),
+            activeFileName = value.getString("activeFileName"),
         ).also { it.validate() }
     }
 }

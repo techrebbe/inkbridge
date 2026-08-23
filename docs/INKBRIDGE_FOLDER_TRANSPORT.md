@@ -34,6 +34,7 @@ Each configured document has its Supernote paths plus either the versioned BOOX 
     BOOX_Device/Documents/InkBridge/inkbridge-doc-v1-<original-pdf-sha256>/incoming/<versioned>.pdf.inkbridge.json
     BOOX_Device/Documents/InkBridge/inkbridge-doc-v1-<original-pdf-sha256>/outgoing/<finalized>.pdf
     BOOX_Device/Documents/InkBridge/inkbridge-doc-v1-<original-pdf-sha256>/outgoing/<finalized>.pdf.inkbridge.json
+    BOOX_Device/Documents/InkBridge/inkbridge-doc-v1-<original-pdf-sha256>/.inkbridge-installed.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/outgoing/page-0001.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/incoming/r<revisions>-g<generation>-<event>.operations.json
     Supernote_Folder/inkbridge-doc-v1-<original-pdf-sha256>/acknowledged/<delivery-sha256>.ack.json
@@ -121,7 +122,7 @@ file path. Replacing the bytes of a PDF that is already known at the same path c
 ink without making it lassoable. Opening the identical broker view under a fresh path triggers
 NeoReader's document-data import/merge flow and makes the strokes editable.
 
-The BOOX companion and folder transport now implement that contract. Broker outputs are published as an immutable, versioned PDF plus descriptor, with the descriptor written last. The companion installs the delivery at a fresh active path, retires the predecessor, opens only the authoritative active file in NeoReader, and finalizes edits as an immutable outgoing PDF plus `StorageEvent` sidecar. The transport converts a finalized edit at the current revision frontier into compact operations; a stale or concurrent finalized edit is uploaded as a full PDF with its original `basedOn` frontier so the broker preserves it as conflict evidence instead of silently rebasing it.
+The BOOX companion and folder transport now implement that contract. Broker outputs are published as an immutable, versioned PDF plus descriptor, with the descriptor written last. The companion installs the delivery at a fresh active path, publishes a durable acknowledgement of that installed broker event, retires the predecessor, opens only the authoritative active file in NeoReader, and finalizes edits as an immutable outgoing PDF plus `StorageEvent` sidecar. The transport keeps only the current acknowledged incoming pair as recovery data and removes older dominated pairs. It converts a finalized edit at the current revision frontier into compact operations; a stale or concurrent finalized edit is uploaded as a full PDF with its original `basedOn` frontier so the broker preserves it as conflict evidence instead of silently rebasing it. Once broker acceptance is reflected in an installed companion view, the accepted outgoing pair is durably retired through an interruption-recoverable marker.
 
 ## Large PDFs
 
@@ -133,7 +134,8 @@ the complete editable PDF. The broker continues rebuilding that view from the im
 ## Failure behavior
 
 - Repeated scans do not duplicate uploads or downloaded manifests.
-- A versioned BOOX delivery pair that disappears after checkpointing is reconstructed from its immutable cloud generation without creating a second version. The descriptor is published only after the PDF is durable.
+- The current acknowledged BOOX delivery pair is retained as active recovery data and is reconstructed from its immutable cloud generation if it disappears. Older dominated incoming pairs are removed and are not recreated even after transport checkpoint loss. The descriptor is always published only after the PDF is durable.
+- Accepted finalized BOOX snapshots remain local until the companion installs a broker view containing their BOOX revision. They are then retired through a synchronized marker; a crash during either file deletion completes the same cleanup on the next scan.
 - A downloaded Supernote manifest that disappears before its valid acknowledgement is restored
   from the immutable cloud generation; an acknowledged delivery does not need to remain local.
 - A process crash after upload retries the same content/revision-stable object name.
@@ -162,7 +164,7 @@ the complete editable PDF. The broker continues rebuilding that view from the im
     cargo clippy -p inkbridge-folder-transport --all-targets -- -D warnings
     cargo test -p inkbridge-folder-transport
 
-The tests cover duplicate scans, revision acknowledgement, broker-manifest delivery, versioned BOOX handoff and recovery, immutable
+The tests cover duplicate scans, revision acknowledgement, broker-manifest delivery, bounded versioned BOOX handoff retention and checkpoint recovery, accepted outgoing retirement, immutable
 baseline recovery, simultaneous local edits, compact BOOX uploads, unpublished-edit protection,
 and conflict blocking. Broker and converter suites remain the authority for stroke parity,
 malformed NeoReader recovery, moves, and deletions.

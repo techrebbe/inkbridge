@@ -305,6 +305,32 @@ fn write_finalized_boox_handoff(
     pdf
 }
 
+fn write_installed_boox_ack(
+    handoff_root: &Path,
+    document: &DocumentFolders,
+    event_id: &str,
+    revisions: RevisionPair,
+    source_generation: u64,
+    content_sha256: &str,
+) {
+    let document_root = handoff_root.join(&document.document_id);
+    fs::create_dir_all(&document_root).unwrap();
+    fs::write(
+        document_root.join(".inkbridge-installed.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": 1,
+            "producer": "inkbridge-boox-companion",
+            "eventId": event_id,
+            "documentId": document.document_id,
+            "sourceRevisions": revisions,
+            "sourceGeneration": source_generation,
+            "contentSha256": content_sha256,
+            "activeFileName": "active.pdf"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
 #[test]
 fn broker_boox_output_stages_one_versioned_companion_delivery() {
     let root = tempdir().unwrap();
@@ -380,6 +406,161 @@ fn broker_boox_output_stages_one_versioned_companion_delivery() {
     assert!(descriptor_path.is_file());
 }
 
+#[test]
+fn installed_boox_ack_bounds_incoming_history_and_recovers_lost_checkpoint() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let first = b"first broker PDF".to_vec();
+    let second = b"second broker PDF".to_vec();
+    cloud.put(
+        &format!("BOOX_Folder/{}/first.pdf", document.document_id),
+        first.clone(),
+        generated_metadata(&document.document_id, "0:1", &first),
+    );
+    let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    cloud.put(
+        &format!("BOOX_Folder/{}/second.pdf", document.document_id),
+        second.clone(),
+        generated_metadata(&document.document_id, "1:2", &second),
+    );
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    write_installed_boox_ack(
+        &handoff_root,
+        &document,
+        &format!("broker-event-{}", sha256_hex(&second)),
+        RevisionPair {
+            boox: 1,
+            supernote: 2,
+        },
+        2,
+        &sha256_hex(&second),
+    );
+
+    state = TransportState::empty();
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    let incoming = handoff_root.join(&document.document_id).join("incoming");
+    let entries = fs::read_dir(&incoming)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        2,
+        "only the active recovery pair should remain"
+    );
+    assert!(entries.iter().all(|path| {
+        !path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&sha256_hex(&first)[..12])
+    }));
+    assert_eq!(*cloud.downloads.lock().unwrap(), 2);
+    assert_eq!(
+        state.documents[&document.document_id].revisions,
+        RevisionPair {
+            boox: 1,
+            supernote: 2,
+        }
+    );
+}
+
+#[test]
+fn accepted_finalized_boox_snapshot_is_retired_after_installed_broker_view() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let bytes = b"accepted finalized BOOX PDF";
+    let event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-finalize-accepted-cleanup".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/book__boox-finalized-g1.pdf",
+            document.document_id
+        ),
+        source_generation: 1,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(bytes),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: None,
+    };
+    let finalized = write_finalized_boox_handoff(&handoff_root, &document, &event, bytes);
+
+    let source_local_id = sha256_hex(event.event_id.as_bytes());
+    let mut state = TransportState {
+        documents: BTreeMap::from([(
+            document.document_id.clone(),
+            DocumentTransportState {
+                revisions: RevisionPair {
+                    boox: 1,
+                    supernote: 1,
+                },
+                boox: SideTransportState {
+                    accepted_source_revisions: BTreeMap::from([(source_local_id, 1)]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]),
+        ..TransportState::empty()
+    };
+    let cloud = FakeCloud::default();
+    let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(
+        finalized.is_file(),
+        "broker acceptance alone must not retire the recovery snapshot"
+    );
+
+    write_installed_boox_ack(
+        &handoff_root,
+        &document,
+        "broker-view-accepted-r1",
+        RevisionPair {
+            boox: 1,
+            supernote: 1,
+        },
+        2,
+        &sha256_hex(b"installed broker view"),
+    );
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(!finalized.exists());
+    assert!(!finalized
+        .with_file_name(format!(
+            "{}.inkbridge.json",
+            finalized.file_name().unwrap().to_string_lossy()
+        ))
+        .exists());
+    assert!(fs::read_dir(finalized.parent().unwrap())
+        .unwrap()
+        .next()
+        .is_none());
+}
 #[test]
 fn broker_boox_output_publishes_descriptor_only_after_pdf_is_durable() {
     let root = tempdir().unwrap();

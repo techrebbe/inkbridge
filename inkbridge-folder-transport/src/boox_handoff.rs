@@ -3,15 +3,20 @@ use inkbridge_broker::{
     DevicePayloadKind, DeviceSide, RevisionPair, StorageEvent, BROKER_PRODUCER,
     EVENT_SCHEMA_VERSION,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
 const DESCRIPTOR_SUFFIX: &str = ".pdf.inkbridge.json";
 pub(crate) const MAX_DESCRIPTOR_BYTES: u64 = 256 * 1024;
 const GENERATED_EVENT_ID: &str = "inkbridge-event-id";
+const INSTALLED_ACKNOWLEDGEMENT_FILE: &str = ".inkbridge-installed.json";
+const COMPANION_PRODUCER: &str = "inkbridge-boox-companion";
+const RETIREMENT_MARKER_PREFIX: &str = ".inkbridge-retire-";
+const RETIREMENT_MARKER_SUFFIX: &str = ".json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BooxHandoffEndpoint {
@@ -20,6 +25,7 @@ pub(crate) struct BooxHandoffEndpoint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedBooxDelivery {
+    pub event_id: String,
     pub pdf_path: PathBuf,
     pub descriptor_path: PathBuf,
     pub descriptor_bytes: Vec<u8>,
@@ -32,18 +38,41 @@ pub(crate) struct FinalizedBooxArtifact {
     pub event: StorageEvent,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct BrokerDeliveryDescriptor<'a> {
+struct BrokerDeliveryDescriptor {
     schema_version: u32,
-    producer: &'a str,
-    event_id: &'a str,
-    document_id: &'a str,
-    original_file_name: &'a str,
+    producer: String,
+    event_id: String,
+    document_id: String,
+    original_file_name: String,
     source_revisions: RevisionPair,
     source_generation: u64,
-    content_sha256: &'a str,
-    pdf_file_name: &'a str,
+    content_sha256: String,
+    pdf_file_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InstalledBooxDelivery {
+    schema_version: u32,
+    producer: String,
+    pub event_id: String,
+    pub document_id: String,
+    pub source_revisions: RevisionPair,
+    pub source_generation: u64,
+    pub content_sha256: String,
+    active_file_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct FinalizedRetirementMarker {
+    schema_version: u32,
+    document_id: String,
+    event_id: String,
+    content_sha256: String,
+    pdf_file_name: String,
 }
 
 impl BooxHandoffEndpoint {
@@ -86,29 +115,182 @@ impl BooxHandoffEndpoint {
         let descriptor_path = incoming.join(format!("{pdf_file_name}.inkbridge.json"));
         let descriptor = BrokerDeliveryDescriptor {
             schema_version: DESCRIPTOR_SCHEMA_VERSION,
-            producer: BROKER_PRODUCER,
-            event_id,
-            document_id: &document.document_id,
-            original_file_name: &document.original_file_name,
+            producer: BROKER_PRODUCER.to_owned(),
+            event_id: event_id.to_owned(),
+            document_id: document.document_id.clone(),
+            original_file_name: document.original_file_name.clone(),
             source_revisions: revisions,
             source_generation: object.generation,
-            content_sha256,
-            pdf_file_name: &pdf_file_name,
+            content_sha256: content_sha256.to_owned(),
+            pdf_file_name: pdf_file_name.clone(),
         };
         let mut descriptor_bytes =
             serde_json::to_vec_pretty(&descriptor).map_err(|error| error.to_string())?;
         descriptor_bytes.push(b'\n');
         Ok(PreparedBooxDelivery {
+            event_id: event_id.to_owned(),
             pdf_path,
             descriptor_path,
             descriptor_bytes,
         })
     }
 
+    pub fn installed_delivery(
+        &self,
+        document: &DocumentFolders,
+    ) -> Result<Option<InstalledBooxDelivery>, String> {
+        let acknowledgement = self.document_root.join(INSTALLED_ACKNOWLEDGEMENT_FILE);
+        let metadata = match fs::symlink_metadata(&acknowledgement) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect BOOX installed-delivery acknowledgement {}: {error}",
+                    acknowledgement.display()
+                ))
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "BOOX installed-delivery acknowledgement {} is not a regular file",
+                acknowledgement.display()
+            ));
+        }
+        let bytes = read_bounded_descriptor(&acknowledgement, &metadata)?;
+        let installed: InstalledBooxDelivery = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "invalid BOOX installed-delivery acknowledgement {}: {error}",
+                acknowledgement.display()
+            )
+        })?;
+        validate_installed_delivery(&installed, document)?;
+        Ok(Some(installed))
+    }
+
+    pub fn retire_superseded_incoming(
+        &self,
+        document: &DocumentFolders,
+        installed: &InstalledBooxDelivery,
+    ) -> Result<(), String> {
+        validate_installed_delivery(installed, document)?;
+        let incoming = self.document_root.join("incoming");
+        let entries = match fs::read_dir(&incoming) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect BOOX handoff incoming directory {}: {error}",
+                    incoming.display()
+                ))
+            }
+        };
+        for entry in entries {
+            let descriptor_path = entry
+                .map_err(|error| {
+                    format!(
+                        "could not inspect an entry in BOOX handoff incoming directory {}: {error}",
+                        incoming.display()
+                    )
+                })?
+                .path();
+            let name = descriptor_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if !name.ends_with(DESCRIPTOR_SUFFIX) {
+                continue;
+            }
+            let Ok(delivery) = read_broker_delivery_descriptor(&descriptor_path, name, document)
+            else {
+                continue;
+            };
+            if delivery.event_id == installed.event_id
+                || !strictly_dominates(installed.source_revisions, delivery.source_revisions)
+            {
+                continue;
+            }
+            let pdf_path = incoming.join(&delivery.pdf_file_name);
+            validate_regular_pdf_if_exists(&pdf_path, &delivery.content_sha256)?;
+            remove_file_and_sync(&pdf_path, &incoming)?;
+            remove_file_and_sync(&descriptor_path, &incoming)?;
+        }
+        Ok(())
+    }
+
+    pub fn retire_accepted_artifact(
+        &self,
+        document: &DocumentFolders,
+        artifact: &FinalizedBooxArtifact,
+    ) -> Result<(), String> {
+        validate_finalized_event(&artifact.event, document)?;
+        let pdf_file_name = artifact
+            .pdf_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "finalized BOOX PDF {} has no file name",
+                    artifact.pdf_path.display()
+                )
+            })?;
+        validate_file_name(pdf_file_name, "finalized BOOX PDF file name")?;
+        let marker = FinalizedRetirementMarker {
+            schema_version: 1,
+            document_id: document.document_id.clone(),
+            event_id: artifact.event.event_id.clone(),
+            content_sha256: artifact.event.content_sha256.clone(),
+            pdf_file_name: pdf_file_name.to_owned(),
+        };
+        let outgoing = self.document_root.join("outgoing");
+        let marker_path = outgoing.join(retirement_marker_name(&marker.event_id));
+        publish_retirement_marker(&marker_path, &marker, &outgoing)?;
+        recover_retirement_marker(&marker_path, &outgoing, document)
+    }
+
+    fn recover_retirements(&self, document: &DocumentFolders) -> Result<(), String> {
+        let outgoing = self.document_root.join("outgoing");
+        let entries = match fs::read_dir(&outgoing) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect BOOX handoff outgoing directory {}: {error}",
+                    outgoing.display()
+                ))
+            }
+        };
+        let mut markers = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|error| {
+                    format!(
+                        "could not inspect an entry in BOOX handoff outgoing directory {}: {error}",
+                        outgoing.display()
+                    )
+                })?
+                .path();
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(RETIREMENT_MARKER_PREFIX)
+                        && name.ends_with(RETIREMENT_MARKER_SUFFIX)
+                })
+            {
+                markers.push(path);
+            }
+        }
+        markers.sort();
+        for marker in markers {
+            recover_retirement_marker(&marker, &outgoing, document)?;
+        }
+        Ok(())
+    }
     pub fn finalized_artifacts(
         &self,
         document: &DocumentFolders,
     ) -> Result<Vec<FinalizedBooxArtifact>, String> {
+        self.recover_retirements(document)?;
         let outgoing = self.document_root.join("outgoing");
         let entries = match fs::read_dir(&outgoing) {
             Ok(entries) => entries,
@@ -167,6 +349,315 @@ impl BooxHandoffEndpoint {
     }
 }
 
+fn validate_installed_delivery(
+    installed: &InstalledBooxDelivery,
+    document: &DocumentFolders,
+) -> Result<(), String> {
+    if installed.schema_version != 1 {
+        return Err(format!(
+            "unsupported BOOX installed-delivery acknowledgement schema {}",
+            installed.schema_version
+        ));
+    }
+    if installed.producer != COMPANION_PRODUCER {
+        return Err(
+            "BOOX installed-delivery acknowledgement has an unexpected producer".to_owned(),
+        );
+    }
+    if installed.document_id != document.document_id {
+        return Err(format!(
+            "BOOX installed-delivery acknowledgement belongs to {}, not {}",
+            installed.document_id, document.document_id
+        ));
+    }
+    if installed.event_id.trim().is_empty() || installed.event_id.len() > 256 {
+        return Err("BOOX installed-delivery acknowledgement has an invalid eventId".to_owned());
+    }
+    if installed.source_generation == 0 {
+        return Err("BOOX installed-delivery acknowledgement has an invalid generation".to_owned());
+    }
+    validate_sha256(
+        &installed.content_sha256,
+        "installed BOOX broker content hash",
+    )?;
+    validate_file_name(&installed.active_file_name, "active BOOX PDF file name")
+}
+
+fn read_broker_delivery_descriptor(
+    descriptor_path: &Path,
+    name: &str,
+    document: &DocumentFolders,
+) -> Result<BrokerDeliveryDescriptor, String> {
+    let metadata = fs::symlink_metadata(descriptor_path).map_err(|error| {
+        format!(
+            "could not inspect BOOX broker descriptor {}: {error}",
+            descriptor_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "BOOX broker descriptor {} is not a regular file",
+            descriptor_path.display()
+        ));
+    }
+    let bytes = read_bounded_descriptor(descriptor_path, &metadata)?;
+    let delivery: BrokerDeliveryDescriptor = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "invalid BOOX broker descriptor {}: {error}",
+            descriptor_path.display()
+        )
+    })?;
+    if delivery.schema_version != DESCRIPTOR_SCHEMA_VERSION
+        || delivery.producer != BROKER_PRODUCER
+        || delivery.document_id != document.document_id
+        || delivery.original_file_name != document.original_file_name
+        || delivery.event_id.trim().is_empty()
+        || delivery.event_id.len() > 256
+        || delivery.source_generation == 0
+    {
+        return Err(format!(
+            "BOOX broker descriptor {} does not match its document or protocol",
+            descriptor_path.display()
+        ));
+    }
+    validate_sha256(
+        &delivery.content_sha256,
+        "BOOX broker delivery content hash",
+    )?;
+    validate_file_name(
+        &delivery.pdf_file_name,
+        "BOOX broker delivery PDF file name",
+    )?;
+    if name != format!("{}.inkbridge.json", delivery.pdf_file_name) {
+        return Err(format!(
+            "BOOX broker descriptor {} does not match PDF {}",
+            descriptor_path.display(),
+            delivery.pdf_file_name
+        ));
+    }
+    Ok(delivery)
+}
+
+fn strictly_dominates(left: RevisionPair, right: RevisionPair) -> bool {
+    left != right && left.boox >= right.boox && left.supernote >= right.supernote
+}
+
+fn retirement_marker_name(event_id: &str) -> String {
+    format!(
+        "{RETIREMENT_MARKER_PREFIX}{}{RETIREMENT_MARKER_SUFFIX}",
+        inkbridge_broker::sha256_hex(event_id.as_bytes())
+    )
+}
+
+fn publish_retirement_marker(
+    marker_path: &Path,
+    marker: &FinalizedRetirementMarker,
+    outgoing: &Path,
+) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec_pretty(marker).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES {
+        return Err("BOOX finalized-retirement marker exceeds the metadata limit".to_owned());
+    }
+    match fs::symlink_metadata(marker_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "BOOX finalized-retirement marker {} is not a regular file",
+                    marker_path.display()
+                ));
+            }
+            let existing = read_bounded_descriptor(marker_path, &metadata)?;
+            if existing != bytes {
+                return Err(format!(
+                    "BOOX finalized-retirement marker {} has unexpected content",
+                    marker_path.display()
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not inspect BOOX finalized-retirement marker {}: {error}",
+                marker_path.display()
+            ))
+        }
+    }
+    fs::create_dir_all(outgoing)
+        .map_err(|error| format!("could not create {}: {error}", outgoing.display()))?;
+    let temporary = marker_path.with_extension("json.part");
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not remove stale BOOX retirement marker {}: {error}",
+                temporary.display()
+            ))
+        }
+    }
+    let mut output = fs::File::create(&temporary)
+        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+    output
+        .write_all(&bytes)
+        .and_then(|_| output.flush())
+        .and_then(|_| output.sync_all())
+        .map_err(|error| format!("could not finalize {}: {error}", temporary.display()))?;
+    drop(output);
+    fs::rename(&temporary, marker_path).map_err(|error| {
+        format!(
+            "could not publish BOOX retirement marker {}: {error}",
+            marker_path.display()
+        )
+    })?;
+    sync_directory(outgoing)
+}
+
+fn recover_retirement_marker(
+    marker_path: &Path,
+    outgoing: &Path,
+    document: &DocumentFolders,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(marker_path).map_err(|error| {
+        format!(
+            "could not inspect BOOX finalized-retirement marker {}: {error}",
+            marker_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "BOOX finalized-retirement marker {} is not a regular file",
+            marker_path.display()
+        ));
+    }
+    let bytes = read_bounded_descriptor(marker_path, &metadata)?;
+    let marker: FinalizedRetirementMarker = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "invalid BOOX finalized-retirement marker {}: {error}",
+            marker_path.display()
+        )
+    })?;
+    if marker.schema_version != 1
+        || marker.document_id != document.document_id
+        || marker.event_id.trim().is_empty()
+        || marker.event_id.len() > 256
+        || marker_path.file_name().and_then(|value| value.to_str())
+            != Some(retirement_marker_name(&marker.event_id).as_str())
+    {
+        return Err(format!(
+            "BOOX finalized-retirement marker {} does not match its document or identity",
+            marker_path.display()
+        ));
+    }
+    validate_sha256(&marker.content_sha256, "retired BOOX content hash")?;
+    validate_file_name(&marker.pdf_file_name, "retired BOOX PDF file name")?;
+    let pdf_path = outgoing.join(&marker.pdf_file_name);
+    let descriptor_path = outgoing.join(format!("{}.inkbridge.json", marker.pdf_file_name));
+    validate_regular_pdf_if_exists(&pdf_path, &marker.content_sha256)?;
+    if let Ok(descriptor_metadata) = fs::symlink_metadata(&descriptor_path) {
+        if descriptor_metadata.file_type().is_symlink() || !descriptor_metadata.is_file() {
+            return Err(format!(
+                "acknowledged BOOX descriptor {} is not a regular file",
+                descriptor_path.display()
+            ));
+        }
+        let descriptor_bytes = read_bounded_descriptor(&descriptor_path, &descriptor_metadata)?;
+        let event: StorageEvent = serde_json::from_slice(&descriptor_bytes).map_err(|error| {
+            format!(
+                "invalid acknowledged BOOX descriptor {}: {error}",
+                descriptor_path.display()
+            )
+        })?;
+        validate_finalized_event(&event, document)?;
+        let object_file_name = Path::new(&event.object_path)
+            .file_name()
+            .and_then(|value| value.to_str());
+        if event.event_id != marker.event_id
+            || event.content_sha256 != marker.content_sha256
+            || object_file_name != Some(marker.pdf_file_name.as_str())
+        {
+            return Err(format!(
+                "acknowledged BOOX descriptor {} does not match its retirement marker",
+                descriptor_path.display()
+            ));
+        }
+    }
+    remove_file_and_sync(&pdf_path, outgoing)?;
+    remove_file_and_sync(&descriptor_path, outgoing)?;
+    remove_file_and_sync(marker_path, outgoing)
+}
+
+fn validate_regular_pdf_if_exists(path: &Path, expected_hash: &str) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "BOOX handoff PDF {} is not a regular file",
+            path.display()
+        ));
+    }
+    let actual_hash = sha256_file(path)?;
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "BOOX handoff PDF {} changed before retirement and was preserved",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("could not open {} for hashing: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not hash {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn remove_file_and_sync(path: &Path, directory: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_directory(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+    }
+}
+
+fn sync_directory(directory: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory)
+            .and_then(|file| file.sync_all())
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+            Err(error) => Err(format!("could not sync {}: {error}", directory.display())),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("could not sync {}: {error}", directory.display()))
+    }
+}
 fn read_finalized_artifact(
     outgoing: &Path,
     descriptor_path: PathBuf,
@@ -419,6 +910,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn installed_acknowledgement_retires_only_superseded_incoming_pairs() {
+        let root = tempdir().unwrap();
+        let document = document();
+        let endpoint = BooxHandoffEndpoint::new(root.path(), &document).unwrap();
+        let incoming = root.path().join(&document.document_id).join("incoming");
+        fs::create_dir_all(&incoming).unwrap();
+        let prepare = |event_id: &str, generation: u64, revisions: RevisionPair, bytes: &[u8]| {
+            let object = CloudObject {
+                path: format!("BOOX_Folder/{}/Example.pdf", document.document_id),
+                generation,
+                size: bytes.len() as u64,
+                metadata: BTreeMap::from([(GENERATED_EVENT_ID.to_owned(), event_id.to_owned())]),
+            };
+            endpoint
+                .prepare_delivery(
+                    &document,
+                    &object,
+                    revisions,
+                    &inkbridge_broker::sha256_hex(bytes),
+                )
+                .unwrap()
+        };
+        let first = prepare(
+            "broker-event-1",
+            1,
+            RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+            b"first",
+        );
+        let second = prepare(
+            "broker-event-2",
+            2,
+            RevisionPair {
+                boox: 1,
+                supernote: 2,
+            },
+            b"second",
+        );
+        for (delivery, bytes) in [
+            (&first, b"first".as_slice()),
+            (&second, b"second".as_slice()),
+        ] {
+            fs::write(&delivery.pdf_path, bytes).unwrap();
+            fs::write(&delivery.descriptor_path, &delivery.descriptor_bytes).unwrap();
+        }
+        fs::write(
+            root.path()
+                .join(&document.document_id)
+                .join(INSTALLED_ACKNOWLEDGEMENT_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "producer": COMPANION_PRODUCER,
+                "eventId": "broker-event-2",
+                "documentId": document.document_id,
+                "sourceRevisions": {"boox": 1, "supernote": 2},
+                "sourceGeneration": 2,
+                "contentSha256": inkbridge_broker::sha256_hex(b"second"),
+                "activeFileName": "active.pdf"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let installed = endpoint.installed_delivery(&document).unwrap().unwrap();
+        endpoint
+            .retire_superseded_incoming(&document, &installed)
+            .unwrap();
+
+        assert!(!first.pdf_path.exists());
+        assert!(!first.descriptor_path.exists());
+        assert!(second.pdf_path.is_file());
+        assert!(second.descriptor_path.is_file());
+    }
+
+    #[test]
+    fn durable_marker_finishes_interrupted_accepted_outgoing_retirement() {
+        let root = tempdir().unwrap();
+        let document = document();
+        let endpoint = BooxHandoffEndpoint::new(root.path(), &document).unwrap();
+        let outgoing = root.path().join(&document.document_id).join("outgoing");
+        fs::create_dir_all(&outgoing).unwrap();
+        let bytes = b"accepted NeoReader PDF";
+        let pdf_name = "Example__boox-finalized-g1.pdf";
+        let event = StorageEvent {
+            schema_version: EVENT_SCHEMA_VERSION,
+            event_id: "accepted-finalization".to_owned(),
+            document_id: document.document_id.clone(),
+            source: DeviceSide::Boox,
+            object_path: format!("BOOX_Folder/{}/{pdf_name}", document.document_id),
+            source_generation: 1,
+            source_revision: 1,
+            based_on: RevisionPair::default(),
+            content_sha256: inkbridge_broker::sha256_hex(bytes),
+            payload_kind: DevicePayloadKind::DeviceView,
+            broker_output: None,
+        };
+        fs::write(outgoing.join(pdf_name), bytes).unwrap();
+        fs::write(
+            outgoing.join(format!("{pdf_name}.inkbridge.json")),
+            serde_json::to_vec_pretty(&event).unwrap(),
+        )
+        .unwrap();
+        let marker = FinalizedRetirementMarker {
+            schema_version: 1,
+            document_id: document.document_id.clone(),
+            event_id: event.event_id.clone(),
+            content_sha256: event.content_sha256.clone(),
+            pdf_file_name: pdf_name.to_owned(),
+        };
+        let marker_path = outgoing.join(retirement_marker_name(&event.event_id));
+        publish_retirement_marker(&marker_path, &marker, &outgoing).unwrap();
+
+        assert!(endpoint.finalized_artifacts(&document).unwrap().is_empty());
+        assert!(fs::read_dir(outgoing).unwrap().next().is_none());
+    }
     #[test]
     fn bounded_descriptor_read_rejects_growth_after_metadata_check() {
         let root = tempdir().unwrap();

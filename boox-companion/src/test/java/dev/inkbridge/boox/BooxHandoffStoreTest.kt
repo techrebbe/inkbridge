@@ -33,6 +33,26 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun install_publishesAndRecoversCurrentInstalledAcknowledgement() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-ack", RevisionPair(1, 2), 10, "acknowledged".toByteArray()),
+        ) as InstallResult.Installed
+        val acknowledgement = File(File(root, documentId), ".inkbridge-installed.json")
+
+        val first = InstalledDeliveryAcknowledgement.fromJson(JSONObject(acknowledgement.readText()))
+        assertEquals("event-ack", first.eventId)
+        assertEquals(RevisionPair(1, 2), first.sourceRevisions)
+        assertEquals(installed.activeFile.name, first.activeFileName)
+        assertEquals(sha256Hex("acknowledged".toByteArray()), first.contentSha256)
+
+        assertTrue(acknowledgement.delete())
+        store.state(documentId)
+        val recovered = InstalledDeliveryAcknowledgement.fromJson(JSONObject(acknowledgement.readText()))
+        assertEquals(first, recovered)
+    }
+    @Test
     fun longValidOriginalNameWithWideCountersRemainsFinalizable() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

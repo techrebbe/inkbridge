@@ -376,6 +376,7 @@ class BooxHandoffStore(
         compactAcknowledgedRetiredPredecessors(documentRoot, intent)
         clearInstallIntent(documentRoot)
         recoverRetiredPredecessors(documentRoot)
+        ensureInstallAcknowledgement(documentRoot)
         return InstallResult.Installed(destination, requireNotNull(readState(documentRoot)))
     }
     private fun documentRoot(documentId: String): File {
@@ -385,9 +386,11 @@ class BooxHandoffStore(
 
     private fun activeDir(documentRoot: File) = File(documentRoot, "active").also(File::mkdirs)
     private fun incomingDir(documentRoot: File) = File(documentRoot, "incoming")
-    private fun retiredDir(documentRoot: File) = File(documentRoot, ".retired").also(File::mkdirs)
+    private fun retiredDir(documentRoot: File) = File(documentRoot, ".retired")
     private fun outgoingDir(documentRoot: File) = File(documentRoot, "outgoing").also(File::mkdirs)
     private fun stateFile(documentRoot: File) = File(documentRoot, ".inkbridge-state.json")
+    private fun installedAcknowledgementFile(documentRoot: File) =
+        File(documentRoot, ".inkbridge-installed.json")
     private fun installIntentFile(documentRoot: File) = File(documentRoot, ".inkbridge-install.json")
     private fun finalizeIntentFile(documentRoot: File) = File(documentRoot, ".inkbridge-finalize.json")
 
@@ -490,6 +493,7 @@ class BooxHandoffStore(
         recoverMissingActive(documentRoot)
         if (verifyRetiredPredecessors) recoverRetiredPredecessors(documentRoot)
         requireStateForActiveFiles(documentRoot)
+        ensureInstallAcknowledgement(documentRoot)
     }
 
     private fun requireStateForActiveFiles(documentRoot: File) {
@@ -622,6 +626,41 @@ class BooxHandoffStore(
         clearFinalizeIntent(documentRoot)
     }
 
+    private fun ensureInstallAcknowledgement(documentRoot: File) {
+        val state = readState(documentRoot) ?: return
+        val active = File(activeDir(documentRoot), state.activeFileName)
+        if (!active.isFile) return
+        val acknowledgement = InstalledDeliveryAcknowledgement.fromState(state)
+        val bytes = acknowledgement.toJson().toString(2).toByteArray()
+        requireMetadataSize(bytes, "Installed-delivery acknowledgement")
+        writeReplaceableDerivedMetadata(
+            documentRoot,
+            installedAcknowledgementFile(documentRoot),
+            bytes,
+        )
+    }
+
+    private fun writeReplaceableDerivedMetadata(
+        documentRoot: File,
+        destination: File,
+        bytes: ByteArray,
+    ) {
+        if (destination.isFile && runCatching {
+                readMetadataBytes(destination, "Installed-delivery acknowledgement").contentEquals(bytes)
+            }.getOrDefault(false)
+        ) {
+            return
+        }
+        require(!destination.exists() || destination.isFile) {
+            "Installed-delivery acknowledgement path is not a file"
+        }
+        val next = File(documentRoot, destination.name + ".next")
+        deleteAndSync(next, documentRoot)
+        writeSynced(next, bytes)
+        deleteAndSync(destination, documentRoot)
+        moveNoReplace(next, destination)
+        syncDirectory(documentRoot)
+    }
     private fun writeInstallIntent(documentRoot: File, intent: InstallIntent) {
         intent.validate(documentRoot.name)
         val bytes = intent.toJson().toString(2).toByteArray()
@@ -1091,7 +1130,16 @@ class BooxHandoffStore(
 
     private fun moveNoReplace(source: File, destination: File) {
         val sourceDirectory = requireNotNull(source.parentFile)
-        val destinationDirectory = requireNotNull(destination.parentFile).also(File::mkdirs)
+        val destinationDirectory = requireNotNull(destination.parentFile)
+        if (!destinationDirectory.isDirectory) {
+            require(!destinationDirectory.exists()) {
+                "Destination directory path is not a directory: " + destinationDirectory.name
+            }
+            require(destinationDirectory.mkdirs()) {
+                "Could not create destination directory " + destinationDirectory.name
+            }
+            destinationDirectory.parentFile?.let(::syncDirectory)
+        }
         // ATOMIC_MOVE may replace a target that appears concurrently. With no
         // REPLACE_EXISTING option, the provider must fail rather than overwrite.
         Files.move(source.toPath(), destination.toPath())

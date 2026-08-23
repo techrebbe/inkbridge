@@ -17,6 +17,19 @@ class BooxHandoffModelsTest {
     }
 
     @Test
+    fun installedAcknowledgementRoundTripsFromCommittedState() {
+        val state = state()
+        val acknowledgement = InstalledDeliveryAcknowledgement.fromState(state)
+
+        assertEquals(
+            acknowledgement,
+            InstalledDeliveryAcknowledgement.fromJson(acknowledgement.toJson()),
+        )
+        assertEquals(state.brokerEventId, acknowledgement.eventId)
+        assertEquals(state.activeRevisions, acknowledgement.sourceRevisions)
+        assertEquals(state.installedBrokerSha256, acknowledgement.contentSha256)
+    }
+    @Test
     fun worstCaseReplayHistoryFitsInstallAndFinalizeIntents() {
         val worstCaseEventId = "\u0000".repeat(256)
         val replayHistory = List(MAX_PROCESSED_EVENT_IDS) { worstCaseEventId }

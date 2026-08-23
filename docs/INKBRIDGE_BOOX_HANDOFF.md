@@ -29,6 +29,7 @@ InkBridge/
       Original__ib-b2-s4-g19__boox-finalized-g1-<hash>.pdf
       Original__ib-b2-s4-g19__boox-finalized-g1-<hash>.pdf.inkbridge.json
     .inkbridge-state.json
+    .inkbridge-installed.json # durable current broker-view acknowledgement
     .inkbridge-install.json  # present only while an install is being committed/recovered
 ```
 
@@ -57,6 +58,7 @@ The companion validates the producer, document ID, filenames, source generation,
 ## Safety rules
 
 - Duplicate events are idempotent and cannot create a second active PDF.
+- After an install commits, the companion atomically publishes `.inkbridge-installed.json`. The transport uses this acknowledgement to keep the current incoming PDF/descriptor as the active recovery pair while durably retiring older dominated pairs. Losing the transport checkpoint therefore cannot recreate obsolete 300–500 MB deliveries.
 - Incoming descriptors whose revisions are already dominated by the active frontier are ignored even after their event IDs age out of the bounded replay cache. The cache retains 64 recent byte-bounded IDs so two worst-case handoff states still fit in one crash-recovery intent.
 - Malformed descriptors and descriptor/PDF pairs that are not complete yet are skipped, allowing later valid deliveries to remain installable.
 - A stale or incomparable revision is rejected; there is no latest-file-wins behavior.
@@ -68,7 +70,8 @@ The companion validates the producer, document ID, filenames, source generation,
 - Files and state use synchronized temporary files plus create-only publication. Existing destination bytes are never overwritten, and each streamed PDF copy is hash-verified before its temporary file is published.
 - A durable install intent keeps the previous active PDF in place until the replacement PDF and state are committed. After interruption or power loss, the next companion action completes the install or safely discards an unpublished attempt before retiring the predecessor.
 - Returning to the companion after it paused for a NeoReader launch records the versioned-path handoff boundary; merely dispatching the asynchronous Android intent does not. The pending pause marker is stored in app-private preferences through activity/process recreation and is cleared only after the handoff-state confirmation commits, so a crash or transient write failure cannot lose that boundary. InkBridge retains and watches at most one full predecessor PDF; the next confirmed install rechecks late bytes, publishes any final edit, and crash-safely removes the older predecessor. If the active handoff was never opened, a further install is refused instead of deleting uncertain data or growing storage without a bound.
-- If either member of an already-finalized outgoing PDF/descriptor pair disappears, the next finalize action deterministically reconstructs the missing artifact from the unchanged active PDF and saved revision state.
+- Before broker acceptance, if either member of an already-finalized outgoing PDF/descriptor pair disappears, the next finalize action deterministically reconstructs the missing artifact from the unchanged active PDF and saved revision state.
+- After the broker accepts a finalized BOOX revision and the companion installs a broker view containing that revision, the transport writes a synchronized retirement marker and removes the acknowledged outgoing PDF/descriptor pair. An interrupted cleanup resumes from the marker, so normal finalizations do not accumulate full-document snapshots.
 
 ## User flow
 

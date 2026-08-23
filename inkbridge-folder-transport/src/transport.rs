@@ -1,7 +1,7 @@
 use crate::{
     boox_handoff::{BooxHandoffEndpoint, FinalizedBooxArtifact, MAX_DESCRIPTOR_BYTES},
-    CloudFolder, CloudObject, DocumentFolders, FileObservation, PendingUpload, SyncReport,
-    TransportAction, TransportState,
+    CloudFolder, CloudObject, DocumentFolders, DocumentTransportState, FileObservation,
+    PendingUpload, SyncReport, TransportAction, TransportState,
 };
 use inkbridge_broker::{sha256_hex, DeviceSide, RevisionPair, BROKER_PRODUCER};
 use inkbridge_convert::{build_manifest, parse_baseline_bytes, BaselineExport};
@@ -440,6 +440,50 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         state: &mut TransportState,
         report: &mut SyncReport,
     ) -> Result<(), String> {
+        let boox_handoff_endpoint = self.boox_handoff_endpoint(document)?;
+        let installed_boox_delivery = boox_handoff_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.installed_delivery(document))
+            .transpose()?
+            .flatten();
+        if let (Some(endpoint), Some(installed)) = (
+            boox_handoff_endpoint.as_ref(),
+            installed_boox_delivery.as_ref(),
+        ) {
+            endpoint.retire_superseded_incoming(document, installed)?;
+            let current = state.document_mut(&document.document_id).revisions;
+            let known_content_hash = state
+                .document_mut(&document.document_id)
+                .boox
+                .delivered_content_sha256
+                .as_deref();
+            if installed.source_revisions == current
+                && known_content_hash.is_some_and(|hash| hash != installed.content_sha256)
+            {
+                return Err(format!(
+                    "BOOX installed acknowledgement {} reports different content for frontier {}:{}",
+                    installed.event_id, current.boox, current.supernote,
+                ));
+            }
+            if dominates(installed.source_revisions, current) {
+                record_delivered_frontier(
+                    state.document_mut(&document.document_id),
+                    installed.source_revisions,
+                    DeviceSide::Boox,
+                    installed.content_sha256.clone(),
+                );
+            } else if !dominates(current, installed.source_revisions) {
+                return Err(format!(
+                    "BOOX installed acknowledgement {} at {}:{} conflicts with transport frontier {}:{}",
+                    installed.event_id,
+                    installed.source_revisions.boox,
+                    installed.source_revisions.supernote,
+                    current.boox,
+                    current.supernote,
+                ));
+            }
+        }
+
         let mut candidates = Vec::new();
         candidates.extend(
             self.cloud
@@ -486,7 +530,8 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             let generation_key = object.generation_key();
             let expected_hash = required_metadata(&object, CONTENT_SHA256)?.to_owned();
             let boox_handoff_delivery = if side == DeviceSide::Boox {
-                self.boox_handoff_endpoint(document)?
+                boox_handoff_endpoint
+                    .as_ref()
                     .map(|endpoint| {
                         endpoint.prepare_delivery(document, &object, revisions, &expected_hash)
                     })
@@ -494,6 +539,21 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             } else {
                 None
             };
+            if let (Some(installed), Some(delivery)) = (
+                installed_boox_delivery.as_ref(),
+                boox_handoff_delivery.as_ref(),
+            ) {
+                if installed.event_id != delivery.event_id
+                    && installed.source_revisions != revisions
+                    && dominates(installed.source_revisions, revisions)
+                {
+                    state
+                        .document_mut(&document.document_id)
+                        .delivered_generations
+                        .insert(generation_key);
+                    continue;
+                }
+            }
             let local_path = match side {
                 DeviceSide::Boox => boox_handoff_delivery
                     .as_ref()
@@ -738,24 +798,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
             remember_file_hash(&local_path, state, SystemTime::now(), &expected_hash)?;
             let document_state = state.document_mut(&document.document_id);
-            document_state.revisions = revisions;
-            document_state.side_mut(side).delivered_content_sha256 = Some(expected_hash);
-            for source in [DeviceSide::Boox, DeviceSide::Supernote] {
-                let accepted_revision = revisions.get(source);
-                let accepted_pending = document_state
-                    .side(source)
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.source_revision <= accepted_revision)
-                    .then(|| document_state.side_mut(source).pending.take())
-                    .flatten();
-                if let Some(pending) = accepted_pending {
-                    document_state
-                        .side_mut(source)
-                        .accepted_local_hashes
-                        .insert(pending.local_path, pending.local_content_sha256);
-                }
-            }
+            record_delivered_frontier(document_state, revisions, side, expected_hash);
             document_state.delivered_generations.insert(generation_key);
             report.actions.push(TransportAction::Delivered {
                 side,
@@ -796,26 +839,36 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         {
             return Ok(());
         }
+        let installed_boox_delivery = endpoint.installed_delivery(document)?;
         for artifact in endpoint.finalized_artifacts(document)? {
             let local_key = canonical_path_key(&artifact.pdf_path);
             let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
             let expected_source_hash = artifact.event.content_sha256.clone();
-            let already_processed = {
+            let (already_uploaded, accepted) = {
                 let boox_state = &state.document_mut(&document.document_id).boox;
-                boox_state
+                let already_uploaded = boox_state
                     .uploaded_local_hashes
+                    .get(&local_key)
+                    .is_some_and(|hash| hash == &expected_source_hash);
+                let accepted = boox_state
+                    .accepted_local_hashes
                     .get(&local_key)
                     .is_some_and(|hash| hash == &expected_source_hash)
                     || boox_state
-                        .accepted_local_hashes
-                        .get(&local_key)
-                        .is_some_and(|hash| hash == &expected_source_hash)
-                    || boox_state
                         .accepted_source_revisions
                         .get(&source_local_id)
-                        .is_some_and(|revision| *revision >= artifact.event.source_revision)
+                        .is_some_and(|revision| *revision >= artifact.event.source_revision);
+                (already_uploaded, accepted)
             };
-            if already_processed {
+            if accepted {
+                if installed_boox_delivery.as_ref().is_some_and(|installed| {
+                    installed.source_revisions.boox >= artifact.event.source_revision
+                }) {
+                    endpoint.retire_accepted_artifact(document, &artifact)?;
+                }
+                continue;
+            }
+            if already_uploaded {
                 continue;
             }
             if !file_is_settled(&artifact.descriptor_path, state, now, self.settle)?
@@ -1575,6 +1628,32 @@ fn parse_revision_metadata(object: &CloudObject) -> Result<RevisionPair, String>
 
 fn dominates(candidate: RevisionPair, current: RevisionPair) -> bool {
     candidate.boox >= current.boox && candidate.supernote >= current.supernote
+}
+
+fn record_delivered_frontier(
+    document_state: &mut DocumentTransportState,
+    revisions: RevisionPair,
+    side: DeviceSide,
+    content_sha256: String,
+) {
+    document_state.revisions = revisions;
+    document_state.side_mut(side).delivered_content_sha256 = Some(content_sha256);
+    for source in [DeviceSide::Boox, DeviceSide::Supernote] {
+        let accepted_revision = revisions.get(source);
+        let accepted_pending = document_state
+            .side(source)
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.source_revision <= accepted_revision)
+            .then(|| document_state.side_mut(source).pending.take())
+            .flatten();
+        if let Some(pending) = accepted_pending {
+            document_state
+                .side_mut(source)
+                .accepted_local_hashes
+                .insert(pending.local_path, pending.local_content_sha256);
+        }
+    }
 }
 
 fn supernote_export_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
