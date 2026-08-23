@@ -478,6 +478,52 @@ fn installed_boox_ack_bounds_incoming_history_and_recovers_lost_checkpoint() {
 }
 
 #[test]
+fn unverified_installed_ack_does_not_advance_frontier_or_retire_deliveries() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let cloud = FakeCloud::default();
+    let generated = b"authoritative broker PDF".to_vec();
+    let generated_hash = sha256_hex(&generated);
+    cloud.put(
+        &format!("BOOX_Folder/{}/book.pdf", document.document_id),
+        generated,
+        generated_metadata(&document.document_id, "0:1", b"authoritative broker PDF"),
+    );
+    write_installed_boox_ack(
+        &handoff_root,
+        &document,
+        &format!("broker-event-{generated_hash}"),
+        RevisionPair {
+            boox: 99,
+            supernote: 99,
+        },
+        1,
+        &generated_hash,
+    );
+
+    let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+    let mut state = TransportState::empty();
+    let error = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap_err();
+
+    assert!(error.contains("does not match an authoritative broker output"));
+    assert!(
+        state.documents.is_empty(),
+        "an unverified acknowledgement must not mutate the transaction state"
+    );
+    assert!(
+        !handoff_root
+            .join(&document.document_id)
+            .join("incoming")
+            .exists(),
+        "an unverified acknowledgement must not trigger incoming cleanup or delivery"
+    );
+}
+
+#[test]
 fn accepted_finalized_boox_snapshot_is_retired_after_installed_broker_view() {
     let root = tempdir().unwrap();
     let handoff_root = root.path().join("boox-handoff");
@@ -523,6 +569,12 @@ fn accepted_finalized_boox_snapshot_is_retired_after_installed_broker_view() {
         ..TransportState::empty()
     };
     let cloud = FakeCloud::default();
+    let installed_view = b"installed broker view".to_vec();
+    cloud.put(
+        &format!("BOOX_Folder/{}/installed-r1.pdf", document.document_id),
+        installed_view.clone(),
+        generated_metadata(&document.document_id, "1:1", &installed_view),
+    );
     let transport = FolderTransport::new(&cloud, &FakeBuilder, Duration::ZERO)
         .with_boox_handoff_root(&handoff_root);
 
@@ -537,13 +589,13 @@ fn accepted_finalized_boox_snapshot_is_retired_after_installed_broker_view() {
     write_installed_boox_ack(
         &handoff_root,
         &document,
-        "broker-view-accepted-r1",
+        &format!("broker-event-{}", sha256_hex(&installed_view)),
         RevisionPair {
             boox: 1,
             supernote: 1,
         },
-        2,
-        &sha256_hex(b"installed broker view"),
+        1,
+        &sha256_hex(&installed_view),
     );
     transport
         .sync_document(&document, &mut state, SystemTime::now())
