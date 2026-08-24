@@ -2468,13 +2468,20 @@ fn equal_revision_alternate_payload_can_only_be_discarded() {
         "discard-equal-revision-alternate",
         ConflictResolutionStrategy::KeepCurrent,
     );
-    assert!(matches!(
-        harness
-            .broker
-            .resolve_conflict(&mut harness.storage, &keep)
-            .unwrap(),
-        ConflictResolutionOutcome::Superseded { .. }
-    ));
+    let outcome = harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &keep)
+        .unwrap();
+    let ConflictResolutionOutcome::Resolved {
+        source_revisions,
+        outputs,
+        ..
+    } = outcome
+    else {
+        panic!("equal-revision keep-current did not generate corrective outputs")
+    };
+    assert_eq!(source_revisions, accepted_state.revisions());
+    assert_eq!(outputs.len(), 2);
 
     let discarded_state = harness.state();
     assert_eq!(discarded_state.revisions(), accepted_state.revisions());
@@ -2491,7 +2498,7 @@ fn equal_revision_alternate_payload_can_only_be_discarded() {
         .contains_key("alternate-at-revision-one"));
     assert!(discarded_state.conflicts.is_empty());
     let record = &discarded_state.resolved_conflicts["sn-alternate-revision-one"];
-    assert!(record.superseded);
+    assert!(!record.superseded);
     assert_eq!(record.strategy, ConflictResolutionStrategy::KeepCurrent);
 
     let retry = harness.event(
@@ -2514,6 +2521,171 @@ fn equal_revision_alternate_payload_can_only_be_discarded() {
     assert_eq!(
         harness.state().strokes["alternate-at-revision-one"].snapshot,
         alternate
+    );
+}
+
+#[test]
+fn equal_revision_in_place_boox_keep_current_rebuilds_canonical_view() {
+    let mut harness = Harness::new();
+    let base = stroke("sn-base-equal-boox", 0.2, 0.3);
+    let initial = harness.event(
+        "sn-base-equal-boox",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let boox_path = boox_view_path(&harness.state());
+    let generated = harness.storage.object(&boox_path).unwrap().clone();
+    let accepted = stroke("boox-accepted-equal-revision", 0.45, 0.5);
+    let accepted_pdf =
+        write_boox_view(&harness.original, [base.clone(), accepted.clone()]).unwrap();
+    let accepted_hash = sha256_hex(&accepted_pdf);
+    let accepted_object =
+        harness
+            .storage
+            .put_unchecked(&boox_path, accepted_pdf.clone(), generated.metadata.clone());
+    let accepted_event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-accepted-equal-revision".to_owned(),
+        document_id: harness.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: boox_path.clone(),
+        source_generation: accepted_object.generation,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: accepted_hash.clone(),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: Some(BrokerOutputMarker {
+            producer: BROKER_PRODUCER.to_owned(),
+            event_id: "sn-base-equal-boox".to_owned(),
+            document_id: harness.document_id.clone(),
+            source_revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+        }),
+    };
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &accepted_event)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
+    let accepted_state = harness.state();
+    assert_eq!(accepted_state.boox.content_sha256, accepted_hash);
+    assert_eq!(
+        accepted_state.boox.source_generation,
+        accepted_object.generation
+    );
+
+    let alternate = stroke("boox-rejected-equal-revision", 0.75, 0.7);
+    let alternate_pdf = write_boox_view(&harness.original, [base.clone(), alternate]).unwrap();
+    let alternate_hash = sha256_hex(&alternate_pdf);
+    let current = harness.storage.object(&boox_path).unwrap().clone();
+    let alternate_object =
+        harness
+            .storage
+            .put_unchecked(&boox_path, alternate_pdf, current.metadata);
+    let conflicting = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-rejected-equal-revision".to_owned(),
+        document_id: harness.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: boox_path.clone(),
+        source_generation: alternate_object.generation,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: alternate_hash.clone(),
+        payload_kind: DevicePayloadKind::DeviceView,
+        broker_output: Some(BrokerOutputMarker {
+            producer: BROKER_PRODUCER.to_owned(),
+            event_id: "sn-base-equal-boox".to_owned(),
+            document_id: harness.document_id.clone(),
+            source_revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+        }),
+    };
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &conflicting)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+    assert_eq!(
+        sha256_hex(&harness.storage.object(&boox_path).unwrap().bytes),
+        alternate_hash
+    );
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-rejected-equal-revision",
+        )
+        .unwrap();
+    let keep = resolution_request(
+        &harness,
+        &analysis,
+        "rebuild-equal-revision-boox-view",
+        ConflictResolutionStrategy::KeepCurrent,
+    );
+    let outcome = harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &keep)
+        .unwrap();
+    let ConflictResolutionOutcome::Resolved { outputs, .. } = outcome else {
+        panic!("equal-revision BOOX keep-current did not rebuild the view")
+    };
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].side, DeviceSide::Boox);
+
+    let corrected = harness.storage.object(&boox_path).unwrap();
+    assert_ne!(sha256_hex(&corrected.bytes), alternate_hash);
+    let corrected_pdf = Document::load_mem(&corrected.bytes).unwrap();
+    let page = *corrected_pdf.get_pages().get(&1).unwrap();
+    let annotation_ids = corrected_pdf
+        .get_page_annotations(page)
+        .unwrap()
+        .iter()
+        .map(|annotation| {
+            String::from_utf8(annotation.get(b"NM").unwrap().as_str().unwrap().to_vec()).unwrap()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        annotation_ids,
+        std::collections::BTreeSet::from([
+            "boox-accepted-equal-revision".to_owned(),
+            "sn-base-equal-boox".to_owned(),
+        ])
+    );
+    let state = harness.state();
+    assert_eq!(state.boox.revision, 1);
+    assert_eq!(state.boox.content_sha256, accepted_hash);
+    assert_eq!(state.boox.source_generation, accepted_object.generation);
+    assert!(state.strokes["boox-accepted-equal-revision"]
+        .tombstone
+        .is_none());
+    assert!(!state.strokes.contains_key("boox-rejected-equal-revision"));
+    assert_eq!(
+        state.generated_views[&boox_path].content_sha256,
+        sha256_hex(&corrected.bytes)
     );
 }
 

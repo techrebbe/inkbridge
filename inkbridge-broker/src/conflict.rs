@@ -130,18 +130,17 @@ impl Broker {
         let context =
             load_context_from_state(storage, state_object, state, &request.conflict_event_id)?;
         let current_source_revision = context.state.device(context.conflict.source).revision;
-        if context.conflict.source_revision <= current_source_revision {
-            if context.conflict.source_revision == current_source_revision
-                && request.strategy != ConflictResolutionStrategy::KeepCurrent
-            {
-                return Err(BrokerError::InvalidEvent(format!(
-                    "conflict {} is an alternate payload for already accepted {:?} revision {}; only keep_current is safe, and incoming changes must be re-exported as a newer revision",
-                    context.conflict.event_id,
-                    context.conflict.source,
-                    current_source_revision
-                )));
-            }
+        let equal_source_revision = context.conflict.source_revision == current_source_revision;
+        if context.conflict.source_revision < current_source_revision {
             return supersede_conflict(storage, context, request);
+        }
+        if equal_source_revision && request.strategy != ConflictResolutionStrategy::KeepCurrent {
+            return Err(BrokerError::InvalidEvent(format!(
+                "conflict {} is an alternate payload for already accepted {:?} revision {}; only keep_current is safe, and incoming changes must be re-exported as a newer revision",
+                context.conflict.event_id,
+                context.conflict.source,
+                current_source_revision
+            )));
         }
 
         ensure_incremental_conflict_resolution_order(&context.state, &context.conflict)?;
@@ -172,25 +171,27 @@ impl Broker {
             apply_manifest(&mut state, &selected_manifest, &effective_event);
         }
 
-        // Every explicit resolution consumes the preserved source revision,
-        // including keep-current. Otherwise the next event from that device
-        // cannot name a coherent based-on frontier and the same conflict is
-        // rediscovered indefinitely.
-        let device = state.device_mut(context.conflict.source);
-        device.revision = context.conflict.source_revision;
-        device
-            .content_sha256
-            .clone_from(&context.conflict.content_sha256);
-        device.source_generation = context.input.generation;
-        device
-            .source_object_path
-            .clone_from(&context.conflict.preserved_path);
-        device.accepted_object_path.clear();
-        device.source_file_name = Some(proposed.document.source_file_name.clone());
-        state.source_generations.insert(
-            context.conflict.preserved_path.clone(),
-            context.input.generation,
-        );
+        if !equal_source_revision {
+            // Advancing resolutions consume the preserved source revision,
+            // including keep-current. Otherwise the next event from that device
+            // cannot name a coherent based-on frontier and the same conflict is
+            // rediscovered indefinitely.
+            let device = state.device_mut(context.conflict.source);
+            device.revision = context.conflict.source_revision;
+            device
+                .content_sha256
+                .clone_from(&context.conflict.content_sha256);
+            device.source_generation = context.input.generation;
+            device
+                .source_object_path
+                .clone_from(&context.conflict.preserved_path);
+            device.accepted_object_path.clear();
+            device.source_file_name = Some(proposed.document.source_file_name.clone());
+            state.source_generations.insert(
+                context.conflict.preserved_path.clone(),
+                context.input.generation,
+            );
+        }
 
         let resulting_revisions = state.revisions();
         state.last_common_revisions = resulting_revisions;
