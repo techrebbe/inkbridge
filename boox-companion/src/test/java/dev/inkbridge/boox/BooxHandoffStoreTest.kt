@@ -738,6 +738,28 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun activePdfQuietWaitUsesOneQuietPeriodAfterMetadataWrite() {
+        val root = temporary.newFolder("root")
+        val quietMillis = 200L
+        val store = BooxHandoffStore(
+            root,
+            predecessorQuietPeriodMillis = quietMillis,
+            predecessorSettleTimeoutMillis = 1_000,
+        )
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        store.afterActiveQuietObservationForTest = { active -> active.appendText("-changed") }
+        val started = System.nanoTime()
+
+        store.awaitActivePdfQuiet(installed.state)
+
+        val elapsedMillis = (System.nanoTime() - started) / 1_000_000L
+        assertTrue("metadata change caused a second quiet period: ${elapsedMillis}ms", elapsedMillis < 350L)
+        assertEquals("one-changed", installed.activeFile.readText())
+    }
+
+    @Test
     fun unconfirmedHandoffRefusesToGrowRetiredPdfStoragePastOnePredecessor() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

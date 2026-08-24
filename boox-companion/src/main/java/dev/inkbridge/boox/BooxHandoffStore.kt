@@ -964,9 +964,10 @@ class BooxHandoffStore(
             val currentModified = file.lastModified()
             val checkedAt = System.nanoTime()
             if (currentLength != observedLength || currentModified != observedModified) {
-                observedLength = currentLength
-                observedModified = currentModified
-                quietUntil = checkedAt + predecessorQuietPeriodMillis * 1_000_000L
+                observedFingerprint = sha256Hex(file)
+                observedLength = file.length()
+                observedModified = file.lastModified()
+                quietUntil = System.nanoTime() + predecessorQuietPeriodMillis * 1_000_000L
             } else if (checkedAt >= quietUntil) {
                 val currentFingerprint = sha256Hex(file)
                 val fingerprintedAt = System.nanoTime()
