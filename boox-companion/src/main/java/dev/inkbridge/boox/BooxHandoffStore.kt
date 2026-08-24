@@ -953,6 +953,7 @@ class BooxHandoffStore(
         var quietUntil = System.nanoTime() + predecessorQuietPeriodMillis * 1_000_000L
         var observedLength = file.length()
         var observedModified = file.lastModified()
+        var observedFingerprint = sha256Hex(file)
         afterInitialObservation?.invoke(file)
         while (true) {
             val now = System.nanoTime()
@@ -967,7 +968,22 @@ class BooxHandoffStore(
                 observedModified = currentModified
                 quietUntil = checkedAt + predecessorQuietPeriodMillis * 1_000_000L
             } else if (checkedAt >= quietUntil) {
-                return
+                val currentFingerprint = sha256Hex(file)
+                val fingerprintedAt = System.nanoTime()
+                val fingerprintedLength = file.length()
+                val fingerprintedModified = file.lastModified()
+                if (
+                    currentFingerprint != observedFingerprint ||
+                    fingerprintedLength != currentLength ||
+                    fingerprintedModified != currentModified
+                ) {
+                    observedFingerprint = currentFingerprint
+                    observedLength = fingerprintedLength
+                    observedModified = fingerprintedModified
+                    quietUntil = fingerprintedAt + predecessorQuietPeriodMillis * 1_000_000L
+                } else {
+                    return
+                }
             }
         }
     }
