@@ -471,6 +471,20 @@ fn ensure_incremental_conflict_resolution_order(
             predecessor.source_revision
         )));
     }
+    let current_source_revision = state.device(conflict.source).revision;
+    let required_predecessor = conflict.based_on.get(conflict.source);
+    if conflict.source_revision > current_source_revision
+        && current_source_revision != required_predecessor
+    {
+        return Err(BrokerError::InvalidEvent(format!(
+            "incremental conflict {} at source revision {} cannot be resolved while the current {:?} revision is {}; wait for its immediate predecessor revision {}",
+            conflict.event_id,
+            conflict.source_revision,
+            conflict.source,
+            current_source_revision,
+            required_predecessor
+        )));
+    }
 
     Ok(())
 }

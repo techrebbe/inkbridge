@@ -3130,6 +3130,242 @@ fn page_scoped_supernote_conflicts_must_resolve_in_source_order() {
 }
 
 #[test]
+fn delayed_supernote_predecessor_must_arrive_before_newer_conflict_resolves() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let base = stroke_on_page("sn-delayed-base", 0, 0.2, 0.3);
+    let initial = harness.event(
+        "sn-delayed-revision-1",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_page(0, std::slice::from_ref(&base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let newest = stroke_on_page("sn-delayed-revision-3-stroke", 1, 0.7, 0.65);
+    let revision_three = harness.event(
+        "sn-delayed-revision-3",
+        DeviceSide::Supernote,
+        3,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        },
+        supernote_export_page(1, std::slice::from_ref(&newest)),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &revision_three)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-delayed-revision-3",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-sn-delayed-revision-3-too-early",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    let state_before = harness.state();
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &request),
+        Err(BrokerError::InvalidEvent(message))
+            if message.contains("immediate predecessor revision 2")
+    ));
+    assert_eq!(harness.state(), state_before);
+
+    let middle = stroke_on_page("sn-delayed-revision-2-stroke", 0, 0.5, 0.55);
+    let revision_two = harness.event(
+        "sn-delayed-revision-2",
+        DeviceSide::Supernote,
+        2,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        supernote_export_page(0, &[base, middle.clone()]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &revision_two)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-delayed-revision-3",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-sn-delayed-revision-3",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(state.supernote.revision, 3);
+    assert_eq!(
+        state.strokes["sn-delayed-revision-2-stroke"].snapshot,
+        middle
+    );
+    assert_eq!(
+        state.strokes["sn-delayed-revision-3-stroke"].snapshot,
+        newest
+    );
+}
+
+#[test]
+fn delayed_compact_boox_predecessor_must_arrive_before_newer_conflict_resolves() {
+    let mut harness = Harness::new();
+    let supernote_base = stroke("sn-before-delayed-compact", 0.2, 0.3);
+    let initial = harness.event(
+        "sn-before-delayed-compact",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&supernote_base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let newest = stroke("boox-delayed-compact-2-stroke", 0.7, 0.65);
+    let mut revision_two = harness.event(
+        "boox-delayed-compact-2",
+        DeviceSide::Boox,
+        2,
+        RevisionPair {
+            boox: 1,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: newest.source_uuid.clone(),
+                page_index: 0,
+                before: None,
+                after: newest.clone(),
+            }],
+            1,
+        ),
+    );
+    revision_two.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &revision_two)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-delayed-compact-2",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-boox-delayed-compact-2-too-early",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    let state_before = harness.state();
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &request),
+        Err(BrokerError::InvalidEvent(message))
+            if message.contains("immediate predecessor revision 1")
+    ));
+    assert_eq!(harness.state(), state_before);
+
+    let middle = stroke("boox-delayed-compact-1-stroke", 0.5, 0.55);
+    let mut revision_one = harness.event(
+        "boox-delayed-compact-1",
+        DeviceSide::Boox,
+        1,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        compact_manifest(
+            vec![Operation::UpsertStroke {
+                source_uuid: middle.source_uuid.clone(),
+                page_index: 0,
+                before: None,
+                after: middle.clone(),
+            }],
+            1,
+        ),
+    );
+    revision_one.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &revision_one)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-delayed-compact-2",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-boox-delayed-compact-2",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(state.boox.revision, 2);
+    assert_eq!(
+        state.strokes["boox-delayed-compact-1-stroke"].snapshot,
+        middle
+    );
+    assert_eq!(
+        state.strokes["boox-delayed-compact-2-stroke"].snapshot,
+        newest
+    );
+}
+
+#[test]
 fn later_same_page_supernote_conflict_does_not_reintroduce_rejected_ink() {
     let mut harness = Harness::new();
     let base = stroke("shared-inherited-page", 0.2, 0.3);
