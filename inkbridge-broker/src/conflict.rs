@@ -516,7 +516,7 @@ fn supersede_conflict<S: BrokerStorage>(
     let record = ConflictResolutionRecord {
         resolution_id: request.resolution_id.clone(),
         conflict_event_id: request.conflict_event_id.clone(),
-        strategy: ConflictResolutionStrategy::KeepCurrent,
+        strategy: request.strategy,
         superseded: true,
         source: context.conflict.source,
         previous_revisions: revisions,

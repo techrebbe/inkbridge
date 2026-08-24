@@ -2981,7 +2981,17 @@ fn older_full_boox_conflict_is_superseded_without_rolling_back_revision() {
     assert!(state.conflicts.is_empty());
     let record = &state.resolved_conflicts["boox-older-full-conflict"];
     assert!(record.superseded);
-    assert_eq!(record.strategy, ConflictResolutionStrategy::KeepCurrent);
+    assert_eq!(record.strategy, ConflictResolutionStrategy::AcceptIncoming);
+    assert!(matches!(
+        harness
+            .broker
+            .resolve_conflict(&mut harness.storage, &older_request)
+            .unwrap(),
+        ConflictResolutionOutcome::Duplicate {
+            strategy: ConflictResolutionStrategy::AcceptIncoming,
+            ..
+        }
+    ));
 }
 
 #[test]
