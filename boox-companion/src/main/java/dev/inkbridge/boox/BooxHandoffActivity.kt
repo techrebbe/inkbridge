@@ -65,8 +65,7 @@ class BooxHandoffActivity : Activity() {
                 opened.brokerEventId,
                 opened.activeFileName,
             )
-            neoReaderHandoff.confirmationCommitted(opened)
-            when (val compact = compactFinalizer.finalize(confirmed.documentId)) {
+            val outcome = when (val compact = compactFinalizer.finalize(confirmed.documentId)) {
                 CompactFinalizeResult.NoChanges -> StorageOutcome(
                     "NeoReader handoff confirmed; no embedded BOOX changes found",
                     confirmed,
@@ -85,6 +84,10 @@ class BooxHandoffActivity : Activity() {
                     confirmed,
                 )
             }
+            // Clear the durable return marker only after all finalization artifacts
+            // are visible. A process death before this point retries on next resume.
+            neoReaderHandoff.confirmationCommitted(opened)
+            outcome
         }
     }
 
