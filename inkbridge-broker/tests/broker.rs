@@ -3130,6 +3130,132 @@ fn page_scoped_supernote_conflicts_must_resolve_in_source_order() {
 }
 
 #[test]
+fn later_same_page_supernote_conflict_does_not_reintroduce_rejected_ink() {
+    let mut harness = Harness::new();
+    let base = stroke("shared-inherited-page", 0.2, 0.3);
+    let initial = harness.event(
+        "sn-base-inherited-page",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let boox_current = stroke("boox-current-inherited-page", 0.5, 0.5);
+    let boox_pdf =
+        write_boox_view(&harness.original, [base.clone(), boox_current.clone()]).unwrap();
+    let boox = harness.event(
+        "boox-current-inherited-page",
+        DeviceSide::Boox,
+        1,
+        common,
+        boox_pdf,
+    );
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let rejected = stroke("sn-rejected-inherited-page", 0.65, 0.65);
+    let older = harness.event(
+        "sn-rejected-inherited-conflict",
+        DeviceSide::Supernote,
+        2,
+        common,
+        supernote_export(std::slice::from_ref(&rejected)),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &older)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let later_safe = stroke("sn-later-safe-page", 0.8, 0.75);
+    let newer = harness.event(
+        "sn-descendant-inherited-conflict",
+        DeviceSide::Supernote,
+        3,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        },
+        supernote_export(&[rejected.clone(), later_safe.clone()]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &newer)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let older_analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-rejected-inherited-conflict",
+        )
+        .unwrap();
+    let older_request = resolution_request(
+        &harness,
+        &older_analysis,
+        "reject-sn-inherited-predecessor",
+        ConflictResolutionStrategy::KeepCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &older_request)
+        .unwrap();
+    assert!(!harness.state().strokes.contains_key(&rejected.source_uuid));
+
+    let newer_analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-descendant-inherited-conflict",
+        )
+        .unwrap();
+    assert!(newer_analysis
+        .safe_changes
+        .iter()
+        .any(|change| change.stroke_id == later_safe.source_uuid));
+    assert!(newer_analysis
+        .overlapping_changes
+        .iter()
+        .any(|change| change.stroke_id == rejected.source_uuid));
+    assert!(newer_analysis
+        .overlapping_changes
+        .iter()
+        .any(|change| change.stroke_id == base.source_uuid));
+
+    let newer_request = resolution_request(
+        &harness,
+        &newer_analysis,
+        "merge-sn-inherited-descendant",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &newer_request)
+        .unwrap();
+
+    let state = harness.state();
+    assert!(state.strokes.contains_key(&later_safe.source_uuid));
+    assert!(!state.strokes.contains_key(&rejected.source_uuid));
+    assert!(state.strokes.contains_key(&base.source_uuid));
+    assert!(state.strokes.contains_key(&boox_current.source_uuid));
+}
+
+#[test]
 fn accept_incoming_replaces_overlaps_and_deletes_current_only_ink() {
     let mut harness = harness_with_mixed_supernote_conflict();
     let analysis = harness

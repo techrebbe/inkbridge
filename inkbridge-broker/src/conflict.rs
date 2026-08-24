@@ -862,11 +862,12 @@ fn classify_operations(
                         && !changed_after(stroke.source_revisions, conflict.based_on)
                 }),
             };
-            // A later incremental conflict can legitimately reference an intermediate
-            // snapshot that an earlier conflict resolution rejected. Treat that mismatch
-            // as an overlap: merge-preserving-current will not apply it, while an explicit
-            // accept-incoming decision can still choose the descendant version.
+            // A later incremental conflict can carry changes inherited from an earlier
+            // resolution that rejected them. Treat those stable IDs as overlaps even when
+            // an addition or deletion has no mismatching before-snapshot to reveal that
+            // ancestry; accept-incoming can still choose the descendant version explicitly.
             let safe = unchanged_since_baseline
+                && !inherited_rejected_change(state, conflict, &stroke_id)
                 && operations_match_current(&operations, canonical.map(|stroke| &stroke.snapshot));
             Ok(OperationGroup {
                 change,
@@ -875,6 +876,28 @@ fn classify_operations(
             })
         })
         .collect()
+}
+
+fn inherited_rejected_change(
+    state: &CanonicalDocumentState,
+    conflict: &PreservedInput,
+    stroke_id: &str,
+) -> bool {
+    let canonical_revision = state
+        .strokes
+        .get(stroke_id)
+        .map(|stroke| stroke.source_revisions.get(conflict.source));
+    state.resolved_conflicts.values().any(|record| {
+        record.source == conflict.source
+            && record.resulting_revisions.get(conflict.source)
+                <= conflict.based_on.get(conflict.source)
+            && canonical_revision
+                .is_none_or(|revision| revision <= record.resulting_revisions.get(conflict.source))
+            && record
+                .preserved_current_stroke_ids
+                .iter()
+                .any(|preserved| preserved == stroke_id)
+    })
 }
 
 fn operations_match_current(operations: &[Operation], current: Option<&StrokeSnapshot>) -> bool {
