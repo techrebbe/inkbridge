@@ -1,0 +1,23 @@
+[package]
+name = "inkbridge-boox-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "On-device BOOX PDF-to-InkBridge manifest converter"
+
+[lib]
+name = "inkbridge_boox"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+inkbridge-convert = { workspace = true }
+jni = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json.workspace = true
+
+[features]
+default = []
+jni-bridge = ["dep:jni"]

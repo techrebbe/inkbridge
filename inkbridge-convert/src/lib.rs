@@ -2,7 +2,10 @@ mod baseline;
 mod model;
 mod pdf;
 
-pub use baseline::{parse_baseline_bytes, BaselineExport, BaselineRevisions};
+pub use baseline::{
+    parse_baseline_bytes, parse_document_baseline_bytes, BaselineExport, BaselineRevisions,
+    DocumentBaseline, DOCUMENT_BASELINE_SCHEMA_VERSION,
+};
 pub use model::{
     geometry_fingerprint, CoordinateTransform, DocumentIdentity, Manifest, NativeStyle, Operation,
     StrokeSnapshot, Summary,
@@ -21,15 +24,6 @@ pub fn build_manifest(
     baseline_paths: &[PathBuf],
     normalized_y_offset: f64,
 ) -> Result<Manifest, String> {
-    let pdf_sha256 = sha256_file(pdf_path)?;
-    let PdfStrokeExtraction {
-        page_count,
-        strokes: extracted,
-        mut skipped,
-        incomplete_pages,
-        failed_source_uuids,
-    } = extract_pdf_strokes(pdf_path)?;
-
     let mut baseline_strokes = Vec::new();
     let mut target_file_names = Vec::new();
     for path in baseline_paths {
@@ -39,6 +33,81 @@ pub fn build_manifest(
         }
         baseline_strokes.extend(export.strokes);
     }
+    let extraction = extract_pdf_strokes(pdf_path)?;
+    build_manifest_from_extraction(
+        pdf_path,
+        extraction,
+        baseline_strokes,
+        target_file_names,
+        normalized_y_offset,
+    )
+}
+
+pub fn build_document_baseline(
+    pdf_path: &Path,
+    source_file_name: &str,
+) -> Result<DocumentBaseline, String> {
+    let pdf_sha256 = sha256_file(pdf_path)?;
+    let PdfStrokeExtraction {
+        page_count,
+        strokes,
+        incomplete_pages,
+        failed_source_uuids,
+        ..
+    } = extract_pdf_strokes(pdf_path)?;
+    if !incomplete_pages.is_empty() || !failed_source_uuids.is_empty() {
+        return Err(format!(
+            "could not safely snapshot all editable BOOX strokes in {}",
+            pdf_path.display()
+        ));
+    }
+    let baseline = DocumentBaseline {
+        schema_version: DOCUMENT_BASELINE_SCHEMA_VERSION,
+        source_file_name: source_file_name.to_owned(),
+        page_count,
+        pdf_sha256,
+        strokes,
+    };
+    baseline.validate()?;
+    Ok(baseline)
+}
+
+pub fn build_manifest_from_document_baseline(
+    pdf_path: &Path,
+    baseline: &DocumentBaseline,
+    normalized_y_offset: f64,
+) -> Result<Manifest, String> {
+    baseline.validate()?;
+    let extraction = extract_pdf_strokes(pdf_path)?;
+    let mut manifest = build_manifest_from_extraction(
+        pdf_path,
+        extraction,
+        baseline.strokes.clone(),
+        vec![baseline.source_file_name.clone()],
+        normalized_y_offset,
+    )?;
+    manifest
+        .document
+        .source_file_name
+        .clone_from(&baseline.source_file_name);
+    Ok(manifest)
+}
+
+fn build_manifest_from_extraction(
+    pdf_path: &Path,
+    extraction: PdfStrokeExtraction,
+    baseline_strokes: Vec<StrokeSnapshot>,
+    target_file_names: Vec<String>,
+    normalized_y_offset: f64,
+) -> Result<Manifest, String> {
+    let pdf_sha256 = sha256_file(pdf_path)?;
+    let PdfStrokeExtraction {
+        page_count,
+        strokes: extracted,
+        mut skipped,
+        incomplete_pages,
+        failed_source_uuids,
+    } = extraction;
     validate_baseline_pages(&baseline_strokes, page_count)?;
     let baseline = index_baseline(baseline_strokes);
     let (operations, unchanged) = diff_strokes(

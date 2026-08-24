@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
-const DESCRIPTOR_SUFFIX: &str = ".pdf.inkbridge.json";
+const DESCRIPTOR_SUFFIX: &str = ".inkbridge.json";
 pub(crate) const MAX_DESCRIPTOR_BYTES: u64 = 256 * 1024;
 const GENERATED_EVENT_ID: &str = "inkbridge-event-id";
 const INSTALLED_ACKNOWLEDGEMENT_FILE: &str = ".inkbridge-installed.json";
@@ -34,7 +34,7 @@ pub(crate) struct PreparedBooxDelivery {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FinalizedBooxArtifact {
     pub descriptor_path: PathBuf,
-    pub pdf_path: PathBuf,
+    pub payload_path: PathBuf,
     pub event: StorageEvent,
 }
 
@@ -233,16 +233,16 @@ impl BooxHandoffEndpoint {
     ) -> Result<(), String> {
         validate_finalized_event(&artifact.event, document)?;
         let pdf_file_name = artifact
-            .pdf_path
+            .payload_path
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or_else(|| {
                 format!(
-                    "finalized BOOX PDF {} has no file name",
-                    artifact.pdf_path.display()
+                    "finalized BOOX payload {} has no file name",
+                    artifact.payload_path.display()
                 )
             })?;
-        validate_file_name(pdf_file_name, "finalized BOOX PDF file name")?;
+        validate_file_name(pdf_file_name, "finalized BOOX payload file name")?;
         let marker = FinalizedRetirementMarker {
             schema_version: 1,
             document_id: document.document_id.clone(),
@@ -712,7 +712,7 @@ fn read_finalized_artifact(
     let pdf_name = name
         .strip_suffix(".inkbridge.json")
         .expect("descriptor suffix was checked above");
-    validate_file_name(pdf_name, "finalized BOOX PDF file name")?;
+    validate_file_name(pdf_name, "finalized BOOX payload file name")?;
     let object_name = Path::new(&event.object_path)
         .file_name()
         .and_then(|value| value.to_str())
@@ -748,7 +748,7 @@ fn read_finalized_artifact(
 
     Ok(FinalizedBooxArtifact {
         descriptor_path,
-        pdf_path,
+        payload_path: pdf_path,
         event,
     })
 }
@@ -772,8 +772,12 @@ fn validate_finalized_event(
     if event.source != DeviceSide::Boox {
         return Err("BOOX handoff event source is not boox".to_owned());
     }
-    if event.payload_kind != DevicePayloadKind::DeviceView || event.broker_output.is_some() {
-        return Err("BOOX handoff event is not a finalized device PDF".to_owned());
+    if !matches!(
+        event.payload_kind,
+        DevicePayloadKind::DeviceView | DevicePayloadKind::BooxOperationManifest
+    ) || event.broker_output.is_some()
+    {
+        return Err("BOOX handoff event is not a supported finalized payload".to_owned());
     }
     if event.event_id.trim().is_empty() || event.event_id.len() > 256 {
         return Err("BOOX handoff event has an invalid eventId".to_owned());
@@ -800,7 +804,7 @@ fn validate_finalized_event(
         || relative_path.chars().any(char::is_control)
     {
         return Err(format!(
-            "BOOX handoff object path {} must name one safe PDF directly below {}",
+            "BOOX handoff object path {} must name one safe payload directly below {}",
             event.object_path, prefix
         ));
     }
@@ -1146,7 +1150,7 @@ mod tests {
         let artifacts = endpoint.finalized_artifacts(&document).unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].event, event);
-        assert_eq!(artifacts[0].pdf_path, outgoing.join(pdf_name));
+        assert_eq!(artifacts[0].payload_path, outgoing.join(pdf_name));
     }
 
     #[test]
@@ -1168,7 +1172,7 @@ mod tests {
 
         assert!(validate_finalized_event(&event, &document)
             .unwrap_err()
-            .contains("one safe PDF"));
+            .contains("one safe payload"));
     }
     #[test]
     fn skips_invalid_or_incomplete_descriptors_without_hashing_complete_pairs() {
@@ -1232,8 +1236,8 @@ mod tests {
         let artifacts = endpoint.finalized_artifacts(&document).unwrap();
         assert_eq!(artifacts.len(), 2);
         assert_eq!(artifacts[0].event, corrupt);
-        assert_eq!(artifacts[0].pdf_path, outgoing.join("c-corrupt.pdf"));
+        assert_eq!(artifacts[0].payload_path, outgoing.join("c-corrupt.pdf"));
         assert_eq!(artifacts[1].event, valid);
-        assert_eq!(artifacts[1].pdf_path, outgoing.join("z-valid.pdf"));
+        assert_eq!(artifacts[1].payload_path, outgoing.join("z-valid.pdf"));
     }
 }

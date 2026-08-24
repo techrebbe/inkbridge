@@ -115,8 +115,10 @@ jobs:
             echo "AR_aarch64_linux_android=$tc/llvm-ar"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tc/aarch64-linux-android24-clang"
           } >> "$GITHUB_ENV"
-      - name: Check reader-core with the JNI bridge for the device target
-        run: cargo check -p reader-core --features jni-bridge --target aarch64-linux-android
+      - name: Check JNI bridges for the device target
+        run: |
+          cargo check -p reader-core --features jni-bridge --target aarch64-linux-android
+          cargo check -p inkbridge-boox-native --features jni-bridge --target aarch64-linux-android
 
   license-manifest:
     name: license manifest (RR18-AC2)

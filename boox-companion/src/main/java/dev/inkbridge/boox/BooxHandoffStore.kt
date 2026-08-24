@@ -100,6 +100,15 @@ class BooxHandoffStore(
         if (finalizedHash != null) {
             val outputName = requireNotNull(state.finalizedOutputFileName)
             val output = File(outgoingDir(documentRoot), outputName)
+            if (outputName.endsWith(".operations.json")) {
+                check(currentHash == finalizedHash) {
+                    "Wait for the previous compact BOOX finalization to be acknowledged before finalizing again"
+                }
+                check(output.isFile && File(outgoingDir(documentRoot), "$outputName.inkbridge.json").isFile) {
+                    "Compact BOOX finalization artifacts are incomplete; reopen NeoReader and return to retry"
+                }
+                return FinalizeResult.AlreadyFinalized(output)
+            }
             val recoverySource = when {
                 currentHash == finalizedHash -> active
                 output.isFile -> output
@@ -146,6 +155,74 @@ class BooxHandoffStore(
         val confirmed = state.copy(openedBrokerEventId = brokerEventId).also(HandoffState::validate)
         writeState(documentRoot, confirmed)
         return confirmed
+    }
+
+    internal fun documentDirectory(documentId: String): File = documentRoot(documentId)
+
+    internal fun activeFile(state: HandoffState): File {
+        state.validate()
+        return File(activeDir(documentRoot(state.documentId)), state.activeFileName)
+    }
+
+    internal fun outgoingDirectory(documentId: String): File = outgoingDir(documentRoot(documentId))
+
+    internal fun publishPayloadBytesOrVerify(
+        bytes: ByteArray,
+        destination: File,
+        expectedHash: String,
+    ) {
+        if (destination.isFile) {
+            require(sha256Hex(destination) == expectedHash) {
+                "Existing ${destination.name} has unexpected content"
+            }
+            return
+        }
+        publishBytesCreateOnly(bytes, destination)
+        require(sha256Hex(destination) == expectedHash) {
+            "Published ${destination.name} has unexpected content"
+        }
+    }
+
+    internal fun publishDescriptorBytesOrVerify(bytes: ByteArray, destination: File) {
+        requireMetadataSize(bytes, "Compact-finalization descriptor")
+        publishBytesOrVerify(bytes, destination)
+    }
+
+    internal fun recordCompactFinalization(
+        expected: HandoffState,
+        activeSha256: String,
+        outputName: String,
+    ): HandoffState {
+        requireSafeFileName(outputName, "compact finalized output file name")
+        val documentRoot = documentRoot(expected.documentId)
+        recover(documentRoot, verifyRetiredPredecessors = true)
+        val current = readState(documentRoot) ?: error("No active InkBridge document")
+        val localGeneration = Math.addExact(expected.localGeneration, 1)
+        if (
+            current.finalizedLocalSha256 == activeSha256 &&
+            current.finalizedOutputFileName == outputName &&
+            current.localGeneration == localGeneration
+        ) {
+            return current
+        }
+        require(current == expected) { "The active handoff state changed during compact finalization" }
+        require(current.finalizedLocalSha256 == null) {
+            "This BOOX revision is already finalized"
+        }
+        require(sha256Hex(activeFile(current)) == activeSha256) {
+            "NeoReader changed the active PDF during compact finalization"
+        }
+        val output = File(outgoingDir(documentRoot), outputName)
+        require(output.isFile && File(outgoingDir(documentRoot), "$outputName.inkbridge.json").isFile) {
+            "Compact finalization artifacts are incomplete"
+        }
+        val next = current.copy(
+            finalizedLocalSha256 = activeSha256,
+            finalizedOutputFileName = outputName,
+            localGeneration = localGeneration,
+        ).also(HandoffState::validate)
+        writeState(documentRoot, next)
+        return next
     }
 
     fun findNextDescriptor(): File? = root

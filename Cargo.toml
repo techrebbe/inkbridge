@@ -6,7 +6,7 @@
 # RR1-AC3: bare `cargo test -p reader-core` builds with `jni` absent from the resolved graph.
 [workspace]
 resolver = "2"
-members = ["build-dict", "device-eink", "inkbridge-broker", "inkbridge-cloud-runtime", "inkbridge-convert", "inkbridge-folder-transport", "inkread-daily", "inkread-dict", "inkread-epub", "inkread-ink", "inkread-lua", "inkread-pdftext", "inkread-update", "reader-core"]
+members = ["build-dict", "device-eink", "inkbridge-boox-native", "inkbridge-broker", "inkbridge-cloud-runtime", "inkbridge-convert", "inkbridge-folder-transport", "inkread-daily", "inkread-dict", "inkread-epub", "inkread-ink", "inkread-lua", "inkread-pdftext", "inkread-update", "reader-core"]
 
 [workspace.package]
 version = "1.0.1"
@@ -28,6 +28,7 @@ inkread-pdftext = { path = "inkread-pdftext" }
 inkread-update = { path = "inkread-update" }
 reader-core = { path = "reader-core" }
 inkbridge-convert = { path = "inkbridge-convert" }
+inkbridge-boox-native = { path = "inkbridge-boox-native" }
 inkbridge-broker = { path = "inkbridge-broker" }
 
 # External — versions verified against docs.rs at implementation time.

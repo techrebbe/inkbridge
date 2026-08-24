@@ -7,13 +7,13 @@
 
 <h1 align="center">inkread</h1>
 
-> InkBridge development note: the private two-folder broker is deployed, and the current milestone
-> is the local finalized-folder transport described in
-> [docs/INKBRIDGE_FOLDER_TRANSPORT.md](docs/INKBRIDGE_FOLDER_TRANSPORT.md). BOOX edits are converted
-> locally into compact operation manifests; broker outputs are delivered back into the two device
-> folders without making filename order or modification time authoritative. InkBridge 0.2.0 now
-> connects the native Supernote plugin directly to that contract; see
-> [docs/INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md](docs/INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md).
+> InkBridge development note: the private two-folder broker is deployed. The BOOX companion now
+> prepares a local baseline and converts the closed NeoReader PDF on-device into a compact operation
+> manifest, so 300-500 MB PDFs do not need to cross the folder/cloud boundary for each ink edit.
+> The versioned inbound handoff and full-PDF recovery path remain intact; the next gate is focused
+> Note Air 4C validation of automatic close on the companion path. See
+> [docs/INKBRIDGE_BOOX_HANDOFF.md](docs/INKBRIDGE_BOOX_HANDOFF.md) and
+> [docs/INKBRIDGE_FOLDER_TRANSPORT.md](docs/INKBRIDGE_FOLDER_TRANSPORT.md).
 
 <p align="center">
   <strong>A Rust-core, e-ink-first document reader with first-class handwriting.</strong><br>

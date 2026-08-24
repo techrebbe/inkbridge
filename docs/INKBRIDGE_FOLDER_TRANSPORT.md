@@ -140,13 +140,13 @@ file path. Replacing the bytes of a PDF that is already known at the same path c
 ink without making it lassoable. Opening the identical broker view under a fresh path triggers
 NeoReader's document-data import/merge flow and makes the strokes editable.
 
-The BOOX companion and folder transport now implement that contract. Broker outputs are published as an immutable, versioned PDF plus descriptor, with the descriptor written last. The companion installs the delivery at a fresh active path, publishes a durable acknowledgement of that installed broker event, retires the predecessor, opens only the authoritative active file in NeoReader, and finalizes edits as an immutable outgoing PDF plus `StorageEvent` sidecar. The transport keeps only the current acknowledged incoming pair as recovery data and removes older dominated pairs. It converts a finalized edit at the current revision frontier into compact operations; a stale or concurrent finalized edit is uploaded as a full PDF with its original `basedOn` frontier so the broker preserves it as conflict evidence instead of silently rebasing it. Once broker acceptance is reflected in an installed companion view, the accepted outgoing pair is durably retired through an interruption-recoverable marker.
+The BOOX companion and folder transport implement that contract. Broker outputs are published as an immutable, versioned PDF plus descriptor, with the descriptor written last. The companion installs the delivery at a fresh active path, records a compact local stroke baseline, publishes a durable acknowledgement, retires the predecessor, and opens only the authoritative active file in NeoReader. On return it runs the shared Rust converter on-device and publishes a compact operation manifest plus `StorageEvent` sidecar. The transport uploads that prebuilt manifest directly, including stale or concurrent manifests with their original `basedOn` frontier so the broker preserves them as conflict evidence instead of silently rebasing them. Full finalized PDFs remain a manual fallback for native conversion/recovery failures. Once broker acceptance is reflected in an installed companion view, the accepted outgoing pair is durably retired through an interruption-recoverable marker.
 
 ## Large PDFs
 
-The BOOX source PDF is hashed and parsed locally after its quiet period, but only the converter's
-operation JSON is uploaded. A 300-500 MB PDF therefore does not cross the network for every BOOX
-ink edit. Supernote-to-BOOX changes still download a generated device view because NeoReader needs
+The BOOX companion hashes and parses the active PDF on the tablet after NeoReader returns, but only
+the converter's operation JSON enters the mirrored outgoing folder. A 300-500 MB PDF therefore does
+not cross the device-to-computer or cloud boundary for every BOOX ink edit. Supernote-to-BOOX changes still download a generated device view because NeoReader needs
 the complete editable PDF. The broker continues rebuilding that view from the immutable original.
 
 ## Failure behavior

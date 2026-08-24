@@ -1,5 +1,5 @@
 use crate::model::{geometry_fingerprint, NativeStyle, StrokeSnapshot};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
@@ -17,7 +17,7 @@ struct ExportPage {
     strokes: Vec<ExportStroke>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BaselineRevisions {
     pub boox: u64,
@@ -44,6 +44,86 @@ pub struct BaselineExport {
     pub based_on: Option<BaselineRevisions>,
     pub page_index: u32,
     pub strokes: Vec<StrokeSnapshot>,
+}
+
+pub const DOCUMENT_BASELINE_SCHEMA_VERSION: u32 = 1;
+
+/// Compact, device-local snapshot of the editable ink in one broker-generated PDF.
+///
+/// The BOOX companion records this before opening NeoReader. After NeoReader closes,
+/// the same converter diffs the edited PDF against this snapshot. The original PDF
+/// bytes never have to leave the device just to preserve stroke identities or infer
+/// deletions.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentBaseline {
+    pub schema_version: u32,
+    pub source_file_name: String,
+    pub page_count: usize,
+    pub pdf_sha256: String,
+    pub strokes: Vec<StrokeSnapshot>,
+}
+
+impl DocumentBaseline {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != DOCUMENT_BASELINE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported BOOX baseline schema {}",
+                self.schema_version
+            ));
+        }
+        if self.source_file_name.trim().is_empty() {
+            return Err("BOOX baseline sourceFileName is empty".to_owned());
+        }
+        if self.page_count == 0 {
+            return Err("BOOX baseline pageCount must be positive".to_owned());
+        }
+        if self.pdf_sha256.len() != 64
+            || !self
+                .pdf_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("BOOX baseline pdfSha256 is not lowercase SHA-256".to_owned());
+        }
+        let mut identities = std::collections::HashSet::new();
+        for stroke in &self.strokes {
+            if stroke.source_uuid.trim().is_empty() {
+                return Err("BOOX baseline contains a stroke without an identity".to_owned());
+            }
+            if !identities.insert(stroke.source_uuid.as_str()) {
+                return Err(format!(
+                    "BOOX baseline contains duplicate stroke identity {}",
+                    stroke.source_uuid
+                ));
+            }
+            if stroke.page_index as usize >= self.page_count {
+                return Err(format!(
+                    "BOOX baseline stroke {} references page {}, but pageCount is {}",
+                    stroke.source_uuid,
+                    stroke.page_index + 1,
+                    self.page_count
+                ));
+            }
+            if stroke.samples.len() < 2 {
+                return Err(format!(
+                    "BOOX baseline stroke {} contains fewer than two samples",
+                    stroke.source_uuid
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_document_baseline_bytes(
+    bytes: &[u8],
+    source_name: &str,
+) -> Result<DocumentBaseline, String> {
+    let baseline: DocumentBaseline = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid BOOX baseline JSON in {source_name}: {error}"))?;
+    baseline.validate()?;
+    Ok(baseline)
 }
 
 pub fn load_baseline(path: &Path) -> Result<BaselineExport, String> {
