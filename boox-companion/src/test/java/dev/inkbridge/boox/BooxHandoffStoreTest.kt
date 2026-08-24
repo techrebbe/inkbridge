@@ -712,6 +712,28 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun activePdfQuietWaitRestartsAfterALateNeoReaderWrite() {
+        val root = temporary.newFolder("root")
+        val quietMillis = 40L
+        val store = BooxHandoffStore(
+            root,
+            predecessorQuietPeriodMillis = quietMillis,
+            predecessorSettleTimeoutMillis = 1_000,
+        )
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        store.afterActiveQuietObservationForTest = { active -> active.appendText("-late") }
+        val started = System.nanoTime()
+
+        store.awaitActivePdfQuiet(installed.state)
+
+        val elapsedMillis = (System.nanoTime() - started) / 1_000_000L
+        assertTrue("quiet period did not restart after the late write", elapsedMillis >= 70L)
+        assertEquals("one-late", installed.activeFile.readText())
+    }
+
+    @Test
     fun unconfirmedHandoffRefusesToGrowRetiredPdfStoragePastOnePredecessor() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)

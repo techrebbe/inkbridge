@@ -65,6 +65,7 @@ class BooxHandoffActivity : Activity() {
                 opened.brokerEventId,
                 opened.activeFileName,
             )
+            store.awaitActivePdfQuiet(confirmed)
             val compact = compactFinalizer.finalize(confirmed.documentId)
             val outcome = when (compact) {
                 CompactFinalizeResult.NoChanges -> StorageOutcome(
@@ -253,6 +254,7 @@ class BooxHandoffActivity : Activity() {
             requireStorageAccess()
             val state = documentId?.let(store::state) ?: store.findMostRecentState()
                 ?: error("No active InkBridge document")
+            store.awaitActivePdfQuiet(state)
             val outcome = when (val compact = compactFinalizer.finalize(state.documentId)) {
                 CompactFinalizeResult.NoChanges -> StorageOutcome(
                     "No new BOOX changes to finalize",

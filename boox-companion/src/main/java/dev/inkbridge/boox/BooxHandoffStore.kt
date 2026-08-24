@@ -56,6 +56,7 @@ class BooxHandoffStore(
     internal var beforeInstallCommitForTest: ((File?) -> Unit)? = null
     internal var beforePreservedDescriptorForTest: ((File) -> Unit)? = null
     internal var afterPredecessorRetirementForTest: ((File) -> Unit)? = null
+    internal var afterActiveQuietObservationForTest: ((File) -> Unit)? = null
     internal var afterCompactStateCommitForTest: (() -> Unit)? = null
     fun install(descriptorFile: File): InstallResult {
         val delivery = readDelivery(descriptorFile)
@@ -163,6 +164,13 @@ class BooxHandoffStore(
     internal fun activeFile(state: HandoffState): File {
         state.validate()
         return File(activeDir(documentRoot(state.documentId)), state.activeFileName)
+    }
+
+    internal fun awaitActivePdfQuiet(state: HandoffState) {
+        val active = activeFile(state)
+        require(active.isFile) { "The opened active PDF is missing" }
+        awaitFileQuiet(active, "active PDF", afterActiveQuietObservationForTest)
+        require(active.isFile) { "The opened active PDF disappeared while waiting for NeoReader" }
     }
 
     internal fun outgoingDirectory(documentId: String): File = outgoingDir(documentRoot(documentId))
@@ -931,19 +939,28 @@ class BooxHandoffStore(
     }
 
     private fun awaitRetiredPredecessorQuiet(retired: File) {
+        awaitFileQuiet(retired, "retired predecessor")
+    }
+
+    private fun awaitFileQuiet(
+        file: File,
+        description: String,
+        afterInitialObservation: ((File) -> Unit)? = null,
+    ) {
         if (predecessorQuietPeriodMillis == 0L) return
         val pollMillis = minOf(100L, predecessorQuietPeriodMillis)
         val timeoutAt = System.nanoTime() + predecessorSettleTimeoutMillis * 1_000_000L
         var quietUntil = System.nanoTime() + predecessorQuietPeriodMillis * 1_000_000L
-        var observedLength = retired.length()
-        var observedModified = retired.lastModified()
+        var observedLength = file.length()
+        var observedModified = file.lastModified()
+        afterInitialObservation?.invoke(file)
         while (true) {
             val now = System.nanoTime()
-            require(now < timeoutAt) { "NeoReader did not release the retired predecessor in time" }
+            require(now < timeoutAt) { "NeoReader did not release the $description in time" }
             val remainingQuietMillis = ((quietUntil - now) / 1_000_000L).coerceAtLeast(1L)
             Thread.sleep(minOf(pollMillis, remainingQuietMillis))
-            val currentLength = retired.length()
-            val currentModified = retired.lastModified()
+            val currentLength = file.length()
+            val currentModified = file.lastModified()
             val checkedAt = System.nanoTime()
             if (currentLength != observedLength || currentModified != observedModified) {
                 observedLength = currentLength
