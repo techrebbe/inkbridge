@@ -32,3 +32,8 @@ output "cloud_build_source_bucket" {
   description = "Dedicated transient source bucket readable by the image-builder account."
   value       = local.enabled ? google_storage_bucket.build_source[0].name : null
 }
+
+output "folder_transport_service_account" {
+  description = "Read-only bucket identity with create-only writes restricted to BOOX_Folder/ and Supernote_Folder/."
+  value       = local.enabled ? google_service_account.folder_transport[0].email : null
+}

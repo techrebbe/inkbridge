@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-const GENERATED_BY_KEY: &str = "inkbridge-generated-by";
-const GENERATED_EVENT_KEY: &str = "inkbridge-event-id";
-const GENERATED_DOCUMENT_KEY: &str = "inkbridge-document-id";
-const GENERATED_REVISIONS_KEY: &str = "inkbridge-source-revisions";
-const GENERATED_CONTENT_HASH_KEY: &str = "inkbridge-content-sha256";
+pub(crate) const GENERATED_BY_KEY: &str = "inkbridge-generated-by";
+pub(crate) const GENERATED_EVENT_KEY: &str = "inkbridge-event-id";
+pub(crate) const GENERATED_DOCUMENT_KEY: &str = "inkbridge-document-id";
+pub(crate) const GENERATED_REVISIONS_KEY: &str = "inkbridge-source-revisions";
+pub(crate) const GENERATED_CONTENT_HASH_KEY: &str = "inkbridge-content-sha256";
 
 #[derive(Default)]
 struct CompactOperationSet<'a> {
@@ -60,7 +60,7 @@ impl fmt::Display for BrokerError {
 impl std::error::Error for BrokerError {}
 
 pub struct Broker {
-    normalized_y_offset: f64,
+    pub(crate) normalized_y_offset: f64,
 }
 
 impl Default for Broker {
@@ -141,6 +141,7 @@ impl Broker {
             source_generations: BTreeMap::new(),
             generated_views: BTreeMap::new(),
             conflicts: Vec::new(),
+            resolved_conflicts: BTreeMap::new(),
         };
         let writes = vec![
             ConditionalWrite {
@@ -280,29 +281,8 @@ impl Broker {
                 &source.bytes,
             );
         }
-        if event.payload_kind == DevicePayloadKind::BooxOperationManifest
-            && state.original_page_count == 0
-        {
-            let original = storage
-                .read(&state.original_object_path)
-                .map_err(BrokerError::Storage)?
-                .ok_or_else(|| BrokerError::MissingObject(state.original_object_path.clone()))?;
-            if sha256_hex(&original.bytes) != state.original_pdf_sha256 {
-                return Err(BrokerError::CorruptState(
-                    "immutable original PDF hash changed".to_owned(),
-                ));
-            }
-            let document = lopdf::Document::load_mem(&original.bytes).map_err(|error| {
-                BrokerError::CorruptState(format!(
-                    "immutable original is not a readable PDF: {error}"
-                ))
-            })?;
-            state.original_page_count = document.get_pages().len();
-            if state.original_page_count == 0 {
-                return Err(BrokerError::CorruptState(
-                    "immutable original PDF contains no pages".to_owned(),
-                ));
-            }
+        if event.payload_kind == DevicePayloadKind::BooxOperationManifest {
+            ensure_original_page_count(storage, &mut state)?;
         }
 
         let source_bytes = source.bytes;
@@ -436,7 +416,7 @@ impl Broker {
         })
     }
 
-    fn boox_to_supernote(
+    pub(crate) fn boox_to_supernote(
         &self,
         state: &CanonicalDocumentState,
         event: &StorageEvent,
@@ -711,6 +691,7 @@ impl Broker {
             source_generation: event.source_generation,
             source_revision: event.source_revision,
             content_sha256: event.content_sha256.clone(),
+            payload_kind: event.payload_kind,
             based_on: event.based_on,
             current_revisions: current,
         });
@@ -734,7 +715,7 @@ impl Broker {
     }
 }
 
-fn refresh_manifest_id(manifest: &mut Manifest) {
+pub(crate) fn refresh_manifest_id(manifest: &mut Manifest) {
     let upserted = manifest
         .operations
         .iter()
@@ -790,7 +771,7 @@ fn is_broker_output(
     metadata_matches && envelope_matches
 }
 
-fn output_metadata(marker: &BrokerOutputMarker, hash: &str) -> BTreeMap<String, String> {
+pub(crate) fn output_metadata(marker: &BrokerOutputMarker, hash: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (GENERATED_BY_KEY.to_owned(), marker.producer.clone()),
         (GENERATED_EVENT_KEY.to_owned(), marker.event_id.clone()),
@@ -809,7 +790,7 @@ fn output_metadata(marker: &BrokerOutputMarker, hash: &str) -> BTreeMap<String, 
     ])
 }
 
-fn destination_precondition(
+pub(crate) fn destination_precondition(
     state: &CanonicalDocumentState,
     path: &str,
     current: &Option<StoredObject>,
@@ -862,7 +843,7 @@ fn mark_event_only<S: BrokerStorage>(
     Ok(())
 }
 
-fn valid_supernote_native_style(style: &inkbridge_convert::NativeStyle) -> bool {
+pub(crate) fn valid_supernote_native_style(style: &inkbridge_convert::NativeStyle) -> bool {
     // The plugin crosses both the JavaScript number bridge and Android integer APIs. Keep the
     // compact wire format inside the narrower native integer domain, which is exactly
     // representable by JavaScript and rejects values the Supernote host cannot preserve.
@@ -872,7 +853,7 @@ fn valid_supernote_native_style(style: &inkbridge_convert::NativeStyle) -> bool 
         && native_integer.contains(&style.pen_type)
 }
 
-fn normalize_supernote_pen_color(snapshot: &mut StrokeSnapshot) {
+pub(crate) fn normalize_supernote_pen_color(snapshot: &mut StrokeSnapshot) {
     let normalized = if snapshot.native_style.pen_color == 0x00 {
         0x00
     } else {
@@ -891,7 +872,11 @@ fn normalized_supernote_snapshot(snapshot: &StrokeSnapshot) -> StrokeSnapshot {
     normalized
 }
 
-fn apply_manifest(state: &mut CanonicalDocumentState, manifest: &Manifest, event: &StorageEvent) {
+pub(crate) fn apply_manifest(
+    state: &mut CanonicalDocumentState,
+    manifest: &Manifest,
+    event: &StorageEvent,
+) {
     let mut revisions = event.based_on;
     revisions.set(event.source, event.source_revision);
     let upserted_ids = manifest
@@ -957,7 +942,7 @@ fn apply_manifest(state: &mut CanonicalDocumentState, manifest: &Manifest, event
     }
 }
 
-fn apply_supernote_export(
+pub(crate) fn apply_supernote_export(
     state: &mut CanonicalDocumentState,
     event: &StorageEvent,
     bytes: &[u8],
@@ -1004,7 +989,7 @@ fn apply_supernote_export(
     Ok(())
 }
 
-fn write_baselines(
+pub(crate) fn write_baselines(
     directory: &Path,
     state: &CanonicalDocumentState,
 ) -> Result<Vec<PathBuf>, BrokerError> {
@@ -1059,7 +1044,7 @@ fn write_baselines(
     Ok(paths)
 }
 
-fn state_write(
+pub(crate) fn state_write(
     path: &str,
     state: &CanonicalDocumentState,
     precondition: GenerationPrecondition,
@@ -1078,8 +1063,11 @@ fn state_write(
     })
 }
 
-fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, BrokerError> {
-    let state: CanonicalDocumentState = serde_json::from_slice(bytes)
+pub(crate) fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, BrokerError> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| BrokerError::CorruptState(error.to_string()))?;
+    migrate_legacy_conflict_payload_kinds(&mut value);
+    let state: CanonicalDocumentState = serde_json::from_value(value)
         .map_err(|error| BrokerError::CorruptState(error.to_string()))?;
     if state.schema_version != STATE_SCHEMA_VERSION {
         return Err(BrokerError::CorruptState(format!(
@@ -1090,7 +1078,69 @@ fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, BrokerError> {
     Ok(state)
 }
 
-fn add_newline(mut bytes: Vec<u8>) -> Vec<u8> {
+fn migrate_legacy_conflict_payload_kinds(value: &mut serde_json::Value) {
+    let Some(conflicts) = value
+        .get_mut("conflicts")
+        .and_then(|conflicts| conflicts.as_array_mut())
+    else {
+        return;
+    };
+    for conflict in conflicts {
+        let Some(object) = conflict.as_object_mut() else {
+            continue;
+        };
+        if object.contains_key("payloadKind") {
+            continue;
+        }
+        let is_boox = object.get("source").and_then(|source| source.as_str()) == Some("boox");
+        let has_json_evidence = ["objectPath", "preservedPath"].iter().any(|key| {
+            object
+                .get(*key)
+                .and_then(|path| path.as_str())
+                .and_then(|path| std::path::Path::new(path).extension())
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        });
+        let payload_kind = if is_boox && has_json_evidence {
+            "boox_operation_manifest"
+        } else {
+            "device_view"
+        };
+        object.insert(
+            "payloadKind".to_owned(),
+            serde_json::Value::String(payload_kind.to_owned()),
+        );
+    }
+}
+
+pub(crate) fn ensure_original_page_count<S: BrokerStorage>(
+    storage: &S,
+    state: &mut CanonicalDocumentState,
+) -> Result<(), BrokerError> {
+    if state.original_page_count != 0 {
+        return Ok(());
+    }
+    let original = storage
+        .read(&state.original_object_path)
+        .map_err(BrokerError::Storage)?
+        .ok_or_else(|| BrokerError::MissingObject(state.original_object_path.clone()))?;
+    if sha256_hex(&original.bytes) != state.original_pdf_sha256 {
+        return Err(BrokerError::CorruptState(
+            "immutable original PDF hash changed".to_owned(),
+        ));
+    }
+    let document = lopdf::Document::load_mem(&original.bytes).map_err(|error| {
+        BrokerError::CorruptState(format!("immutable original is not a readable PDF: {error}"))
+    })?;
+    state.original_page_count = document.get_pages().len();
+    if state.original_page_count == 0 {
+        return Err(BrokerError::CorruptState(
+            "immutable original PDF contains no pages".to_owned(),
+        ));
+    }
+    Ok(())
+}
+pub(crate) fn add_newline(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.push(b'\n');
     bytes
 }
@@ -1113,7 +1163,7 @@ fn readable_segment(value: &str) -> String {
     }
 }
 
-fn event_path_segment(event_id: &str) -> String {
+pub(crate) fn event_path_segment(event_id: &str) -> String {
     let prefix = readable_segment(event_id)
         .chars()
         .take(48)

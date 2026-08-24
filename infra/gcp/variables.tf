@@ -71,6 +71,20 @@ variable "firestore_database" {
   default     = "(default)"
 }
 
+variable "folder_transport_operator" {
+  description = "Operator IAM member (for example user:name@example.com) allowed to impersonate the folder transport and invoke the private conflict API; required for runtime deployment."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.folder_transport_operator == "" ||
+      can(regex("^(user|group):[^[:space:]@]+@[^[:space:]@]+$", var.folder_transport_operator))
+    )
+    error_message = "folder_transport_operator must be empty or a user:/group: IAM member."
+  }
+}
+
 variable "monthly_budget_usd" {
   description = "Optional billing budget. Zero omits it. Budgets alert but do not cap charges."
   type        = number

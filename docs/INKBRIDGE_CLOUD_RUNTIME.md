@@ -35,6 +35,31 @@ explicit `rejected` result and acknowledges them with HTTP 200 so Eventarc does
 not retry an immutable bad event forever. Cloud Storage, Firestore, and pending
 outbox failures still return 500 and remain eligible for Eventarc retry.
 
+## Private conflict API
+
+The same private Cloud Run service exposes:
+
+```text
+GET  /v1/documents/<document-id>/conflicts
+GET  /v1/documents/<document-id>/conflicts/<conflict-event-id>
+POST /v1/documents/<document-id>/conflicts/<conflict-event-id>
+```
+
+The collection GET returns active conflict summaries and the raw event IDs needed by the item
+routes. The item GET returns safe and overlapping stroke changes plus the state/revision
+preconditions required by POST. POST accepts an explicit `merge_preserving_current`,
+`keep_current`, or `accept_incoming` decision. The runtime recovers any pending durable outbox.
+Stale destination generations, competing decisions, and reuse of a resolution ID with a changed
+strategy return HTTP 409; malformed requests return 400; a missing document/conflict returns 404.
+Cloud Run IAM remains the authorization boundary; Terraform grants invocation only to Eventarc and
+the configured operator.
+
+Resolution uses the existing transactional reservation, generation-conditional object writes, and
+durable outbox. Every required BOOX/Supernote output is made durable before canonical state is
+promoted. The broker-generated `resolution.json` unblock marker is a post-finalization release
+write: it cannot become visible until that canonical state is active. See
+[`INKBRIDGE_CONFLICT_RESOLUTION.md`](INKBRIDGE_CONFLICT_RESOLUTION.md).
+
 ## Firestore transaction and durable outbox
 
 `inkbridgeDocuments/{documentId}` stores a generation/hash pointer to the last
@@ -49,9 +74,12 @@ pointer, never the PDF or manifest bytes. The runtime then uses an atomic
 Firestore `documents:commit` with document `updateTime` preconditions to reserve
 both records. It performs destination uploads with `ifGenerationMatch`; after
 each output, the outbox records the returned generation. Only after every
-object exists with the expected bytes and metadata does another atomic
-Firestore commit promote the pending canonical-state pointer to active and mark
-the outbox delivered. The runtime then deletes only the finalized output
+ordinary output exists with the expected bytes and metadata does another atomic
+Firestore commit promote the pending canonical-state pointer to active. Conflict-resolution
+commits retain their pending reservation while the post-finalization marker is delivered, then
+atomically clear the pending state and mark the outbox delivered. A crash in either phase resumes
+from the recorded object generations without exposing a premature unblock marker. The runtime then
+deletes only the finalized output
 payload generations from `BrokerOutbox/`; the canonical-state payload remains
 the active state evidence. Cleanup is best-effort after finalization, so failure
 can leak storage but cannot invalidate published state or block recovery.
@@ -81,8 +109,8 @@ inkbridge-register-original=true
 inkbridge-original-file-name=<logical file name>
 ```
 
-The finalized-object event reaches the same internal-only Cloud Run endpoint as
-device events. The broker verifies the exact object generation, validates the
+The finalized-object event reaches the same IAM-authenticated Cloud Run endpoint as device events.
+The broker verifies the exact object generation, validates the
 PDF, derives its stable content-based document ID, and stores the immutable
 original under `Originals/<documentId>/original.pdf`. Duplicate delivery is
 idempotent. Unmarked staging objects are ignored. The HTTP
@@ -98,7 +126,7 @@ BOOX_Folder/<documentId>/<name>.pdf       # generated/editable BOOX view
 Supernote_Folder/<documentId>/incoming/   # native-operation manifests
 Canonical/<documentId>/states/            # immutable canonical-state blobs
 BrokerOutbox/<documentId>/<commitId>/      # immutable staged output payloads
-Conflicts/<documentId>/<event>/           # both sides preserved
+Conflicts/<documentId>/<event>/           # both inputs + durable resolution marker
 ```
 
 Canonical active state and the durable outbox live in Firestore. Device folder
@@ -145,6 +173,22 @@ INKBRIDGE_GCS_BUCKET
 INKBRIDGE_FIRESTORE_DATABASE  # defaults to (default)
 PORT                          # defaults to 8080
 ```
+
+The deployed service accepts network ingress but remains IAM-private: there is no `allUsers` or
+`allAuthenticatedUsers` invoker binding. Eventarc and the configured
+`folder_transport_operator` are the only provisioned invokers. An operator uses their own
+authenticated gcloud configuration:
+
+```text
+gcloud run services proxy inkbridge-broker \
+  --project=PROJECT_ID \
+  --region=REGION \
+  --port=8080 \
+  --configuration=inkbridge-operator
+```
+
+The private conflict endpoints are then available through `http://localhost:8080`; ordinary
+unauthenticated requests to the Cloud Run URL remain rejected.
 
 The runtime container includes `inkbridge-convert` and qpdf 12.2 or newer and
 targets Linux `amd64`. The minimum qpdf version is enforced while the image is

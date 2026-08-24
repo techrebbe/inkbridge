@@ -90,8 +90,26 @@ must not be synced between two running transports. A process lock prevents two t
 using it concurrently. If the operating system terminates the process without allowing cleanup,
 remove the adjacent lock file only after verifying that no transport is still running.
 
-The user running the transport must already be authenticated with gcloud and authorized for the
-private InkBridge bucket. The transport uses create-only uploads with custom metadata; retrying an
+Production scans must use the Terraform-managed `inkbridge-folder-transport` service account,
+not project-owner or broker-runtime credentials. That identity can read the private bucket, but its
+create-only writes are IAM-conditioned to `BOOX_Folder/` and `Supernote_Folder/`. It cannot
+create `Conflicts/.../resolution.json`, canonical state, or broker outbox objects. Resolution
+markers are trusted only because this broker-only namespace boundary is enforced by IAM; their
+custom metadata is validation data, not authentication.
+
+Set `folder_transport_operator` to the operator's `user:` or `group:` IAM member before the
+reviewed Terraform apply. Then use a dedicated gcloud configuration:
+
+```text
+gcloud config configurations create inkbridge-folder-transport
+gcloud config set project PROJECT_ID --configuration=inkbridge-folder-transport
+gcloud config set auth/impersonate_service_account \
+  inkbridge-folder-transport@PROJECT_ID.iam.gserviceaccount.com \
+  --configuration=inkbridge-folder-transport
+```
+
+Select that configuration for the transport process (for example with
+`CLOUDSDK_ACTIVE_CONFIG_NAME=inkbridge-folder-transport`). Uploads remain create-only; retrying an
 uncertain upload succeeds only when the existing immutable object carries the exact intended hash
 and revision metadata.
 
@@ -145,9 +163,11 @@ the complete editable PDF. The broker continues rebuilding that view from the im
   deferred; no implicit latest-file-wins decision is made. A sibling page exported at the same
   original frontier can safely rebase across accepted Supernote-only page revisions, while any
   intervening BOOX revision or accepted revision of that same page requires a fresh export.
-- Simultaneous device edits are preserved by the broker under Conflicts; the transport reports
-  the conflict and stops new source uploads instead of choosing a winner. It resumes only after an
-  explicit reconciliation workflow has safely retired those conflict objects.
+- Simultaneous device edits are preserved by the broker under `Conflicts/`; the transport reports
+  one conflict per event and stops new source uploads instead of choosing a winner. Resolution
+  retains both evidence objects and adds a broker-authenticated `resolution.json` marker. The
+  transport ignores resolved groups only when that marker has the expected producer, document,
+  event, and kind metadata; forged or incomplete markers remain blocking.
 - Accepted Supernote baselines survive working-file replacement and checkpoint loss through the
   immutable `.inkbridge-accepted` cache; a missing or hash-mismatched cache entry is recovered from
   its accepted cloud generation before BOOX conversion proceeds.
@@ -166,5 +186,6 @@ the complete editable PDF. The broker continues rebuilding that view from the im
 
 The tests cover duplicate scans, revision acknowledgement, broker-manifest delivery, bounded versioned BOOX handoff retention and checkpoint recovery, accepted outgoing retirement, immutable
 baseline recovery, simultaneous local edits, compact BOOX uploads, unpublished-edit protection,
-and conflict blocking. Broker and converter suites remain the authority for stroke parity,
+conflict grouping, forged-marker rejection, and resolution unblocking. Broker and converter suites
+remain the authority for stroke parity,
 malformed NeoReader recovery, moves, and deletions.

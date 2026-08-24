@@ -37,6 +37,10 @@ resource "terraform_data" "deployment_guard" {
       )
       error_message = "cloud_run_image must come from the configured project, region, and Artifact Registry repository."
     }
+    precondition {
+      condition     = !local.runtime_enabled || var.folder_transport_operator != ""
+      error_message = "folder_transport_operator is required when Cloud Run is enabled so conflicts have an authenticated operator path."
+    }
   }
 }
 
@@ -208,12 +212,52 @@ resource "google_service_account" "eventarc" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_service_account" "folder_transport" {
+  count = local.enabled ? 1 : 0
+
+  project      = var.project_id
+  account_id   = "inkbridge-folder-transport"
+  display_name = "InkBridge local folder transport"
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_storage_bucket_iam_member" "runtime_objects" {
   count = local.enabled ? 1 : 0
 
   bucket = google_storage_bucket.sync[0].name
   role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${google_service_account.runtime[0].email}"
+}
+
+resource "google_storage_bucket_iam_member" "folder_transport_reader" {
+  count = local.enabled ? 1 : 0
+
+  bucket = google_storage_bucket.sync[0].name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.folder_transport[0].email}"
+}
+
+resource "google_storage_bucket_iam_member" "folder_transport_device_writer" {
+  count = local.enabled ? 1 : 0
+
+  bucket = google_storage_bucket.sync[0].name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.folder_transport[0].email}"
+
+  condition {
+    title       = "device-folders-only"
+    description = "The local adapter can create device evidence, never broker state or conflict markers."
+    expression  = "resource.name.startsWith(\"projects/_/buckets/${google_storage_bucket.sync[0].name}/objects/BOOX_Folder/\") || resource.name.startsWith(\"projects/_/buckets/${google_storage_bucket.sync[0].name}/objects/Supernote_Folder/\")"
+  }
+}
+
+resource "google_service_account_iam_member" "folder_transport_impersonator" {
+  count = local.enabled && var.folder_transport_operator != "" ? 1 : 0
+
+  service_account_id = google_service_account.folder_transport[0].name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = var.folder_transport_operator
 }
 
 resource "google_artifact_registry_repository_iam_member" "builder_writer" {
@@ -274,7 +318,7 @@ resource "google_cloud_run_v2_service" "runtime" {
   project             = var.project_id
   name                = "inkbridge-broker"
   location            = var.region
-  ingress             = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  ingress             = "INGRESS_TRAFFIC_ALL"
   deletion_protection = true
 
   template {
@@ -328,6 +372,16 @@ resource "google_cloud_run_v2_service_iam_member" "eventarc_invoker" {
   name     = google_cloud_run_v2_service.runtime[0].name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.eventarc[0].email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "operator_invoker" {
+  count = local.runtime_enabled && var.folder_transport_operator != "" ? 1 : 0
+
+  project  = var.project_id
+  location = google_cloud_run_v2_service.runtime[0].location
+  name     = google_cloud_run_v2_service.runtime[0].name
+  role     = "roles/run.invoker"
+  member   = var.folder_transport_operator
 }
 
 resource "google_eventarc_trigger" "storage_finalized" {

@@ -2,6 +2,7 @@ use crate::{
     boox_handoff::{
         BooxHandoffEndpoint, FinalizedBooxArtifact, InstalledBooxDelivery, MAX_DESCRIPTOR_BYTES,
     },
+    conflicts::unresolved_conflict_groups,
     CloudFolder, CloudObject, DocumentFolders, DocumentTransportState, FileObservation,
     PendingUpload, SyncReport, TransportAction, TransportState, VerifiedBooxInstall,
 };
@@ -150,19 +151,15 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         let prefix = format!("Conflicts/{}/", document.document_id);
         let objects = self.cloud.list(&prefix)?;
         let previous = state.document_mut(&document.document_id).conflicts.clone();
-        let current = objects
-            .iter()
-            .map(CloudObject::generation_key)
-            .collect::<std::collections::BTreeSet<_>>();
+        let current = unresolved_conflict_groups(&objects, &document.document_id);
         state
             .document_mut(&document.document_id)
             .conflicts
             .clone_from(&current);
-        for object in objects {
-            let key = object.generation_key();
-            if !previous.contains(&key) {
+        for group_path in &current {
+            if !previous.contains(group_path) {
                 report.actions.push(TransportAction::Conflict {
-                    object_path: object.path,
+                    object_path: group_path.clone(),
                 });
             }
         }

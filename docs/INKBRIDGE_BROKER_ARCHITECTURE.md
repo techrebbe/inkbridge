@@ -46,6 +46,8 @@ Supernote_Folder/
 
 Conflicts/
   <document-id>/<event-id>/incoming.<ext>        preserved concurrent input
+  <document-id>/<event-id>/current-<side>.<ext>  preserved competing accepted input
+  <document-id>/<event-id>/resolution.json       broker-owned resolution audit marker
 ```
 
 The folder adapters may expose friendlier matching filenames to users, but they must attach the
@@ -95,6 +97,20 @@ generates a fresh device view from the immutable original. Every active stroke i
 `/Ink` annotation with a stable `/NM`, `/InkList`, border style, and `/AP` appearance stream. Rebuilding
 from the immutable original prevents annotations from accumulating on each round trip.
 
+## Conflict resolution
+
+An active conflict can be inspected without mutating state. The analysis separates changes that
+still match their based-on canonical strokes from overlapping changes made by both branches. An
+explicit resolution chooses `merge_preserving_current` (safe changes only), `keep_current`, or
+`accept_incoming`.
+
+Every request carries the state revision and current BOOX/Supernote revision pair returned by
+inspection. Stale analysis, a changed destination generation, or a second different decision fails
+without committing. The same resolution ID is idempotent. A successful resolution atomically
+publishes rebuilt device views, canonical state, and a broker-authenticated marker while retaining
+all original conflict evidence. See
+[`INKBRIDGE_CONFLICT_RESOLUTION.md`](INKBRIDGE_CONFLICT_RESOLUTION.md).
+
 ## Local validation
 
 ```bash
@@ -128,5 +144,6 @@ That test requires byte-for-byte equality with the already-proven Shapiro Supern
    Firestore collection. Authentication, regions, retention, budgets, and alerting are deployment
    decisions for the later infrastructure milestone.
 
-BOOX folder automation, the Supernote companion/plugin transport, and multiwriter operation merging
-remain separate later milestones. This core intentionally reports conservative conflicts first.
+BOOX folder automation and the Supernote companion/plugin transport remain separate adapters.
+The core now supports conservative, explicit conflict inspection and resolution; automatic
+multiwriter conflict resolution remains out of scope.

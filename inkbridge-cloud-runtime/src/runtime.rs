@@ -3,12 +3,16 @@ use crate::{
     ObjectStore, RegistrationEvent,
 };
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use inkbridge_broker::{Broker, BrokerError, CanonicalDocumentState, ProcessOutcome};
+use inkbridge_broker::{
+    Broker, BrokerError, CanonicalDocumentState, CommitError, ConflictAnalysis,
+    ConflictResolutionOutcome, ConflictResolutionRequest, ConflictResolutionStrategy,
+    ConflictSummary, ProcessOutcome, RevisionPair, RESOLUTION_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -28,6 +32,17 @@ pub struct RegisterDocumentRequest {
     pub original_file_name: String,
     #[serde(default)]
     pub source_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveConflictRequest {
+    #[serde(default = "resolution_schema_version")]
+    pub schema_version: u32,
+    pub resolution_id: String,
+    pub expected_state_revision: u64,
+    pub expected_current_revisions: RevisionPair,
+    pub strategy: ConflictResolutionStrategy,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -149,11 +164,58 @@ impl RuntimeService {
         }
     }
 
+    pub fn list_conflicts(&self, document_id: &str) -> Result<Vec<ConflictSummary>, BrokerError> {
+        let storage = CloudBrokerStorage::new(self.objects.clone(), self.states.clone());
+        storage.recover(document_id).map_err(BrokerError::Storage)?;
+        Broker::default().list_conflicts(&storage, document_id)
+    }
+
+    pub fn inspect_conflict(
+        &self,
+        document_id: &str,
+        conflict_event_id: &str,
+    ) -> Result<ConflictAnalysis, BrokerError> {
+        let storage = CloudBrokerStorage::new(self.objects.clone(), self.states.clone());
+        storage.recover(document_id).map_err(BrokerError::Storage)?;
+        Broker::default().inspect_conflict(&storage, document_id, conflict_event_id)
+    }
+
+    pub fn resolve_conflict(
+        &self,
+        document_id: &str,
+        conflict_event_id: &str,
+        request: ResolveConflictRequest,
+    ) -> Result<ConflictResolutionOutcome, BrokerError> {
+        let storage = CloudBrokerStorage::new(self.objects.clone(), self.states.clone());
+        storage.recover(document_id).map_err(BrokerError::Storage)?;
+        let mut storage = storage;
+        Broker::default().resolve_conflict(
+            &mut storage,
+            &ConflictResolutionRequest {
+                schema_version: request.schema_version,
+                resolution_id: request.resolution_id,
+                document_id: document_id.to_owned(),
+                conflict_event_id: conflict_event_id.to_owned(),
+                expected_state_revision: request.expected_state_revision,
+                expected_current_revisions: request.expected_current_revisions,
+                strategy: request.strategy,
+            },
+        )
+    }
+
     pub fn router(self) -> Router {
         Router::new()
             .route("/", post(eventarc_handler))
             .route("/healthz", get(health_handler))
             .route("/v1/documents/register", post(register_handler))
+            .route(
+                "/v1/documents/{document_id}/conflicts",
+                get(list_conflicts_handler),
+            )
+            .route(
+                "/v1/documents/{document_id}/conflicts/{conflict_event_id}",
+                get(inspect_conflict_handler).post(resolve_conflict_handler),
+            )
             .with_state(Arc::new(self))
     }
 }
@@ -205,8 +267,80 @@ async fn register_handler(
     }
 }
 
+async fn list_conflicts_handler(
+    State(service): State<Arc<RuntimeService>>,
+    Path(document_id): Path<String>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || service.list_conflicts(&document_id)).await {
+        Ok(Ok(conflicts)) => (StatusCode::OK, Json(json!(conflicts))).into_response(),
+        Ok(Err(error)) => conflict_error_response(error),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn inspect_conflict_handler(
+    State(service): State<Arc<RuntimeService>>,
+    Path((document_id, conflict_event_id)): Path<(String, String)>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || {
+        service.inspect_conflict(&document_id, &conflict_event_id)
+    })
+    .await
+    {
+        Ok(Ok(analysis)) => (StatusCode::OK, Json(json!(analysis))).into_response(),
+        Ok(Err(error)) => conflict_error_response(error),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn resolve_conflict_handler(
+    State(service): State<Arc<RuntimeService>>,
+    Path((document_id, conflict_event_id)): Path<(String, String)>,
+    Json(request): Json<ResolveConflictRequest>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || {
+        service.resolve_conflict(&document_id, &conflict_event_id, request)
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => (StatusCode::OK, Json(json!(outcome))).into_response(),
+        Ok(Err(error)) => conflict_error_response(error),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"status": "ok"})))
+}
+
+fn conflict_error_response(error: BrokerError) -> Response {
+    let status = match &error {
+        BrokerError::MissingObject(_) => StatusCode::NOT_FOUND,
+        BrokerError::InvalidEvent(message) if message.contains("not active") => {
+            StatusCode::NOT_FOUND
+        }
+        BrokerError::InvalidEvent(message)
+            if message.contains("stale")
+                || message.contains("already resolved")
+                || message.contains("already recorded strategy") =>
+        {
+            StatusCode::CONFLICT
+        }
+        BrokerError::InvalidEvent(_) => StatusCode::BAD_REQUEST,
+        BrokerError::StaleDestination { .. }
+        | BrokerError::ConditionalWrite(CommitError::PreconditionFailed { .. }) => {
+            StatusCode::CONFLICT
+        }
+        BrokerError::ConditionalWrite(CommitError::Other(_))
+        | BrokerError::CorruptState(_)
+        | BrokerError::Conversion(_)
+        | BrokerError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, error.to_string())
+}
+
+fn resolution_schema_version() -> u32 {
+    RESOLUTION_SCHEMA_VERSION
 }
 
 fn error_response(status: StatusCode, message: String) -> Response {
@@ -531,5 +665,243 @@ mod tests {
         let active = record.active.unwrap();
         let payload = service.objects.read(&active.payload.path).unwrap().unwrap();
         serde_json::from_slice(&payload.bytes).unwrap()
+    }
+
+    fn runtime_stroke(id: &str, x: f64, y: f64) -> StrokeSnapshot {
+        let native_style = NativeStyle::default();
+        let samples = vec![[x, y, 900.0], [x + 0.08, y + 0.04, 1100.0]];
+        StrokeSnapshot {
+            source_uuid: id.to_owned(),
+            origin: "supernote-native".to_owned(),
+            page_index: 0,
+            geometry_fingerprint: geometry_fingerprint(&native_style, &samples),
+            native_style,
+            samples,
+        }
+    }
+
+    fn runtime_supernote_export(strokes: &[StrokeSnapshot]) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "sourceFileName": "daily-reading.pdf",
+            "pageIndex": 0,
+            "strokes": strokes.iter().map(|stroke| json!({
+                "sourceUuid": stroke.source_uuid,
+                "sourceKey": stroke.source_uuid,
+                "layerNum": stroke.native_style.layer_num,
+                "thickness": stroke.native_style.thickness,
+                "penColor": stroke.native_style.pen_color,
+                "penType": stroke.native_style.pen_type,
+                "samples": stroke.samples
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    struct RuntimeDeviceUpdate {
+        event_id: &'static str,
+        side: DeviceSide,
+        source_revision: u64,
+        based_on: RevisionPair,
+        bytes: Vec<u8>,
+    }
+
+    fn publish_device_event(
+        service: &RuntimeService,
+        objects: &MemoryObjectStore,
+        document_id: &str,
+        update: RuntimeDeviceUpdate,
+    ) -> RuntimeOutcome {
+        let path = match update.side {
+            DeviceSide::Boox => {
+                format!("BOOX_Folder/{document_id}/{}.pdf", update.event_id)
+            }
+            DeviceSide::Supernote => {
+                format!("Supernote_Folder/{document_id}/{}.json", update.event_id)
+            }
+        };
+        let object = objects.put(&path, update.bytes.clone());
+        let body = serde_json::to_vec(&json!({
+            "bucket": "sync-bucket",
+            "name": path,
+            "generation": object.generation.to_string(),
+            "metadata": {
+                "inkbridge-document-id": document_id,
+                "inkbridge-source-revision": update.source_revision.to_string(),
+                "inkbridge-based-on-boox": update.based_on.boox.to_string(),
+                "inkbridge-based-on-supernote": update.based_on.supernote.to_string(),
+                "inkbridge-sync-ready": "true",
+                "inkbridge-content-sha256": sha256_hex(&update.bytes)
+            }
+        }))
+        .unwrap();
+        service
+            .handle_storage_event(&headers(update.event_id), &body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn conflict_http_surface_inspects_rejects_stale_and_resolves_idempotently() {
+        let objects = Arc::new(MemoryObjectStore::default());
+        let states = Arc::new(MemoryCanonicalStateStore::default());
+        let original_bytes = original_pdf();
+        let original = objects.put("Staging/conflict-original.pdf", original_bytes.clone());
+        let service = Arc::new(RuntimeService::new("sync-bucket", objects.clone(), states));
+        let registered = service
+            .register_document(&RegisterDocumentRequest {
+                original_object_path: "Staging/conflict-original.pdf".to_owned(),
+                original_file_name: "daily-reading.pdf".to_owned(),
+                source_generation: Some(original.generation),
+            })
+            .unwrap();
+        let document_id = registered.document_id;
+
+        assert!(matches!(
+            publish_device_event(
+                &service,
+                &objects,
+                &document_id,
+                RuntimeDeviceUpdate {
+                    event_id: "sn-base",
+                    side: DeviceSide::Supernote,
+                    source_revision: 1,
+                    based_on: RevisionPair::default(),
+                    bytes: runtime_supernote_export(&[runtime_stroke("shared", 0.2, 0.3)]),
+                },
+            ),
+            RuntimeOutcome::Processed {
+                outcome: ProcessOutcome::Applied { .. }
+            }
+        ));
+        let common = RevisionPair {
+            boox: 0,
+            supernote: 1,
+        };
+        let boox_pdf = inkbridge_broker::write_boox_view(
+            &original_bytes,
+            [
+                runtime_stroke("shared", 0.35, 0.3),
+                runtime_stroke("boox-current", 0.55, 0.55),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            publish_device_event(
+                &service,
+                &objects,
+                &document_id,
+                RuntimeDeviceUpdate {
+                    event_id: "boox-current",
+                    side: DeviceSide::Boox,
+                    source_revision: 1,
+                    based_on: common,
+                    bytes: boox_pdf,
+                },
+            ),
+            RuntimeOutcome::Processed {
+                outcome: ProcessOutcome::Applied { .. }
+            }
+        ));
+        assert!(matches!(
+            publish_device_event(
+                &service,
+                &objects,
+                &document_id,
+                RuntimeDeviceUpdate {
+                    event_id: "sn-concurrent",
+                    side: DeviceSide::Supernote,
+                    source_revision: 2,
+                    based_on: common,
+                    bytes: runtime_supernote_export(&[
+                        runtime_stroke("shared", 0.2, 0.45),
+                        runtime_stroke("sn-new", 0.75, 0.7),
+                    ]),
+                },
+            ),
+            RuntimeOutcome::Processed {
+                outcome: ProcessOutcome::Conflict { .. }
+            }
+        ));
+
+        let listed =
+            list_conflicts_handler(State(service.clone()), Path(document_id.clone())).await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let summaries = service.list_conflicts(&document_id).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].conflict_event_id, "sn-concurrent");
+
+        let missing = inspect_conflict_handler(
+            State(service.clone()),
+            Path((document_id.clone(), "missing-conflict".to_owned())),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let inspect = inspect_conflict_handler(
+            State(service.clone()),
+            Path((document_id.clone(), "sn-concurrent".to_owned())),
+        )
+        .await;
+        assert_eq!(inspect.status(), StatusCode::OK);
+        let analysis = service
+            .inspect_conflict(&document_id, "sn-concurrent")
+            .unwrap();
+        assert_eq!(analysis.safe_changes.len(), 1);
+        assert_eq!(analysis.overlapping_changes.len(), 2);
+
+        let request = ResolveConflictRequest {
+            schema_version: RESOLUTION_SCHEMA_VERSION,
+            resolution_id: "resolve-http-conflict".to_owned(),
+            expected_state_revision: analysis.state_revision,
+            expected_current_revisions: analysis.current_revisions,
+            strategy: ConflictResolutionStrategy::MergePreservingCurrent,
+        };
+        let mut stale = request.clone();
+        stale.expected_state_revision += 1;
+        let stale_response = resolve_conflict_handler(
+            State(service.clone()),
+            Path((document_id.clone(), "sn-concurrent".to_owned())),
+            Json(stale),
+        )
+        .await;
+        assert_eq!(stale_response.status(), StatusCode::CONFLICT);
+
+        let resolved = resolve_conflict_handler(
+            State(service.clone()),
+            Path((document_id.clone(), "sn-concurrent".to_owned())),
+            Json(request.clone()),
+        )
+        .await;
+        assert_eq!(resolved.status(), StatusCode::OK);
+        let state = states_record(&service, &document_id);
+        assert_eq!(
+            state.revisions(),
+            RevisionPair {
+                boox: 1,
+                supernote: 2
+            }
+        );
+        assert!(state.conflicts.is_empty());
+        assert!(service.list_conflicts(&document_id).unwrap().is_empty());
+        assert!(state.strokes.contains_key("sn-new"));
+        assert!(matches!(
+            service
+                .resolve_conflict(&document_id, "sn-concurrent", request.clone())
+                .unwrap(),
+            ConflictResolutionOutcome::Duplicate { .. }
+        ));
+
+        let mut changed_strategy = request;
+        changed_strategy.strategy = ConflictResolutionStrategy::AcceptIncoming;
+        let changed_strategy_response = resolve_conflict_handler(
+            State(service.clone()),
+            Path((document_id, "sn-concurrent".to_owned())),
+            Json(changed_strategy),
+        )
+        .await;
+        assert_eq!(
+            changed_strategy_response.status(),
+            StatusCode::CONFLICT,
+            "reusing a resolution ID with different parameters must not be accepted as a duplicate"
+        );
     }
 }

@@ -89,6 +89,11 @@ impl CloudFolder for GcloudFolder {
         object_path: &str,
         metadata: &BTreeMap<String, String>,
     ) -> Result<CloudObject, String> {
+        if !is_device_upload_path(object_path) {
+            return Err(format!(
+                "folder transport may upload only within BOOX_Folder/ or Supernote_Folder/: {object_path}"
+            ));
+        }
         let metadata = metadata
             .iter()
             .map(|(key, value)| {
@@ -139,6 +144,14 @@ impl CloudFolder for GcloudFolder {
             Err(command_error("download Cloud Storage object", &output))
         }
     }
+}
+
+fn is_device_upload_path(path: &str) -> bool {
+    (path.starts_with("BOOX_Folder/") || path.starts_with("Supernote_Folder/"))
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+        && !path.chars().any(char::is_control)
 }
 
 fn metadata_matches(existing: &BTreeMap<String, String>, encoded: &str) -> bool {
@@ -216,6 +229,25 @@ impl DescribeObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_paths_are_confined_to_device_namespaces() {
+        assert!(is_device_upload_path(
+            "BOOX_Folder/inkbridge-doc-v1-test/uploads/r1.json"
+        ));
+        assert!(is_device_upload_path(
+            "Supernote_Folder/inkbridge-doc-v1-test/uploads/r1.json"
+        ));
+        for path in [
+            "Conflicts/inkbridge-doc-v1-test/event/resolution.json",
+            "Canonical/inkbridge-doc-v1-test/state.json",
+            "BOOX_Folder/",
+            "BOOX_Folder/../Conflicts/event/resolution.json",
+            "Supernote_Folder//event.json",
+        ] {
+            assert!(!is_device_upload_path(path), "{path}");
+        }
+    }
 
     #[test]
     fn parses_gcloud_list_shape_and_preserves_custom_metadata() {
