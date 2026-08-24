@@ -79,6 +79,7 @@ pub fn build_manifest_from_document_baseline(
 ) -> Result<Manifest, String> {
     baseline.validate()?;
     let extraction = extract_pdf_strokes(pdf_path)?;
+    validate_document_page_count(baseline.page_count, extraction.page_count)?;
     let mut manifest = build_manifest_from_extraction(
         pdf_path,
         extraction,
@@ -91,6 +92,18 @@ pub fn build_manifest_from_document_baseline(
         .source_file_name
         .clone_from(&baseline.source_file_name);
     Ok(manifest)
+}
+
+fn validate_document_page_count(
+    baseline_page_count: usize,
+    returned_page_count: usize,
+) -> Result<(), String> {
+    if returned_page_count != baseline_page_count {
+        return Err(format!(
+            "NeoReader returned a PDF with {returned_page_count} pages, but the BOOX baseline has {baseline_page_count}; full-PDF fallback is required"
+        ));
+    }
+    Ok(())
 }
 
 fn build_manifest_from_extraction(
@@ -416,6 +429,21 @@ mod tests {
         assert!(error.contains("out-of-range"));
         assert!(error.contains("page 3"));
         assert!(error.contains("2 pages"));
+    }
+
+    #[test]
+    fn compact_document_page_count_must_match_baseline() {
+        validate_document_page_count(9, 9).unwrap();
+
+        let added_page = validate_document_page_count(9, 10)
+            .expect_err("adding a page must require the full-PDF fallback");
+        assert!(added_page.contains("10 pages"));
+        assert!(added_page.contains("baseline has 9"));
+
+        let removed_page = validate_document_page_count(9, 8)
+            .expect_err("removing a page must require the full-PDF fallback");
+        assert!(removed_page.contains("8 pages"));
+        assert!(removed_page.contains("baseline has 9"));
     }
 
     #[test]
