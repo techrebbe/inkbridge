@@ -56,6 +56,7 @@ class BooxHandoffStore(
     internal var beforeInstallCommitForTest: ((File?) -> Unit)? = null
     internal var beforePreservedDescriptorForTest: ((File) -> Unit)? = null
     internal var afterPredecessorRetirementForTest: ((File) -> Unit)? = null
+    internal var afterCompactStateCommitForTest: (() -> Unit)? = null
     fun install(descriptorFile: File): InstallResult {
         val delivery = readDelivery(descriptorFile)
         val documentRoot = documentRoot(delivery.documentId)
@@ -104,8 +105,8 @@ class BooxHandoffStore(
                 check(currentHash == finalizedHash) {
                     "Wait for the previous compact BOOX finalization to be acknowledged before finalizing again"
                 }
-                check(output.isFile && File(outgoingDir(documentRoot), "$outputName.inkbridge.json").isFile) {
-                    "Compact BOOX finalization artifacts are incomplete; reopen NeoReader and return to retry"
+                check(output.isFile) {
+                    "Compact BOOX finalization payload is missing; reopen NeoReader and return to retry"
                 }
                 return FinalizeResult.AlreadyFinalized(output)
             }
@@ -192,15 +193,21 @@ class BooxHandoffStore(
         expected: HandoffState,
         activeSha256: String,
         outputName: String,
+        payloadSha256: String,
     ): HandoffState {
         requireSafeFileName(outputName, "compact finalized output file name")
         val documentRoot = documentRoot(expected.documentId)
         recover(documentRoot, verifyRetiredPredecessors = true)
         val current = readState(documentRoot) ?: error("No active InkBridge document")
         val localGeneration = Math.addExact(expected.localGeneration, 1)
+        val output = File(outgoingDir(documentRoot), outputName)
+        require(output.isFile && sha256Hex(output) == payloadSha256) {
+            "Compact finalization payload is incomplete"
+        }
         if (
             current.finalizedLocalSha256 == activeSha256 &&
             current.finalizedOutputFileName == outputName &&
+            current.finalizedOutputSha256 == payloadSha256 &&
             current.localGeneration == localGeneration
         ) {
             return current
@@ -212,16 +219,14 @@ class BooxHandoffStore(
         require(sha256Hex(activeFile(current)) == activeSha256) {
             "NeoReader changed the active PDF during compact finalization"
         }
-        val output = File(outgoingDir(documentRoot), outputName)
-        require(output.isFile && File(outgoingDir(documentRoot), "$outputName.inkbridge.json").isFile) {
-            "Compact finalization artifacts are incomplete"
-        }
         val next = current.copy(
             finalizedLocalSha256 = activeSha256,
             finalizedOutputFileName = outputName,
+            finalizedOutputSha256 = payloadSha256,
             localGeneration = localGeneration,
         ).also(HandoffState::validate)
         writeState(documentRoot, next)
+        afterCompactStateCommitForTest?.invoke()
         return next
     }
 
@@ -322,6 +327,7 @@ class BooxHandoffStore(
         val next = state.copy(
             finalizedLocalSha256 = currentHash,
             finalizedOutputFileName = outputName,
+            finalizedOutputSha256 = currentHash,
             localGeneration = nextLocalGeneration,
         )
         writeFinalizeIntent(documentRoot, FinalizeIntent(previousState = state, nextState = next))
@@ -592,10 +598,15 @@ class BooxHandoffStore(
         val expectedHash: String
         val recoverySource: File?
         if (state.finalizedLocalSha256 != null) {
-            expectedHash = state.finalizedLocalSha256
-            recoverySource = state.finalizedOutputFileName
-                ?.let { File(outgoingDir(documentRoot), it) }
-                ?.takeIf(File::isFile)
+            if (state.finalizedOutputFileName?.endsWith(".operations.json") == true) {
+                expectedHash = state.installedBrokerSha256
+                recoverySource = findRetainedBrokerPdf(documentRoot, state)
+            } else {
+                expectedHash = state.finalizedLocalSha256
+                recoverySource = state.finalizedOutputFileName
+                    ?.let { File(outgoingDir(documentRoot), it) }
+                    ?.takeIf(File::isFile)
+            }
         } else {
             expectedHash = state.installedBrokerSha256
             recoverySource = findRetainedBrokerPdf(documentRoot, state)

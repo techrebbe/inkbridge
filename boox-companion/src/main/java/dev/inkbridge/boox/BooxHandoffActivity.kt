@@ -247,19 +247,37 @@ class BooxHandoffActivity : Activity() {
             requireStorageAccess()
             val state = documentId?.let(store::state) ?: store.findMostRecentState()
                 ?: error("No active InkBridge document")
-            when (val result = store.finalize(state.documentId)) {
-                FinalizeResult.NoChanges -> StorageOutcome(
+            when (val compact = compactFinalizer.finalize(state.documentId)) {
+                CompactFinalizeResult.NoChanges -> StorageOutcome(
                     "No new BOOX changes to finalize",
                     state,
                 )
-                is FinalizeResult.AlreadyFinalized -> StorageOutcome(
+                is CompactFinalizeResult.AlreadyFinalized -> StorageOutcome(
                     "These BOOX changes were already finalized",
                     store.state(state.documentId),
                 )
-                is FinalizeResult.Finalized -> StorageOutcome(
-                    "BOOX changes finalized\n" + result.pdf.name + "\nReady for folder sync",
-                    result.state,
+                is CompactFinalizeResult.Finalized -> StorageOutcome(
+                    compact.operationCount.toString() +
+                        " BOOX operation(s) finalized\nReady for folder sync",
+                    compact.state,
                 )
+                is CompactFinalizeResult.FullPdfFallbackRequired ->
+                    when (val fallback = store.finalize(state.documentId)) {
+                        FinalizeResult.NoChanges -> StorageOutcome(
+                            "No new BOOX changes to finalize",
+                            state,
+                        )
+                        is FinalizeResult.AlreadyFinalized -> StorageOutcome(
+                            "These BOOX changes were already finalized",
+                            store.state(state.documentId),
+                        )
+                        is FinalizeResult.Finalized -> StorageOutcome(
+                            "BOOX changes finalized as a full PDF\n" + fallback.pdf.name +
+                                "\nCompact sync unavailable: " + compact.reason +
+                                "\nReady for folder sync",
+                            fallback.state,
+                        )
+                    }
             }
         }
 

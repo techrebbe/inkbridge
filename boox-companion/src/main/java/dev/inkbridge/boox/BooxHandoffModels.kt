@@ -148,6 +148,7 @@ data class HandoffState(
     val installedBrokerSha256: String,
     val finalizedLocalSha256: String? = null,
     val finalizedOutputFileName: String? = null,
+    val finalizedOutputSha256: String? = null,
     val localGeneration: Long = 0,
     val processedEventIds: List<String> = emptyList(),
     val retiredPredecessors: List<RetiredPredecessorWatch> = emptyList(),
@@ -163,8 +164,12 @@ data class HandoffState(
         require(SHA256.matches(installedBrokerSha256)) { "Invalid installed PDF hash" }
         finalizedLocalSha256?.let { require(SHA256.matches(it)) { "Invalid finalized PDF hash" } }
         finalizedOutputFileName?.let { requireSafeFileName(it, "finalized output file name") }
+        finalizedOutputSha256?.let { require(SHA256.matches(it)) { "Invalid finalized output hash" } }
         require((finalizedLocalSha256 == null) == (finalizedOutputFileName == null)) {
             "Finalized PDF hash and file name must be recorded together"
+        }
+        require(finalizedOutputSha256 == null || finalizedLocalSha256 != null) {
+            "Finalized output hash requires finalized state"
         }
         require(localGeneration >= 0) { "Invalid local generation" }
         require(processedEventIds.size <= MAX_PROCESSED_EVENT_IDS) { "Too many processed event IDs" }
@@ -189,6 +194,7 @@ data class HandoffState(
         .put("installedBrokerSha256", installedBrokerSha256)
         .putOpt("finalizedLocalSha256", finalizedLocalSha256)
         .putOpt("finalizedOutputFileName", finalizedOutputFileName)
+        .putOpt("finalizedOutputSha256", finalizedOutputSha256)
         .put("localGeneration", localGeneration)
         .put("processedEventIds", JSONArray(processedEventIds))
         .put("retiredPredecessors", JSONArray(retiredPredecessors.map { it.toJson() }))
@@ -210,6 +216,7 @@ data class HandoffState(
                 installedBrokerSha256 = value.getString("installedBrokerSha256"),
                 finalizedLocalSha256 = value.optNullableString("finalizedLocalSha256"),
                 finalizedOutputFileName = value.optNullableString("finalizedOutputFileName"),
+                finalizedOutputSha256 = value.optNullableString("finalizedOutputSha256"),
                 localGeneration = value.optLong("localGeneration", 0),
                 processedEventIds = List(eventIds.length()) { eventIds.getString(it) }
                     .takeLast(MAX_PROCESSED_EVENT_IDS),
@@ -331,6 +338,7 @@ data class FinalizeIntent(
             nextState == previousState.copy(
                 finalizedLocalSha256 = finalizedHash,
                 finalizedOutputFileName = outputName,
+                finalizedOutputSha256 = nextState.finalizedOutputSha256,
                 localGeneration = previousState.localGeneration + 1,
             ),
         ) { "Finalize intent does not describe one durable BOOX snapshot" }
@@ -381,13 +389,16 @@ object HandoffPolicy {
         if (delivery.sourceGeneration <= state.sourceGeneration) {
             return InstallDecision.Reject("Delivery generation is not newer")
         }
+        if (
+            state.finalizedLocalSha256 != null &&
+            delivery.sourceRevisions.boox <= state.activeRevisions.boox
+        ) {
+            return InstallDecision.Reject("The broker has not accepted the finalized BOOX revision yet")
+        }
         if (activeSha256 == null) return InstallDecision.Reject("The active PDF is missing")
         if (activeSha256 != state.installedBrokerSha256) {
             if (activeSha256 != state.finalizedLocalSha256) {
                 return InstallDecision.Reject("Finalize the current BOOX changes before installing an update")
-            }
-            if (delivery.sourceRevisions.boox <= state.activeRevisions.boox) {
-                return InstallDecision.Reject("The broker has not accepted the finalized BOOX revision yet")
             }
         }
         return InstallDecision.Install

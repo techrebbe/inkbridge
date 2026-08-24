@@ -3,6 +3,7 @@ package dev.inkbridge.boox
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -95,9 +96,81 @@ class CompactBooxFinalizerTest {
         }
 
         assertEquals(null, store.state(documentId)?.finalizedLocalSha256)
-        assertEquals(2, store.outgoingDirectory(documentId).listFiles().orEmpty().size)
+        val outgoing = store.outgoingDirectory(documentId).listFiles().orEmpty()
+        assertEquals(1, outgoing.size)
+        assertTrue(outgoing.single().name.endsWith(".operations.json"))
+        assertFalse(File(outgoing.single().parentFile, outgoing.single().name + ".inkbridge.json").exists())
     }
 
+    @Test
+    fun state_commit_before_descriptor_is_recovered_without_duplicate_conversion() {
+        val root = Files.createTempDirectory("inkbridge-compact-state-crash").toFile()
+        val (store, state, active) = installedState(root)
+        val converter = FakeConverter()
+        val finalizer = CompactBooxFinalizer(store, converter)
+        finalizer.prepareBaseline(state)
+        active.writeBytes("NeoReader edit".toByteArray())
+        store.afterCompactStateCommitForTest = { error("simulated process death") }
+
+        assertThrows(IllegalStateException::class.java) {
+            finalizer.finalize(documentId)
+        }
+
+        val committed = requireNotNull(store.state(documentId))
+        assertEquals(sha256Hex(active), committed.finalizedLocalSha256)
+        val outgoing = store.outgoingDirectory(documentId)
+        val manifest = outgoing.listFiles().orEmpty().single { it.name.endsWith(".operations.json") }
+        val descriptor = File(outgoing, manifest.name + ".inkbridge.json")
+        assertFalse(descriptor.exists())
+
+        assertTrue(active.delete())
+        store.afterCompactStateCommitForTest = null
+        val recovered = finalizer.finalize(documentId) as CompactFinalizeResult.AlreadyFinalized
+
+        assertEquals(manifest, recovered.manifest)
+        assertTrue(descriptor.isFile)
+        assertEquals(1, converter.manifestCalls)
+    }
+
+    @Test
+    fun oversized_native_manifest_falls_back_before_publication_or_state_commit() {
+        val root = Files.createTempDirectory("inkbridge-compact-oversized").toFile()
+        val (store, state, active) = installedState(root)
+        val oversizedManifest = FakeConverter.manifest(sha256Hex("edited PDF".toByteArray()))
+        assertTrue(oversizedManifest.size > FakeConverter.BASELINE.size)
+        val converter = object : BooxManifestConverter {
+            override fun buildBaseline(pdf: File, sourceFileName: String) = FakeConverter.BASELINE
+            override fun buildManifest(pdf: File, baseline: ByteArray) = oversizedManifest
+        }
+        val finalizer = CompactBooxFinalizer(
+            store,
+            converter,
+            maxCompactJsonBytes = FakeConverter.BASELINE.size,
+        )
+        finalizer.prepareBaseline(state)
+        active.writeBytes("edited PDF".toByteArray())
+
+        val result = finalizer.finalize(documentId)
+
+        assertTrue(result is CompactFinalizeResult.FullPdfFallbackRequired)
+        assertTrue(store.outgoingDirectory(documentId).listFiles().orEmpty().isEmpty())
+        assertEquals(null, store.state(documentId)?.finalizedLocalSha256)
+    }
+
+    @Test
+    fun compact_entry_point_preserves_full_pdf_finalization_recovery() {
+        val root = Files.createTempDirectory("inkbridge-full-fallback-recovery").toFile()
+        val (store, _, active) = installedState(root)
+        active.writeBytes("full PDF fallback edit".toByteArray())
+        val full = store.finalize(documentId) as FinalizeResult.Finalized
+        assertTrue(full.descriptor.delete())
+
+        val recovered = CompactBooxFinalizer(store, FakeConverter()).finalize(documentId)
+
+        assertTrue(recovered is CompactFinalizeResult.AlreadyFinalized)
+        assertTrue(full.pdf.isFile)
+        assertTrue(full.descriptor.isFile)
+    }
     private fun installedState(root: File): Triple<BooxHandoffStore, HandoffState, File> {
         val store = BooxHandoffStore(root)
         val activeName = "book__ib-b0-s3-g7.pdf"
