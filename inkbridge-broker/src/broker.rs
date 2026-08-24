@@ -1064,7 +1064,10 @@ pub(crate) fn state_write(
 }
 
 pub(crate) fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, BrokerError> {
-    let state: CanonicalDocumentState = serde_json::from_slice(bytes)
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| BrokerError::CorruptState(error.to_string()))?;
+    migrate_legacy_conflict_payload_kinds(&mut value);
+    let state: CanonicalDocumentState = serde_json::from_value(value)
         .map_err(|error| BrokerError::CorruptState(error.to_string()))?;
     if state.schema_version != STATE_SCHEMA_VERSION {
         return Err(BrokerError::CorruptState(format!(
@@ -1073,6 +1076,41 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<CanonicalDocumentState, Broke
         )));
     }
     Ok(state)
+}
+
+fn migrate_legacy_conflict_payload_kinds(value: &mut serde_json::Value) {
+    let Some(conflicts) = value
+        .get_mut("conflicts")
+        .and_then(|conflicts| conflicts.as_array_mut())
+    else {
+        return;
+    };
+    for conflict in conflicts {
+        let Some(object) = conflict.as_object_mut() else {
+            continue;
+        };
+        if object.contains_key("payloadKind") {
+            continue;
+        }
+        let is_boox = object.get("source").and_then(|source| source.as_str()) == Some("boox");
+        let has_json_evidence = ["objectPath", "preservedPath"].iter().any(|key| {
+            object
+                .get(*key)
+                .and_then(|path| path.as_str())
+                .and_then(|path| std::path::Path::new(path).extension())
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        });
+        let payload_kind = if is_boox && has_json_evidence {
+            "boox_operation_manifest"
+        } else {
+            "device_view"
+        };
+        object.insert(
+            "payloadKind".to_owned(),
+            serde_json::Value::String(payload_kind.to_owned()),
+        );
+    }
 }
 
 pub(crate) fn ensure_original_page_count<S: BrokerStorage>(

@@ -3903,6 +3903,103 @@ fn resolving_valid_compact_conflict_persists_recovered_legacy_page_count() {
 }
 
 #[test]
+fn legacy_compact_conflict_without_payload_kind_is_inferred_from_json_evidence() {
+    let mut harness = Harness::new();
+    let base = stroke("sn-before-legacy-payload-kind", 0.2, 0.3);
+    let initial = harness.event(
+        "sn-before-legacy-payload-kind",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let incoming = stroke("boox-legacy-payload-kind", 0.7, 0.7);
+    let compact_bytes = compact_manifest(
+        vec![Operation::UpsertStroke {
+            source_uuid: incoming.source_uuid.clone(),
+            page_index: incoming.page_index,
+            before: None,
+            after: incoming.clone(),
+        }],
+        1,
+    );
+    let mut event = harness.event(
+        "boox-legacy-payload-kind-conflict",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_bytes.clone(),
+    );
+    let json_path = format!(
+        "BOOX_Folder/{}/incoming-r1.operations.json",
+        harness.document_id
+    );
+    let json_object = harness
+        .storage
+        .put_unchecked(&json_path, compact_bytes, BTreeMap::new());
+    event.object_path = json_path;
+    event.source_generation = json_object.generation;
+    event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &event)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let mut legacy = serde_json::to_value(harness.state()).unwrap();
+    legacy["conflicts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("payloadKind");
+    harness.storage.put_unchecked(
+        state_path(&harness.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+
+    let conflicts = harness
+        .broker
+        .list_conflicts(&harness.storage, &harness.document_id)
+        .unwrap();
+    assert_eq!(
+        conflicts[0].payload_kind,
+        DevicePayloadKind::BooxOperationManifest
+    );
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "boox-legacy-payload-kind-conflict",
+        )
+        .unwrap();
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-legacy-payload-kind",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(state.boox.revision, 1);
+    assert!(state.strokes["boox-legacy-payload-kind"]
+        .tombstone
+        .is_none());
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
 fn incremental_boox_conflicts_must_resolve_in_source_order() {
     let mut harness = Harness::new();
     let initial = harness.event(

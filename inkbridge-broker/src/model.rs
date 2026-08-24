@@ -139,7 +139,6 @@ pub struct PreservedInput {
     pub event_id: String,
     pub source: DeviceSide,
     pub object_path: String,
-    #[serde(default)]
     pub payload_kind: DevicePayloadKind,
     pub preserved_path: String,
     #[serde(default)]
