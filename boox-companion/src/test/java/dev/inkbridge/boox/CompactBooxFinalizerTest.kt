@@ -43,6 +43,30 @@ class CompactBooxFinalizerTest {
     }
 
     @Test
+    fun preparing_current_baseline_retires_only_obsolete_baseline_snapshots() {
+        val root = Files.createTempDirectory("inkbridge-compact-baseline-retirement").toFile()
+        val (store, state, _) = installedState(root)
+        val documentRoot = store.documentDirectory(documentId)
+        val obsolete = File(documentRoot, ".inkbridge-baseline-${"0".repeat(16)}.json")
+            .apply { writeText("obsolete") }
+        val unrelated = File(documentRoot, ".inkbridge-baseline-not-a-hash.json")
+            .apply { writeText("preserve") }
+        val finalizer = CompactBooxFinalizer(store, FakeConverter())
+
+        val current = finalizer.prepareBaseline(state)
+
+        assertTrue(current.isFile)
+        assertFalse(obsolete.exists())
+        assertTrue(unrelated.isFile)
+
+        val laterObsolete = File(documentRoot, ".inkbridge-baseline-${"1".repeat(16)}.json")
+            .apply { writeText("obsolete after restart") }
+        assertEquals(current, finalizer.prepareBaseline(state))
+        assertFalse(laterObsolete.exists())
+        assertTrue(current.isFile)
+    }
+
+    @Test
     fun changed_pdf_without_baseline_falls_back_without_publishing() {
         val root = Files.createTempDirectory("inkbridge-compact-fallback").toFile()
         val (store, _, active) = installedState(root)

@@ -27,16 +27,18 @@ internal class CompactBooxFinalizer(
         val active = store.activeFile(state)
         require(active.isFile) { "The active PDF is missing" }
         val baseline = baselineFile(state)
-        if (baseline.isFile) return baseline
-        require(sha256Hex(active) == state.installedBrokerSha256) {
-            "The active PDF changed before its compact baseline was prepared"
+        if (!baseline.isFile) {
+            require(sha256Hex(active) == state.installedBrokerSha256) {
+                "The active PDF changed before its compact baseline was prepared"
+            }
+            val bytes = converter.buildBaseline(active, state.originalFileName)
+            require(bytes.isNotEmpty()) { "The native converter returned an empty BOOX baseline" }
+            require(bytes.size <= maxCompactJsonBytes) {
+                "The compact BOOX baseline is unreasonably large"
+            }
+            store.publishPayloadBytesOrVerify(bytes, baseline, sha256Hex(bytes))
         }
-        val bytes = converter.buildBaseline(active, state.originalFileName)
-        require(bytes.isNotEmpty()) { "The native converter returned an empty BOOX baseline" }
-        require(bytes.size <= maxCompactJsonBytes) {
-            "The compact BOOX baseline is unreasonably large"
-        }
-        store.publishPayloadBytesOrVerify(bytes, baseline, sha256Hex(bytes))
+        retireObsoleteBaselines(state, baseline)
         return baseline
     }
 
@@ -195,6 +197,20 @@ internal class CompactBooxFinalizer(
             ".inkbridge-baseline-" + state.installedBrokerSha256.take(16) + ".json",
         )
 
+    private fun retireObsoleteBaselines(state: HandoffState, currentBaseline: File) {
+        store.documentDirectory(state.documentId).listFiles().orEmpty()
+            .filter { candidate ->
+                candidate.isFile &&
+                    candidate.name != currentBaseline.name &&
+                    BASELINE_FILE_NAME.matches(candidate.name)
+            }
+            .forEach { obsolete ->
+                check(obsolete.delete()) {
+                    "Could not retire obsolete compact BOOX baseline ${obsolete.name}"
+                }
+            }
+    }
+
     private fun validateBaseline(bytes: ByteArray, state: HandoffState) {
         val baseline = JSONObject(String(bytes, Charsets.UTF_8))
         require(baseline.getInt("schemaVersion") == 1) {
@@ -229,5 +245,6 @@ internal class CompactBooxFinalizer(
 
     private companion object {
         const val DEFAULT_MAX_COMPACT_JSON_BYTES = 64 * 1024 * 1024
+        val BASELINE_FILE_NAME = Regex("""\.inkbridge-baseline-[0-9a-f]{16}\.json""")
     }
 }
