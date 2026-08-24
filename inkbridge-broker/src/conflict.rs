@@ -685,6 +685,11 @@ fn validate_conflict_boox_manifest(
                 page_index,
                 before,
             } => {
+                if !state.strokes.contains_key(source_uuid) {
+                    return Err(BrokerError::InvalidEvent(format!(
+                        "preserved BOOX operation manifest deletes unknown stroke {source_uuid}"
+                    )));
+                }
                 validate_conflict_snapshot(
                     source_uuid,
                     *page_index,
@@ -705,6 +710,11 @@ fn validate_conflict_boox_manifest(
                 before,
                 after,
             } => {
+                if before.is_some() && !state.strokes.contains_key(source_uuid) {
+                    return Err(BrokerError::InvalidEvent(format!(
+                        "preserved BOOX operation manifest updates unknown stroke {source_uuid}"
+                    )));
+                }
                 if let Some(before) = before {
                     validate_conflict_snapshot(
                         source_uuid,

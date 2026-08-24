@@ -1047,6 +1047,90 @@ fn preserved_compact_cross_page_upsert_requires_a_matching_delete() {
         ))
         .is_none());
 }
+#[test]
+fn preserved_compact_rejects_unknown_updates_and_deletes_before_resolution() {
+    let unknown_update_before = stroke("preserved-unknown-update", 0.3, 0.4);
+    let unknown_update_after = stroke("preserved-unknown-update", 0.5, 0.6);
+    for (case, operation) in [
+        (
+            "delete",
+            Operation::DeleteStroke {
+                source_uuid: "preserved-unknown-delete".to_owned(),
+                page_index: 0,
+                before: stroke("preserved-unknown-delete", 0.2, 0.3),
+            },
+        ),
+        (
+            "update",
+            Operation::UpsertStroke {
+                source_uuid: "preserved-unknown-update".to_owned(),
+                page_index: 0,
+                before: Some(unknown_update_before.clone()),
+                after: unknown_update_after.clone(),
+            },
+        ),
+    ] {
+        let mut harness = Harness::new();
+        let base = stroke("sn-before-preserved-unknown", 0.1, 0.2);
+        let initial = harness.event(
+            &format!("sn-before-preserved-unknown-{case}"),
+            DeviceSide::Supernote,
+            1,
+            RevisionPair::default(),
+            supernote_export(std::slice::from_ref(&base)),
+        );
+        harness
+            .broker
+            .process(&mut harness.storage, &initial)
+            .unwrap();
+
+        let event_id = format!("boox-preserved-unknown-{case}");
+        let mut event = harness.event(
+            &event_id,
+            DeviceSide::Boox,
+            1,
+            RevisionPair::default(),
+            compact_manifest(vec![operation], 1),
+        );
+        event.payload_kind = DevicePayloadKind::BooxOperationManifest;
+        assert!(matches!(
+            harness
+                .broker
+                .process(&mut harness.storage, &event)
+                .unwrap(),
+            ProcessOutcome::Conflict { .. }
+        ));
+
+        assert!(matches!(
+            harness
+                .broker
+                .inspect_conflict(&harness.storage, &harness.document_id, &event_id),
+            Err(BrokerError::InvalidEvent(message)) if message.contains("unknown stroke")
+        ));
+
+        let state_before = harness.state();
+        let request = ConflictResolutionRequest {
+            schema_version: RESOLUTION_SCHEMA_VERSION,
+            resolution_id: format!("resolve-preserved-unknown-{case}"),
+            document_id: harness.document_id.clone(),
+            conflict_event_id: event_id.clone(),
+            expected_state_revision: state_before.state_revision,
+            expected_current_revisions: state_before.revisions(),
+            strategy: ConflictResolutionStrategy::AcceptIncoming,
+        };
+        assert!(matches!(
+            harness
+                .broker
+                .resolve_conflict(&mut harness.storage, &request),
+            Err(BrokerError::InvalidEvent(message)) if message.contains("unknown stroke")
+        ));
+        assert_eq!(harness.state(), state_before);
+        assert!(harness
+            .storage
+            .object(&conflict_resolution_path(&harness.document_id, &event_id))
+            .is_none());
+    }
+}
 
 #[test]
 fn compact_manifest_rejects_duplicate_upserts_for_one_stroke() {
