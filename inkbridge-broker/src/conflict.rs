@@ -203,9 +203,6 @@ impl Broker {
 
         let resulting_revisions = state.revisions();
         state.last_common_revisions = resulting_revisions;
-        state
-            .processed_event_ids
-            .insert(request.resolution_id.clone());
         state.state_revision += 1;
         state
             .conflicts
@@ -518,9 +515,6 @@ fn supersede_conflict<S: BrokerStorage>(
 ) -> Result<ConflictResolutionOutcome, BrokerError> {
     let mut state = context.state;
     let revisions = state.revisions();
-    state
-        .processed_event_ids
-        .insert(request.resolution_id.clone());
     state.state_revision += 1;
     state
         .conflicts

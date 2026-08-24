@@ -2099,6 +2099,96 @@ fn resolution_request(
 }
 
 #[test]
+fn resolution_id_does_not_deduplicate_a_later_device_event() {
+    let mut harness = Harness::new();
+    let base = stroke("resolution-id-base", 0.2, 0.3);
+    let initial = harness.event(
+        "resolution-id-sn-base",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export(std::slice::from_ref(&base)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let incoming = stroke("resolution-id-incoming", 0.55, 0.55);
+    let conflict_pdf = write_boox_view(&harness.original, [base, incoming.clone()]).unwrap();
+    let conflict = harness.event(
+        "resolution-id-conflict",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        conflict_pdf,
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &conflict)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "resolution-id-conflict",
+        )
+        .unwrap();
+    let shared_id = "later-device-event-id";
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        shared_id,
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let resolved = harness.state();
+    assert_eq!(resolved.boox.revision, 1);
+    assert!(!resolved.processed_event_ids.contains(shared_id));
+    let imported = &resolved.strokes["resolution-id-incoming"];
+    assert!(imported.tombstone.is_none());
+
+    let next = stroke("resolution-id-next-device-stroke", 0.75, 0.7);
+    let mut active = resolved
+        .strokes
+        .values()
+        .filter(|stroke| stroke.tombstone.is_none())
+        .map(|stroke| stroke.snapshot.clone())
+        .collect::<Vec<_>>();
+    active.push(next.clone());
+    let next_pdf = write_boox_view(&harness.original, active).unwrap();
+    let next_event = harness.event(
+        shared_id,
+        DeviceSide::Boox,
+        2,
+        resolved.revisions(),
+        next_pdf,
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &next_event)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
+
+    let state = harness.state();
+    assert_eq!(state.boox.revision, 2);
+    assert!(state.processed_event_ids.contains(shared_id));
+    let applied = &state.strokes["resolution-id-next-device-stroke"];
+    assert!(applied.tombstone.is_none());
+}
+
+#[test]
 fn tracked_in_place_boox_conflict_resolves_against_its_exact_generation() {
     let mut harness = harness_with_in_place_boox_conflict();
     let boox_path = boox_view_path(&harness.state());
@@ -2979,6 +3069,9 @@ fn older_full_boox_conflict_is_superseded_without_rolling_back_revision() {
     assert_eq!(state.revisions(), before_superseding.revisions());
     assert_eq!(state.strokes, before_superseding.strokes);
     assert!(state.conflicts.is_empty());
+    assert!(!state
+        .processed_event_ids
+        .contains("supersede-older-full-boox"));
     let record = &state.resolved_conflicts["boox-older-full-conflict"];
     assert!(record.superseded);
     assert_eq!(record.strategy, ConflictResolutionStrategy::AcceptIncoming);
