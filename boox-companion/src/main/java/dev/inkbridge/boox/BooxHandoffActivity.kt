@@ -65,7 +65,8 @@ class BooxHandoffActivity : Activity() {
                 opened.brokerEventId,
                 opened.activeFileName,
             )
-            val outcome = when (val compact = compactFinalizer.finalize(confirmed.documentId)) {
+            val compact = compactFinalizer.finalize(confirmed.documentId)
+            val outcome = when (compact) {
                 CompactFinalizeResult.NoChanges -> StorageOutcome(
                     "NeoReader handoff confirmed; no embedded BOOX changes found",
                     confirmed,
@@ -84,9 +85,11 @@ class BooxHandoffActivity : Activity() {
                     confirmed,
                 )
             }
-            // Clear the durable return marker only after all finalization artifacts
-            // are visible. A process death before this point retries on next resume.
-            neoReaderHandoff.confirmationCommitted(opened)
+            // A compact fallback has not finalized anything yet. Preserve the
+            // durable marker until an explicit full-PDF fallback succeeds.
+            if (compact !is CompactFinalizeResult.FullPdfFallbackRequired) {
+                neoReaderHandoff.confirmationCommitted(opened)
+            }
             outcome
         }
     }
@@ -250,7 +253,7 @@ class BooxHandoffActivity : Activity() {
             requireStorageAccess()
             val state = documentId?.let(store::state) ?: store.findMostRecentState()
                 ?: error("No active InkBridge document")
-            when (val compact = compactFinalizer.finalize(state.documentId)) {
+            val outcome = when (val compact = compactFinalizer.finalize(state.documentId)) {
                 CompactFinalizeResult.NoChanges -> StorageOutcome(
                     "No new BOOX changes to finalize",
                     state,
@@ -282,6 +285,10 @@ class BooxHandoffActivity : Activity() {
                         )
                     }
             }
+            neoReaderHandoff.activityResumed()
+                ?.takeIf { it.documentId == state.documentId }
+                ?.let(neoReaderHandoff::confirmationCommitted)
+            outcome
         }
 
     private fun requestStorageAccess() = runUiAction {
