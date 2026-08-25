@@ -1,5 +1,6 @@
 mod baseline;
 mod model;
+mod neoreader_repair;
 mod pdf;
 
 pub use baseline::{
@@ -120,6 +121,7 @@ fn build_manifest_from_extraction(
         mut skipped,
         incomplete_pages,
         failed_source_uuids,
+        tombstoned_source_uuids,
     } = extraction;
     validate_baseline_pages(&baseline_strokes, page_count)?;
     let baseline = index_baseline(baseline_strokes);
@@ -128,6 +130,7 @@ fn build_manifest_from_extraction(
         &baseline,
         &incomplete_pages,
         &failed_source_uuids,
+        &tombstoned_source_uuids,
     );
 
     let upserted = operations
@@ -228,6 +231,7 @@ fn diff_strokes(
     baseline: &HashMap<String, StrokeSnapshot>,
     incomplete_pages: &HashSet<u32>,
     failed_source_uuids: &HashSet<String>,
+    tombstoned_source_uuids: &HashSet<String>,
 ) -> (Vec<Operation>, usize) {
     let baseline_pages = baseline
         .values()
@@ -275,7 +279,10 @@ fn diff_strokes(
     }
 
     for before in baseline.values() {
-        if should_infer_deletion(before, &baseline_pages, &active_ids, incomplete_pages) {
+        if !active_ids.contains(&before.source_uuid)
+            && (tombstoned_source_uuids.contains(&before.source_uuid)
+                || should_infer_deletion(before, &baseline_pages, &active_ids, incomplete_pages))
+        {
             operations.push(Operation::DeleteStroke {
                 source_uuid: before.source_uuid.clone(),
                 page_index: before.page_index,
@@ -398,6 +405,7 @@ mod tests {
             &baseline,
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
         );
 
         assert_eq!(unchanged, 0);
@@ -471,10 +479,42 @@ mod tests {
             &baseline,
             &incomplete_pages,
             &failed_source_uuids,
+            &HashSet::new(),
         );
 
         assert!(operations.is_empty());
         assert_eq!(unchanged, 0);
+    }
+
+    #[test]
+    fn explicit_broker_tombstone_deletes_only_its_stroke_on_an_incomplete_page() {
+        let deleted = test_stroke("explicitly-deleted", 0);
+        let preserved = test_stroke("unrelated-malformed", 0);
+        let baseline = HashMap::from([
+            (deleted.source_uuid.clone(), deleted.clone()),
+            (preserved.source_uuid.clone(), preserved),
+        ]);
+        let incomplete_pages = HashSet::from([0]);
+        let tombstones = HashSet::from([deleted.source_uuid.clone()]);
+
+        let (operations, unchanged) = diff_strokes(
+            Vec::new(),
+            &baseline,
+            &incomplete_pages,
+            &HashSet::new(),
+            &tombstones,
+        );
+
+        assert_eq!(unchanged, 0);
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            &operations[0],
+            Operation::DeleteStroke {
+                source_uuid,
+                page_index: 0,
+                before,
+            } if source_uuid == "explicitly-deleted" && before == &deleted
+        ));
     }
 
     #[test]
