@@ -225,16 +225,33 @@ fn inkbridge_deletion_marker(document: &Document, annotation: &Dictionary) -> Op
     {
         return None;
     }
-    if annotation
-        .get(b"InkList")
-        .ok()
-        .and_then(|value| resolve(document, value).ok())
-        .and_then(|value| value.as_array().ok())
-        .is_some()
-    {
-        return None;
+    match annotation.get(b"InkList") {
+        Err(_) => annotation_source_uuid(document, annotation),
+        Ok(value) if neoreader_removed_inklist_placeholder(document, value) => {
+            annotation_source_uuid(document, annotation)
+        }
+        Ok(_) => None,
     }
-    annotation_source_uuid(document, annotation)
+}
+
+fn neoreader_removed_inklist_placeholder(document: &Document, value: &Object) -> bool {
+    let Object::Reference(object_id) = value else {
+        return false;
+    };
+    if document.get_object(*object_id).is_ok() {
+        return false;
+    }
+
+    // Captured NeoReader deletions encode the removed /InkList as a compressed
+    // reference whose advertised container is not an object stream. qpdf repairs
+    // this exact impossible xref shape by dropping /InkList. Do not generalize it:
+    // ordinary missing references and all other malformed present values are
+    // damaged active annotations and must enter extraction-failure handling.
+    matches!(
+        document.reference_table.get(object_id.0),
+        Some(lopdf::xref::XrefEntry::Compressed { container, .. })
+            if !matches!(document.objects.get(&(*container, 0)), Some(Object::Stream(_)))
+    )
 }
 
 fn extract_standard_ink(
@@ -667,8 +684,8 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_broker_owned_ink_without_resolvable_geometry_as_a_deletion_marker() {
-        let document = Document::new();
+    fn recognizes_only_exact_broker_owned_deletion_shapes() {
+        let mut document = Document::new();
         let marker = dictionary! {
             "Subtype" => "Ink",
             "NM" => Object::string_literal("deleted-stroke"),
@@ -694,6 +711,40 @@ mod tests {
             ],
         };
         assert_eq!(inkbridge_deletion_marker(&document, &still_active), None);
+
+        let malformed = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("damaged-active-stroke"),
+            "InkBridgeProducer" => Object::string_literal("inkbridge-broker"),
+            "InkList" => Object::Null,
+        };
+        assert_eq!(inkbridge_deletion_marker(&document, &malformed), None);
+
+        let unresolved = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("unresolved-active-stroke"),
+            "InkBridgeProducer" => Object::string_literal("inkbridge-broker"),
+            "InkList" => Object::Reference((999, 0)),
+        };
+        assert_eq!(inkbridge_deletion_marker(&document, &unresolved), None);
+
+        document.reference_table.insert(
+            1001,
+            lopdf::xref::XrefEntry::Compressed {
+                container: 1002,
+                index: 0,
+            },
+        );
+        let neoreader_removed = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("neoreader-removed-stroke"),
+            "InkBridgeProducer" => Object::string_literal("inkbridge-broker"),
+            "InkList" => Object::Reference((1001, 0)),
+        };
+        assert_eq!(
+            inkbridge_deletion_marker(&document, &neoreader_removed).as_deref(),
+            Some("neoreader-removed-stroke")
+        );
     }
 
     #[test]
