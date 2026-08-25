@@ -20,6 +20,7 @@ pub struct PdfStrokeExtraction {
     pub incomplete_pages: HashSet<u32>,
     pub failed_source_uuids: HashSet<String>,
     pub tombstoned_source_uuids: HashSet<String>,
+    pub broker_owned_source_uuids: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +81,7 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
     let mut incomplete_pages = HashSet::new();
     let mut failed_source_uuids = HashSet::new();
     let mut tombstoned_source_uuids = HashSet::new();
+    let mut broker_owned_source_uuids = HashSet::new();
 
     for (page_number, page_id) in &pages {
         let page_index = page_number.saturating_sub(1);
@@ -96,8 +98,15 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
                 tombstoned_source_uuids.insert(source_uuid);
                 continue;
             }
+            let broker_owned = is_inkbridge_broker_annotation(&document, annotation);
             match extract_annotation(&document, annotation, page_index, geometry) {
-                Ok(extracted) => strokes.extend(extracted),
+                Ok(extracted) => {
+                    if broker_owned {
+                        broker_owned_source_uuids
+                            .extend(extracted.iter().map(|stroke| stroke.source_uuid.clone()));
+                    }
+                    strokes.extend(extracted);
+                }
                 Err(error) => {
                     eprintln!("warning: skipped annotation on page {page_number}: {error}");
                     skipped += 1;
@@ -116,6 +125,7 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
         incomplete_pages,
         failed_source_uuids,
         tombstoned_source_uuids,
+        broker_owned_source_uuids,
     })
 }
 
@@ -216,13 +226,16 @@ fn annotation_source_uuid(document: &Document, annotation: &Dictionary) -> Optio
     }
 }
 
+fn is_inkbridge_broker_annotation(document: &Document, annotation: &Dictionary) -> bool {
+    pdf_string(document, annotation.get(b"InkBridgeProducer").ok()).as_deref()
+        == Some("inkbridge-broker")
+}
+
 fn inkbridge_deletion_marker(document: &Document, annotation: &Dictionary) -> Option<String> {
     if name(document, annotation.get(b"Subtype").ok()).as_deref() != Some("Ink") {
         return None;
     }
-    if pdf_string(document, annotation.get(b"InkBridgeProducer").ok()).as_deref()
-        != Some("inkbridge-broker")
-    {
+    if !is_inkbridge_broker_annotation(document, annotation) {
         return None;
     }
     match annotation.get(b"InkList") {

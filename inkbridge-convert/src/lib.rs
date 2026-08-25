@@ -52,6 +52,7 @@ pub fn build_document_baseline(
     let PdfStrokeExtraction {
         page_count,
         strokes,
+        broker_owned_source_uuids,
         incomplete_pages,
         failed_source_uuids,
         ..
@@ -62,15 +63,34 @@ pub fn build_document_baseline(
             pdf_path.display()
         ));
     }
+    let (strokes, immutable_original_source_uuids) =
+        partition_document_baseline_strokes(strokes, &broker_owned_source_uuids);
     let baseline = DocumentBaseline {
         schema_version: DOCUMENT_BASELINE_SCHEMA_VERSION,
         source_file_name: source_file_name.to_owned(),
         page_count,
         pdf_sha256,
         strokes,
+        immutable_original_source_uuids,
     };
     baseline.validate()?;
     Ok(baseline)
+}
+
+fn partition_document_baseline_strokes(
+    strokes: Vec<StrokeSnapshot>,
+    broker_owned_source_uuids: &HashSet<String>,
+) -> (Vec<StrokeSnapshot>, Vec<String>) {
+    let (canonical, immutable_original): (Vec<_>, Vec<_>) = strokes
+        .into_iter()
+        .partition(|stroke| broker_owned_source_uuids.contains(&stroke.source_uuid));
+    let mut immutable_original_source_uuids = immutable_original
+        .into_iter()
+        .map(|stroke| stroke.source_uuid)
+        .collect::<Vec<_>>();
+    immutable_original_source_uuids.sort();
+    immutable_original_source_uuids.dedup();
+    (canonical, immutable_original_source_uuids)
 }
 
 pub fn build_manifest_from_document_baseline(
@@ -79,7 +99,10 @@ pub fn build_manifest_from_document_baseline(
     normalized_y_offset: f64,
 ) -> Result<Manifest, String> {
     baseline.validate()?;
-    let extraction = extract_pdf_strokes(pdf_path)?;
+    let extraction = exclude_immutable_original_annotations(
+        extract_pdf_strokes(pdf_path)?,
+        &baseline.immutable_original_source_uuids,
+    );
     validate_document_page_count(baseline.page_count, extraction.page_count)?;
     let mut manifest = build_manifest_from_extraction(
         pdf_path,
@@ -93,6 +116,26 @@ pub fn build_manifest_from_document_baseline(
         .source_file_name
         .clone_from(&baseline.source_file_name);
     Ok(manifest)
+}
+
+fn exclude_immutable_original_annotations(
+    mut extraction: PdfStrokeExtraction,
+    source_uuids: &[String],
+) -> PdfStrokeExtraction {
+    let ignored = source_uuids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    extraction
+        .strokes
+        .retain(|stroke| !ignored.contains(stroke.source_uuid.as_str()));
+    extraction
+        .failed_source_uuids
+        .retain(|source_uuid| !ignored.contains(source_uuid.as_str()));
+    extraction
+        .tombstoned_source_uuids
+        .retain(|source_uuid| !ignored.contains(source_uuid.as_str()));
+    extraction
 }
 
 fn validate_document_page_count(
@@ -122,6 +165,7 @@ fn build_manifest_from_extraction(
         incomplete_pages,
         failed_source_uuids,
         tombstoned_source_uuids,
+        ..
     } = extraction;
     validate_baseline_pages(&baseline_strokes, page_count)?;
     let baseline = index_baseline(baseline_strokes);
@@ -584,5 +628,53 @@ mod tests {
             sha256_file(&path).unwrap(),
             format!("{:x}", Sha256::digest(&bytes))
         );
+    }
+
+    #[test]
+    fn compact_baseline_ignores_immutable_original_ink_but_keeps_new_boox_ink() {
+        let canonical = test_stroke("canonical", 0);
+        let immutable_original = test_stroke("original-ink", 0);
+        let (baseline_strokes, ignored) = partition_document_baseline_strokes(
+            vec![canonical.clone(), immutable_original.clone()],
+            &HashSet::from([canonical.source_uuid.clone()]),
+        );
+        assert_eq!(baseline_strokes, vec![canonical.clone()]);
+        assert_eq!(ignored, vec![immutable_original.source_uuid.clone()]);
+
+        let mut moved_original = immutable_original.clone();
+        moved_original.samples[0][0] += 0.1;
+        moved_original.geometry_fingerprint =
+            geometry_fingerprint(&moved_original.native_style, &moved_original.samples);
+        let new_boox_stroke = test_stroke("new-boox-stroke", 0);
+        let extraction = PdfStrokeExtraction {
+            page_count: 1,
+            strokes: vec![moved_original, canonical.clone(), new_boox_stroke.clone()],
+            skipped: 0,
+            incomplete_pages: HashSet::new(),
+            failed_source_uuids: HashSet::new(),
+            tombstoned_source_uuids: HashSet::new(),
+            broker_owned_source_uuids: HashSet::from([canonical.source_uuid.clone()]),
+        };
+        let filtered = exclude_immutable_original_annotations(extraction, &ignored);
+        let baseline = HashMap::from([(canonical.source_uuid.clone(), canonical)]);
+        let (operations, unchanged) = diff_strokes(
+            filtered.strokes,
+            &baseline,
+            &filtered.incomplete_pages,
+            &filtered.failed_source_uuids,
+            &filtered.tombstoned_source_uuids,
+        );
+
+        assert_eq!(unchanged, 1);
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            &operations[0],
+            Operation::UpsertStroke {
+                source_uuid,
+                before: None,
+                after,
+                ..
+            } if source_uuid == "new-boox-stroke" && after == &new_boox_stroke
+        ));
     }
 }

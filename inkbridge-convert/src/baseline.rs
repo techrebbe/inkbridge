@@ -62,6 +62,9 @@ pub struct DocumentBaseline {
     pub page_count: usize,
     pub pdf_sha256: String,
     pub strokes: Vec<StrokeSnapshot>,
+    /// Stable identities belonging to annotations already present in the immutable original.
+    #[serde(default)]
+    pub immutable_original_source_uuids: Vec<String>,
 }
 
 impl DocumentBaseline {
@@ -109,6 +112,19 @@ impl DocumentBaseline {
                 return Err(format!(
                     "BOOX baseline stroke {} contains fewer than two samples",
                     stroke.source_uuid
+                ));
+            }
+        }
+        for source_uuid in &self.immutable_original_source_uuids {
+            if source_uuid.trim().is_empty() {
+                return Err(
+                    "BOOX baseline contains an immutable-original annotation without an identity"
+                        .to_owned(),
+                );
+            }
+            if !identities.insert(source_uuid.as_str()) {
+                return Err(format!(
+                    "BOOX baseline repeats annotation identity {source_uuid} across canonical and immutable-original inventories"
                 ));
             }
         }
