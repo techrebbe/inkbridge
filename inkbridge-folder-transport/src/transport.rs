@@ -6,8 +6,8 @@ use crate::{
     CloudFolder, CloudObject, DocumentFolders, DocumentTransportState, FileObservation,
     PendingUpload, SyncReport, TransportAction, TransportState, VerifiedBooxInstall,
 };
-use inkbridge_broker::{sha256_hex, DeviceSide, RevisionPair, BROKER_PRODUCER};
-use inkbridge_convert::{build_manifest, parse_baseline_bytes, BaselineExport};
+use inkbridge_broker::{sha256_hex, DevicePayloadKind, DeviceSide, RevisionPair, BROKER_PRODUCER};
+use inkbridge_convert::{build_manifest, parse_baseline_bytes, BaselineExport, Manifest};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -26,6 +26,7 @@ const SOURCE_PAGE_INDEX: &str = "inkbridge-source-page-index";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 const RECOVERED_MISSING_PREFIX: &str = "inkbridge-missing-accepted://";
 const MAX_SUPERNOTE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_BOOX_OPERATION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SUPERNOTE_ACK_BYTES: u64 = 256 * 1024;
 
 pub trait BooxManifestBuilder {
@@ -984,7 +985,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 .is_some_and(|receipt| verified_boox_install_matches_ack(receipt, installed))
         });
         for artifact in endpoint.finalized_artifacts(document)? {
-            let local_key = canonical_path_key(&artifact.pdf_path);
+            let local_key = canonical_path_key(&artifact.payload_path);
             let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
             let expected_source_hash = artifact.event.content_sha256.clone();
             let (already_uploaded, accepted) = {
@@ -1015,26 +1016,37 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 continue;
             }
             if !file_is_settled(&artifact.descriptor_path, state, now, self.settle)?
-                || !file_is_settled(&artifact.pdf_path, state, now, self.settle)?
+                || !file_is_settled(&artifact.payload_path, state, now, self.settle)?
             {
                 continue;
             }
-            let source_hash = sha256_file(&artifact.pdf_path)?;
+            let source_hash = sha256_file(&artifact.payload_path)?;
             if source_hash != expected_source_hash {
                 report.actions.push(TransportAction::Deferred {
                     side: DeviceSide::Boox,
                     reason: format!(
-                        "finalized BOOX PDF {} has content hash {source_hash}, not descriptor hash {}, and was preserved for inspection",
-                        artifact.pdf_path.display(),
+                        "finalized BOOX payload {} has content hash {source_hash}, not descriptor hash {}, and was preserved for inspection",
+                        artifact.payload_path.display(),
                         expected_source_hash
                     ),
                 });
                 continue;
             }
+            if artifact.event.payload_kind == DevicePayloadKind::BooxOperationManifest {
+                return self.upload_prebuilt_boox_manifest(
+                    document,
+                    state,
+                    &artifact,
+                    &source_hash,
+                    report,
+                );
+            }
             let current = state.document_mut(&document.document_id).revisions;
             if artifact.event.based_on == current {
                 let mut companion_document = document.clone();
-                companion_document.boox_pdf.clone_from(&artifact.pdf_path);
+                companion_document
+                    .boox_pdf
+                    .clone_from(&artifact.payload_path);
                 return self.upload_boox_pdf_if_ready(
                     &companion_document,
                     state,
@@ -1054,6 +1066,46 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         Ok(())
     }
 
+    fn upload_prebuilt_boox_manifest(
+        &self,
+        document: &DocumentFolders,
+        state: &mut TransportState,
+        artifact: &FinalizedBooxArtifact,
+        payload_hash: &str,
+        report: &mut SyncReport,
+    ) -> Result<(), String> {
+        let local_key = canonical_path_key(&artifact.payload_path);
+        let source_local_id = sha256_hex(artifact.event.event_id.as_bytes());
+        let source_view_hash = read_boox_operation_source_view_hash(&artifact.payload_path)?;
+        let (object, source_revision) = self.upload_source_at(
+            document,
+            state,
+            DeviceSide::Boox,
+            &artifact.payload_path,
+            &local_key,
+            &source_local_id,
+            None,
+            &source_view_hash,
+            payload_hash,
+            "boox_operation_manifest",
+            "operations.json",
+            artifact.event.based_on,
+            artifact.event.source_revision,
+        )?;
+        state
+            .document_mut(&document.document_id)
+            .boox
+            .uploaded_local_hashes
+            .insert(local_key, payload_hash.to_owned());
+        report.actions.push(TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            local_path: artifact.payload_path.clone(),
+            object_path: object.path,
+            source_revision,
+            uploaded_bytes: object.size,
+        });
+        Ok(())
+    }
     fn upload_conflicting_boox_handoff(
         &self,
         document: &DocumentFolders,
@@ -1067,8 +1119,8 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             document,
             state,
             DeviceSide::Boox,
-            &artifact.pdf_path,
-            &canonical_path_key(&artifact.pdf_path),
+            &artifact.payload_path,
+            &canonical_path_key(&artifact.payload_path),
             &source_local_id,
             None,
             source_hash,
@@ -1083,12 +1135,12 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             .boox
             .uploaded_local_hashes
             .insert(
-                canonical_path_key(&artifact.pdf_path),
+                canonical_path_key(&artifact.payload_path),
                 source_hash.to_owned(),
             );
         report.actions.push(TransportAction::Uploaded {
             side: DeviceSide::Boox,
-            local_path: artifact.pdf_path.clone(),
+            local_path: artifact.payload_path.clone(),
             object_path: object.path,
             source_revision,
             uploaded_bytes: object.size,
@@ -1835,6 +1887,45 @@ fn verified_boox_install_object(
     })
 }
 
+fn read_boox_operation_source_view_hash(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "could not inspect BOOX operation manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.len() > MAX_BOOX_OPERATION_MANIFEST_BYTES {
+        return Err(format!(
+            "BOOX operation manifest {} exceeds the {} byte safety limit",
+            path.display(),
+            MAX_BOOX_OPERATION_MANIFEST_BYTES
+        ));
+    }
+    let file = File::open(path).map_err(|error| {
+        format!(
+            "could not read BOOX operation manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    let manifest: Manifest = serde_json::from_reader(BufReader::new(file)).map_err(|error| {
+        format!(
+            "invalid BOOX operation manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    let hash = manifest.document.pdf_sha256;
+    let valid = hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if !valid {
+        return Err(format!(
+            "BOOX operation manifest {} has an invalid source PDF hash",
+            path.display()
+        ));
+    }
+    Ok(hash)
+}
 fn record_delivered_frontier(
     document_state: &mut DocumentTransportState,
     revisions: RevisionPair,

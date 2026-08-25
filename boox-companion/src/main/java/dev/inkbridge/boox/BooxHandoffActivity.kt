@@ -24,6 +24,7 @@ class BooxHandoffActivity : Activity() {
     private lateinit var status: TextView
     private val actionButtons = mutableListOf<Button>()
     private lateinit var neoReaderHandoff: NeoReaderHandoffTracker
+    private lateinit var compactFinalizer: CompactBooxFinalizer
     private var operationRunning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -38,6 +39,7 @@ class BooxHandoffActivity : Activity() {
             predecessorQuietPeriodMillis = 1_500,
             predecessorSettleTimeoutMillis = 15_000,
         )
+        compactFinalizer = CompactBooxFinalizer(store, NativeBooxManifestConverter())
         setContentView(buildUi())
         renderStatus("Ready")
         dispatchIntent(intent)
@@ -63,8 +65,33 @@ class BooxHandoffActivity : Activity() {
                 opened.brokerEventId,
                 opened.activeFileName,
             )
-            neoReaderHandoff.confirmationCommitted(opened)
-            StorageOutcome("NeoReader handoff confirmed", confirmed)
+            store.awaitActivePdfQuiet(confirmed)
+            val compact = compactFinalizer.finalize(confirmed.documentId)
+            val outcome = when (compact) {
+                CompactFinalizeResult.NoChanges -> StorageOutcome(
+                    "NeoReader handoff confirmed; no embedded BOOX changes found",
+                    confirmed,
+                )
+                is CompactFinalizeResult.AlreadyFinalized -> StorageOutcome(
+                    "NeoReader handoff confirmed; these BOOX changes were already finalized",
+                    store.state(confirmed.documentId),
+                )
+                is CompactFinalizeResult.Finalized -> StorageOutcome(
+                    "NeoReader handoff confirmed\n" + compact.operationCount +
+                        " BOOX operation(s) finalized\nReady for folder sync",
+                    compact.state,
+                )
+                is CompactFinalizeResult.FullPdfFallbackRequired -> StorageOutcome(
+                    "NeoReader handoff confirmed\nCompact sync unavailable: " + compact.reason,
+                    confirmed,
+                )
+            }
+            // A compact fallback has not finalized anything yet. Preserve the
+            // durable marker until an explicit full-PDF fallback succeeds.
+            if (compact !is CompactFinalizeResult.FullPdfFallbackRequired) {
+                neoReaderHandoff.confirmationCommitted(opened)
+            }
+            outcome
         }
     }
 
@@ -125,13 +152,18 @@ class BooxHandoffActivity : Activity() {
         requireStorageAccess()
         val descriptor = store.findNextDescriptor() ?: error("No new broker update is waiting")
         when (val result = store.install(descriptor)) {
-            is InstallResult.Installed -> StorageOutcome(
-                "Installed revision b" + result.state.activeRevisions.boox +
-                    " / s" + result.state.activeRevisions.supernote +
-                    "\n" + result.activeFile.name,
-                result.state,
-                result.activeFile,
-            )
+            is InstallResult.Installed -> {
+                val compactWarning = runCatching {
+                    compactFinalizer.prepareBaseline(result.state)
+                }.exceptionOrNull()?.let { "\nCompact sync unavailable: " + it.message }.orEmpty()
+                StorageOutcome(
+                    "Installed revision b" + result.state.activeRevisions.boox +
+                        " / s" + result.state.activeRevisions.supernote +
+                        "\n" + result.activeFile.name + compactWarning,
+                    result.state,
+                    result.activeFile,
+                )
+            }
             is InstallResult.Duplicate -> StorageOutcome(
                 "That broker update was already installed",
                 store.findMostRecentState(),
@@ -209,9 +241,12 @@ class BooxHandoffActivity : Activity() {
             requireStorageAccess()
             val state = documentId?.let(store::state) ?: store.findMostRecentState()
                 ?: error("No active InkBridge document")
-            val pdf = File(File(File(store.root, state.documentId), "active"), state.activeFileName)
+            val pdf = store.activeFile(state)
             require(pdf.isFile) { "The active PDF is missing" }
-            StorageOutcome("Opening active document in NeoReader", state, pdf)
+            val compactWarning = runCatching {
+                compactFinalizer.prepareBaseline(state)
+            }.exceptionOrNull()?.let { "\nCompact sync unavailable: " + it.message }.orEmpty()
+            StorageOutcome("Opening active document in NeoReader" + compactWarning, state, pdf)
         }
 
     private fun finalizeActive(documentId: String? = null) =
@@ -219,20 +254,43 @@ class BooxHandoffActivity : Activity() {
             requireStorageAccess()
             val state = documentId?.let(store::state) ?: store.findMostRecentState()
                 ?: error("No active InkBridge document")
-            when (val result = store.finalize(state.documentId)) {
-                FinalizeResult.NoChanges -> StorageOutcome(
+            store.awaitActivePdfQuiet(state)
+            val outcome = when (val compact = compactFinalizer.finalize(state.documentId)) {
+                CompactFinalizeResult.NoChanges -> StorageOutcome(
                     "No new BOOX changes to finalize",
                     state,
                 )
-                is FinalizeResult.AlreadyFinalized -> StorageOutcome(
+                is CompactFinalizeResult.AlreadyFinalized -> StorageOutcome(
                     "These BOOX changes were already finalized",
                     store.state(state.documentId),
                 )
-                is FinalizeResult.Finalized -> StorageOutcome(
-                    "BOOX changes finalized\n" + result.pdf.name + "\nReady for folder sync",
-                    result.state,
+                is CompactFinalizeResult.Finalized -> StorageOutcome(
+                    compact.operationCount.toString() +
+                        " BOOX operation(s) finalized\nReady for folder sync",
+                    compact.state,
                 )
+                is CompactFinalizeResult.FullPdfFallbackRequired ->
+                    when (val fallback = store.finalize(state.documentId)) {
+                        FinalizeResult.NoChanges -> StorageOutcome(
+                            "No new BOOX changes to finalize",
+                            state,
+                        )
+                        is FinalizeResult.AlreadyFinalized -> StorageOutcome(
+                            "These BOOX changes were already finalized",
+                            store.state(state.documentId),
+                        )
+                        is FinalizeResult.Finalized -> StorageOutcome(
+                            "BOOX changes finalized as a full PDF\n" + fallback.pdf.name +
+                                "\nCompact sync unavailable: " + compact.reason +
+                                "\nReady for folder sync",
+                            fallback.state,
+                        )
+                    }
             }
+            neoReaderHandoff.activityResumed()
+                ?.takeIf { it.documentId == state.documentId }
+                ?.let(neoReaderHandoff::confirmationCommitted)
+            outcome
         }
 
     private fun requestStorageAccess() = runUiAction {

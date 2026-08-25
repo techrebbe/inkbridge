@@ -26,8 +26,10 @@ InkBridge/
     .retired/
       Original__ib-b1-s4-g18.pdf
     outgoing/
-      Original__ib-b2-s4-g19__boox-finalized-g1-<hash>.pdf
-      Original__ib-b2-s4-g19__boox-finalized-g1-<hash>.pdf.inkbridge.json
+      boox-g1-<active-pdf-hash>.operations.json
+      boox-g1-<active-pdf-hash>.operations.json.inkbridge.json
+      # A full finalized PDF pair appears only when native conversion cannot run safely.
+    .inkbridge-baseline-<broker-pdf-hash>.json
     .inkbridge-state.json
     .inkbridge-installed.json # durable current broker-view acknowledgement
     .inkbridge-install.json  # present only while an install is being committed/recovered
@@ -65,23 +67,36 @@ The companion validates the producer, document ID, filenames, source generation,
 - A storage-generation republish of the already installed revision and content is ignored before download and any equivalent staged pair is retired; a same-revision PDF with different bytes is rejected as conflicting content.
 - If NeoReader changed the active PDF, a new broker view is refused until those changes are finalized.
 - Even after finalization, the old view is retained until a new broker delivery advances the BOOX revision, proving that the broker accepted the finalized BOOX edit.
-- Incoming and outgoing PDFs are streamed, so a 500 MB PDF is never loaded wholly into memory.
+- Incoming PDFs and rare full-PDF fallback snapshots are streamed. Normal BOOX finalization parses the active PDF locally and publishes only compact operation JSON, so a 300-500 MB PDF is not mirrored or uploaded for each ink edit.
 - Hashing, copying, synchronization, state recovery, and finalization run on one serialized background worker. The activity disables actions while work is running and performs only status updates and the final NeoReader launch on Android's main thread.
 - Files and state use synchronized temporary files plus create-only publication. Existing destination bytes are never overwritten, and each streamed PDF copy is hash-verified before its temporary file is published.
 - A durable install intent keeps the previous active PDF in place until the replacement PDF and state are committed. After interruption or power loss, the next companion action completes the install or safely discards an unpublished attempt before retiring the predecessor.
 - Returning to the companion after it paused for a successfully dispatched NeoReader launch records the versioned-path handoff boundary; merely preparing or dispatching the asynchronous Android intent does not. The pending target is persisted before dispatch, but a pause can be recorded only when the same in-memory tracker was armed after `startActivity` returned successfully. A process restart therefore cannot turn an unrelated permission/Home pause into a false confirmation. Once that armed pause is durably observed, the pending marker survives activity/process recreation and is cleared only after the handoff-state confirmation commits. InkBridge retains and watches at most one full predecessor PDF; the next confirmed install rechecks late bytes, publishes any final edit, and crash-safely removes the older predecessor. If the active handoff was never opened, a further install is refused instead of deleting uncertain data or growing storage without a bound.
-- Before broker acceptance, if either member of an already-finalized outgoing PDF/descriptor pair disappears, the next finalize action deterministically reconstructs the missing artifact from the unchanged active PDF and saved revision state.
+- Compact output is published payload-first and descriptor-last with deterministic names and hashes. A retry verifies identical existing bytes; incomplete publication never overwrites another artifact. The manual full-PDF fallback retains its durable finalize-intent recovery.
 - After the broker accepts a finalized BOOX revision and the companion installs a broker view containing that revision, the transport writes a synchronized retirement marker and removes the acknowledged outgoing PDF/descriptor pair. An interrupted cleanup resumes from the marker, so normal finalizations do not accumulate full-document snapshots.
 
 ## User flow
 
-1. **Install next update** validates and installs the next broker delivery at a fresh active path, then opens that exact path in NeoReader. When you later return to the companion, it records the completed foreground handoff before enabling the next operation.
-2. **Open active document in NeoReader** can reopen the current authoritative path later and renews the same durable handoff confirmation.
-3. After editing and using NeoReader's **Embed Data to PDF**, return to the companion.
-4. **Finalize BOOX changes** creates an immutable outgoing PDF and a broker `StorageEvent` sidecar.
-5. The folder transport validates both files. At the current frontier it uploads compact operations; if the finalized view is stale or concurrent, it uploads the full PDF with its original `basedOn` revisions as conflict evidence. The broker processes the event conditionally and eventually returns a newer broker delivery.
+1. **Install next update** validates a fresh broker view, prepares a compact stroke baseline locally, and opens that exact versioned path in NeoReader.
+2. Write normally in NeoReader and exit back to InkBridge.
+3. On resume, the companion confirms the handoff and automatically diffs the closed PDF against the saved baseline through the same Rust converter used on desktop.
+4. The companion publishes a small `boox_operation_manifest` plus its `StorageEvent` descriptor. Repeated resume/event delivery is idempotent and cannot duplicate strokes.
+5. The folder transport uploads that manifest directly; it does not read or transfer the active PDF. A stale manifest keeps its original `basedOn` frontier so the broker preserves it as conflict evidence instead of rebasing or choosing latest-file-wins.
+6. If NeoReader did not embed its live ink at close, or the native parser encounters corruption outside the narrow Android-safe trailing-xref repair, InkBridge reports that compact sync is unavailable. The existing **Embed Data to PDF** and **Finalize BOOX changes** full-PDF path remains the explicit recovery route.
 
-The outgoing event is based on the active revision pair and advances the BOOX source revision by one. Its deterministic event ID makes repeated finalization idempotent.
+## Note Air 4C compact-handoff hardware result
+
+The companion's versioned local path passed a two-cycle test on a 210 MiB PDF on August 25, 2026:
+
+- The first normal NeoReader close, without manual **Embed Data to PDF** or **Finalize BOOX changes**, produced 7 compact operations in a 136,750-byte manifest. No full PDF was placed in the outgoing folder.
+- The broker accepted BOOX revision 1 and rebuilt the immutable-original-derived BOOX view. NeoReader adopted that fresh versioned path as editable ink.
+- The imported handwriting was moved with lasso and one character was erased, then the document was closed normally again.
+- NeoReader's second rewrite contained a malformed trailing xref-stream `/Length`. The Android-safe in-memory repair recovered the exact stream boundary, after which the converter emitted 8 operations (6 upserts and 2 deletions) in 235,408 bytes. The device manifest was byte-identical to host recovery output, and no full PDF was published.
+- Replaying both device manifests sequentially through one broker state advanced cleanly to BOOX revision 2 with 6 active strokes, 2 tombstones, and both event IDs recorded. The broker rejected neither valid edit and created no duplicate stroke.
+
+The replay also exposed that broker-generated standard PDF `/Ink` is a lossy view of native pen metadata. The broker now requires stable identity, page, visible geometry, width, and grayscale to match the canonical precondition while restoring native-only pen type, layer, origin, and pressure when the visible style was unchanged. A real geometry mismatch is still rejected as stale input.
+
+This validates the 210 MiB case only; it does not claim that every 300-500 MB document or every malformed-PDF variant has passed hardware testing. Broader corruption still uses the explicit full-PDF recovery path.
 
 ## Folder-transport integration
 
@@ -89,27 +104,16 @@ Set `booxHandoffRoot` in the folder-transport configuration to the local mirror 
 
 This milestone does not add cloud resources or change deployed broker infrastructure. Folder mirroring between the computer and BOOX remains an adapter/setup concern; the descriptor, identity, revision, and create-only publication rules do not depend on the mirroring tool.
 
-## Planned integrated-cloud outbound experiment
+## Integrated Google Drive experiment result
 
-BOOX documents integrated Google Drive, OneDrive, and Dropbox reading-data synchronization, but the
-current official material does not establish strongly enough that simply closing a cloud-backed PDF
-always embeds live NeoReader stroke data and uploads it. Do not replace the proven manual **Embed
-Data to PDF → Finalize BOOX changes** flow until this is verified on the Note Air 4C.
+The Note Air 4C test produced a clear split:
 
-Use a disposable copy in a dedicated Google Drive folder:
+- For the small disposable PDF, normal NeoReader close embedded live `#ONYX-STROKE`/`onyxpoints` data into the local cached PDF and uploaded the complete changed PDF to Drive without using **Embed Data to PDF** manually.
+- A broker-generated replacement opened at a fresh path was adopted as editable NeoReader state; lasso, move, and erase all worked.
+- An externally replaced Drive revision was not shown merely by reopening the stale BOOX copy, so Drive cannot be the authoritative inbound handoff.
+- A 210 MiB source embedded locally, but BOOX did not submit the updated file to Drive. This matches BOOX's documented 200 MB source-file limit for reading-data synchronization and makes whole-PDF cloud upload unsuitable for the user's 300-500 MB documents.
 
-1. open it through BOOX integrated storage and add uniquely identifiable handwriting;
-2. close NeoReader without manually embedding;
-3. wait for BOOX synchronization and download that exact Drive revision;
-4. inspect it for live `#ONYX-STROKE`/`onyxpoints` data, not merely visible flattened ink;
-5. record close-to-upload timing, revision behavior, and whether the whole PDF is transferred;
-6. repeat with a large document, including provider behavior above 200 MB;
-7. separately replace the Drive file externally and test whether BOOX detects/imports the update.
-
-If the test passes, integrated Drive sync can become the preferred **outbound** BOOX adapter:
-NeoReader close → Drive revision → immutable GCS evidence → existing broker. Drive remains transport,
-never canonical state or “latest file wins.” The companion is still required for inbound
-versioned-path adoption, installed acknowledgements, conflict/status UI, and recovery.
+Integrated Drive remains an optional convenience for small documents, not the correctness boundary. The production direction is therefore: versioned companion input, local NeoReader close/embed, on-device Rust conversion, and compact-manifest folder transport. The broker remains canonical; Drive modification time and "latest file" ordering never determine state.
 
 Official background:
 

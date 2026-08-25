@@ -712,6 +712,54 @@ class BooxHandoffStoreTest {
     }
 
     @Test
+    fun activePdfQuietWaitDetectsSameLengthWriteWithRestoredTimestamp() {
+        val root = temporary.newFolder("root")
+        val quietMillis = 40L
+        val store = BooxHandoffStore(
+            root,
+            predecessorQuietPeriodMillis = quietMillis,
+            predecessorSettleTimeoutMillis = 1_000,
+        )
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        val originalModified = installed.activeFile.lastModified()
+        store.afterActiveQuietObservationForTest = { active ->
+            active.writeText("two")
+            assertTrue(active.setLastModified(originalModified))
+        }
+        val started = System.nanoTime()
+
+        store.awaitActivePdfQuiet(installed.state)
+
+        val elapsedMillis = (System.nanoTime() - started) / 1_000_000L
+        assertTrue("quiet period did not restart after the same-metadata write", elapsedMillis >= 70L)
+        assertEquals("two", installed.activeFile.readText())
+    }
+
+    @Test
+    fun activePdfQuietWaitUsesOneQuietPeriodAfterMetadataWrite() {
+        val root = temporary.newFolder("root")
+        val quietMillis = 200L
+        val store = BooxHandoffStore(
+            root,
+            predecessorQuietPeriodMillis = quietMillis,
+            predecessorSettleTimeoutMillis = 1_000,
+        )
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(0, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        store.afterActiveQuietObservationForTest = { active -> active.appendText("-changed") }
+        val started = System.nanoTime()
+
+        store.awaitActivePdfQuiet(installed.state)
+
+        val elapsedMillis = (System.nanoTime() - started) / 1_000_000L
+        assertTrue("metadata change caused a second quiet period: ${elapsedMillis}ms", elapsedMillis < 350L)
+        assertEquals("one-changed", installed.activeFile.readText())
+    }
+
+    @Test
     fun unconfirmedHandoffRefusesToGrowRetiredPdfStoragePastOnePredecessor() {
         val root = temporary.newFolder("root")
         val store = BooxHandoffStore(root)
@@ -1112,6 +1160,57 @@ class BooxHandoffStoreTest {
         assertTrue(store.finalize(documentId) is FinalizeResult.AlreadyFinalized)
     }
 
+    @Test
+    fun missingCompactFinalizedActivePdf_recoversBrokerViewAndAcceptsAcknowledgement() {
+        val root = temporary.newFolder("root")
+        val store = BooxHandoffStore(root)
+        val installed = store.install(
+            delivery(root, "event-1", RevisionPair(1, 1), 10, "one".toByteArray()),
+        ) as InstallResult.Installed
+        installed.activeFile.appendText("-compact-finalized")
+        val activeHash = sha256Hex(installed.activeFile)
+        val outputName = "boox-g1-${activeHash.take(12)}.operations.json"
+        val payload = "{\"schemaVersion\":1}".toByteArray()
+        val outgoing = store.outgoingDirectory(documentId)
+        val output = File(outgoing, outputName)
+        store.publishPayloadBytesOrVerify(payload, output, sha256Hex(payload))
+        val finalized = store.recordCompactFinalization(
+            expected = installed.state,
+            activeSha256 = activeHash,
+            outputName = outputName,
+            payloadSha256 = sha256Hex(payload),
+        )
+        assertTrue(installed.activeFile.delete())
+
+        val recovered = requireNotNull(store.state(documentId))
+
+        assertEquals(finalized, recovered)
+        assertTrue(installed.activeFile.isFile)
+        assertEquals("one", installed.activeFile.readText())
+        assertTrue(output.isFile)
+
+        val unacknowledged = delivery(
+            root,
+            "a-unacknowledged",
+            RevisionPair(1, 2),
+            11,
+            "unacknowledged".toByteArray(),
+        )
+        val rejected = runCatching { store.install(unacknowledged) }.exceptionOrNull()
+        assertTrue(rejected!!.message!!.contains("has not accepted"))
+        val acknowledged = delivery(
+            root,
+            "z-acknowledged",
+            RevisionPair(2, 2),
+            12,
+            "two".toByteArray(),
+        )
+
+        assertEquals(acknowledged.canonicalFile, store.findNextDescriptor()!!.canonicalFile)
+        val installedAcknowledgement = store.install(acknowledged) as InstallResult.Installed
+        assertEquals("two", installedAcknowledgement.activeFile.readText())
+        assertEquals(RevisionPair(2, 2), installedAcknowledgement.state.activeRevisions)
+    }
     @Test
     fun finalize_recreatesMissingPublishedPairFromActivePdf() {
         val root = temporary.newFolder("root")

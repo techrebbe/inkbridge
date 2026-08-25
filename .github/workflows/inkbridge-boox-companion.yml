@@ -5,6 +5,10 @@ on:
     branches: [master, "feat/**", "agent/**"]
     paths:
       - "boox-companion/**"
+      - "inkbridge-boox-native/**"
+      - "inkbridge-convert/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "settings.gradle.kts"
       - "build.gradle.kts"
       - "gradle/**"
@@ -14,6 +18,10 @@ on:
   pull_request:
     paths:
       - "boox-companion/**"
+      - "inkbridge-boox-native/**"
+      - "inkbridge-convert/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "settings.gradle.kts"
       - "build.gradle.kts"
       - "gradle/**"
@@ -33,6 +41,23 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: gradle
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Configure Android NDK
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          test -n "$ndk" || { echo "::error::No Android NDK found on the runner"; exit 1; }
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+      - name: Build native BOOX converter
+        run: |
+          cargo ndk -t arm64-v8a \
+            -o boox-companion/src/main/jniLibs \
+            build --release -p inkbridge-boox-native --features jni-bridge
       - name: Test, lint, and assemble
         run: |
           chmod +x ./gradlew
@@ -42,6 +67,15 @@ jobs:
             :boox-companion:assembleDebug \
             :boox-companion:assembleRelease \
             --console=plain
+      - name: Verify native converter is packaged
+        run: |
+          apk="$(find boox-companion/build/outputs/apk/debug -type f -name '*.apk' -print -quit)"
+          test -n "$apk"
+          listing="$(unzip -l "$apk")"
+          [[ "$listing" == *"lib/arm64-v8a/libinkbridge_boox.so"* ]] || {
+            echo "::error::Native BOOX converter missing from $apk"
+            exit 1
+          }
       - name: Verify automation actions are debug-only
         run: |
           debug_manifest=$(find boox-companion/build/intermediates/merged_manifests/debug -name AndroidManifest.xml -print -quit)

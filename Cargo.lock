@@ -1038,6 +1038,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkbridge-boox-native"
+version = "1.0.1"
+dependencies = [
+ "inkbridge-convert",
+ "jni",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "inkbridge-broker"
 version = "1.0.1"
 dependencies = [

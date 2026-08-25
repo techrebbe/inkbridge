@@ -181,6 +181,14 @@ impl BooxManifestBuilder for FakeBuilder {
     }
 }
 
+struct PanicBuilder;
+
+impl BooxManifestBuilder for PanicBuilder {
+    fn build(&self, _pdf: &Path, _baselines: &[PathBuf]) -> Result<BuiltBooxManifest, String> {
+        panic!("a prebuilt BOOX manifest must not be converted again")
+    }
+}
+
 struct HashingBuilder;
 
 impl BooxManifestBuilder for HashingBuilder {
@@ -1216,6 +1224,90 @@ fn finalized_companion_edit_uploads_compact_operations_at_current_frontier() {
         })
         .expect("compact BOOX upload was not stored");
     assert_eq!(uploaded.1, b"{\"schemaVersion\":1}\n");
+    assert_eq!(uploaded.0.metadata["inkbridge-based-on-boox"], "0");
+    assert_eq!(uploaded.0.metadata["inkbridge-based-on-supernote"], "1");
+    assert_eq!(
+        uploaded.0.metadata[SOURCE_LOCAL_ID],
+        sha256_hex(event.event_id.as_bytes())
+    );
+}
+
+#[test]
+fn companion_built_manifest_uploads_without_reprocessing_the_pdf() {
+    let root = tempdir().unwrap();
+    let handoff_root = root.path().join("boox-handoff");
+    let document = mapping(root.path());
+    let source_view_hash = "7".repeat(64);
+    let bytes = format!(
+        r#"{{"schemaVersion":1,"manifestId":"compact-test","source":"boox-neoreader-embedded-pdf","document":{{"sourceFileName":"book.pdf","targetFileNames":["book.pdf"],"pageCount":1,"pdfSha256":"{source_view_hash}"}},"coordinateTransform":{{"pdfToSupernoteNormalizedYOffset":0.0}},"operations":[],"summary":{{"upserted":0,"deleted":0,"unchanged":0,"skipped":0}}}}"#
+    )
+    .into_bytes();
+    let event = StorageEvent {
+        schema_version: EVENT_SCHEMA_VERSION,
+        event_id: "boox-compact-finalize-current".to_owned(),
+        document_id: document.document_id.clone(),
+        source: DeviceSide::Boox,
+        object_path: format!(
+            "BOOX_Folder/{}/boox-g1-0123456789ab.operations.json",
+            document.document_id
+        ),
+        source_generation: 1,
+        source_revision: 1,
+        based_on: RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        content_sha256: sha256_hex(&bytes),
+        payload_kind: DevicePayloadKind::BooxOperationManifest,
+        broker_output: None,
+    };
+    let finalized = write_finalized_boox_handoff(&handoff_root, &document, &event, &bytes);
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(
+        &cloud,
+        &document,
+        0,
+        1,
+        native_export_at(0, "accepted", 0, 0),
+    );
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: event.based_on,
+            ..Default::default()
+        },
+    );
+    let transport = FolderTransport::new(&cloud, &PanicBuilder, Duration::ZERO)
+        .with_boox_handoff_root(&handoff_root);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Boox,
+            source_revision: 1,
+            local_path,
+            uploaded_bytes,
+            ..
+        } if local_path == &finalized && *uploaded_bytes == bytes.len() as u64
+    )));
+    let objects = cloud.objects.lock().unwrap();
+    let uploaded = objects
+        .iter()
+        .find(|(object, _)| {
+            object
+                .metadata
+                .get("inkbridge-payload-kind")
+                .map(String::as_str)
+                == Some("boox_operation_manifest")
+        })
+        .expect("prebuilt BOOX manifest was not stored");
+    assert_eq!(uploaded.1.as_slice(), bytes.as_slice());
+    assert_eq!(uploaded.0.metadata[SOURCE_VIEW_SHA256], source_view_hash);
     assert_eq!(uploaded.0.metadata["inkbridge-based-on-boox"], "0");
     assert_eq!(uploaded.0.metadata["inkbridge-based-on-supernote"], "1");
     assert_eq!(

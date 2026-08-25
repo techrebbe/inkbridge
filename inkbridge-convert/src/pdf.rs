@@ -1,9 +1,11 @@
 use crate::model::{geometry_fingerprint, NativeStyle, Sample, StrokeSnapshot};
+use crate::neoreader_repair::repair_trailing_xref_stream_length;
 use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object, Stream};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -17,6 +19,8 @@ pub struct PdfStrokeExtraction {
     pub skipped: usize,
     pub incomplete_pages: HashSet<u32>,
     pub failed_source_uuids: HashSet<String>,
+    pub tombstoned_source_uuids: HashSet<String>,
+    pub broker_owned_source_uuids: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +80,8 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
     let mut skipped = 0usize;
     let mut incomplete_pages = HashSet::new();
     let mut failed_source_uuids = HashSet::new();
+    let mut tombstoned_source_uuids = HashSet::new();
+    let mut broker_owned_source_uuids = HashSet::new();
 
     for (page_number, page_id) in &pages {
         let page_index = page_number.saturating_sub(1);
@@ -88,8 +94,19 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
         })?;
 
         for annotation in annotations {
+            if let Some(source_uuid) = inkbridge_deletion_marker(&document, annotation) {
+                tombstoned_source_uuids.insert(source_uuid);
+                continue;
+            }
+            let broker_owned = is_inkbridge_broker_annotation(&document, annotation);
             match extract_annotation(&document, annotation, page_index, geometry) {
-                Ok(extracted) => strokes.extend(extracted),
+                Ok(extracted) => {
+                    if broker_owned {
+                        broker_owned_source_uuids
+                            .extend(extracted.iter().map(|stroke| stroke.source_uuid.clone()));
+                    }
+                    strokes.extend(extracted);
+                }
                 Err(error) => {
                     eprintln!("warning: skipped annotation on page {page_number}: {error}");
                     skipped += 1;
@@ -107,6 +124,8 @@ pub fn extract_pdf_strokes(path: &Path) -> Result<PdfStrokeExtraction, String> {
         skipped,
         incomplete_pages,
         failed_source_uuids,
+        tombstoned_source_uuids,
+        broker_owned_source_uuids,
     })
 }
 
@@ -116,10 +135,28 @@ fn load_neoreader_pdf(path: &Path) -> Result<Document, String> {
         Err(error) => error,
     };
 
-    // NeoReader occasionally emits a readable PDF whose incremental xref stream
-    // has an incorrect length or omits its own entry. PDF viewers recover it,
-    // but lopdf correctly rejects the malformed table. qpdf provides the same
-    // lossless structural rewrite we previously had to perform manually.
+    // NeoReader occasionally emits a readable PDF whose final xref stream has a
+    // wrong direct /Length. Repair that one field in memory first so the Android
+    // companion does not need to bundle qpdf or copy a 300–500 MB document.
+    let native_repair_error = match fs::read(path) {
+        Ok(mut bytes) => match repair_trailing_xref_stream_length(&mut bytes) {
+            Ok(true) => match Document::load_mem(&bytes) {
+                Ok(document) => {
+                    eprintln!(
+                        "warning: NeoReader PDF had an invalid trailing xref length; recovered it in memory"
+                    );
+                    return Ok(document);
+                }
+                Err(error) => Some(format!("in-memory xref repair did not load: {error}")),
+            },
+            Ok(false) => Some("no repairable trailing xref length was found".to_owned()),
+            Err(error) => Some(error),
+        },
+        Err(error) => Some(format!("could not read PDF for in-memory repair: {error}")),
+    };
+
+    // Keep qpdf as the broader host/cloud recovery path for malformed structures
+    // outside the deliberately narrow Android-safe repair above.
     let work = tempfile::tempdir().map_err(|error| {
         format!(
             "could not load PDF {}: {initial_error}; could not create repair directory: {error}",
@@ -136,8 +173,9 @@ fn load_neoreader_pdf(path: &Path) -> Result<Document, String> {
         .output()
         .map_err(|error| {
             format!(
-                "could not load PDF {}: {initial_error}; qpdf recovery could not start ({error}). Install qpdf or set INKBRIDGE_QPDF.",
+                "could not load PDF {}: {initial_error}; {}; qpdf recovery could not start ({error}). Install qpdf or set INKBRIDGE_QPDF.",
                 path.display(),
+                native_repair_error.as_deref().unwrap_or("native recovery was unavailable"),
             )
         })?;
     if !output.status.success() {
@@ -186,6 +224,47 @@ fn annotation_source_uuid(document: &Document, annotation: &Dictionary) -> Optio
         }
         _ => None,
     }
+}
+
+fn is_inkbridge_broker_annotation(document: &Document, annotation: &Dictionary) -> bool {
+    pdf_string(document, annotation.get(b"InkBridgeProducer").ok()).as_deref()
+        == Some("inkbridge-broker")
+}
+
+fn inkbridge_deletion_marker(document: &Document, annotation: &Dictionary) -> Option<String> {
+    if name(document, annotation.get(b"Subtype").ok()).as_deref() != Some("Ink") {
+        return None;
+    }
+    if !is_inkbridge_broker_annotation(document, annotation) {
+        return None;
+    }
+    match annotation.get(b"InkList") {
+        Err(_) => annotation_source_uuid(document, annotation),
+        Ok(value) if neoreader_removed_inklist_placeholder(document, value) => {
+            annotation_source_uuid(document, annotation)
+        }
+        Ok(_) => None,
+    }
+}
+
+fn neoreader_removed_inklist_placeholder(document: &Document, value: &Object) -> bool {
+    let Object::Reference(object_id) = value else {
+        return false;
+    };
+    if document.get_object(*object_id).is_ok() {
+        return false;
+    }
+
+    // Captured NeoReader deletions encode the removed /InkList as a compressed
+    // reference whose advertised container is not an object stream. qpdf repairs
+    // this exact impossible xref shape by dropping /InkList. Do not generalize it:
+    // ordinary missing references and all other malformed present values are
+    // damaged active annotations and must enter extraction-failure handling.
+    matches!(
+        document.reference_table.get(object_id.0),
+        Some(lopdf::xref::XrefEntry::Compressed { container, .. })
+            if !matches!(document.objects.get(&(*container, 0)), Some(Object::Stream(_)))
+    )
 }
 
 fn extract_standard_ink(
@@ -615,6 +694,70 @@ mod tests {
             height: 800.0,
             rotation: 0,
         }
+    }
+
+    #[test]
+    fn recognizes_only_exact_broker_owned_deletion_shapes() {
+        let mut document = Document::new();
+        let marker = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("deleted-stroke"),
+            "InkBridgeProducer" => Object::string_literal("inkbridge-broker"),
+        };
+        assert_eq!(
+            inkbridge_deletion_marker(&document, &marker).as_deref(),
+            Some("deleted-stroke")
+        );
+
+        let unrelated = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("damaged-foreign-stroke"),
+        };
+        assert_eq!(inkbridge_deletion_marker(&document, &unrelated), None);
+
+        let still_active = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("active-stroke"),
+            "InkBridgeProducer" => Object::string_literal("inkbridge-broker"),
+            "InkList" => vec![
+                Object::Array(vec![60.into(), 600.into(), 120.into(), 560.into()])
+            ],
+        };
+        assert_eq!(inkbridge_deletion_marker(&document, &still_active), None);
+
+        let malformed = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("damaged-active-stroke"),
+            "InkBridgeProducer" => Object::string_literal("inkbridge-broker"),
+            "InkList" => Object::Null,
+        };
+        assert_eq!(inkbridge_deletion_marker(&document, &malformed), None);
+
+        let unresolved = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("unresolved-active-stroke"),
+            "InkBridgeProducer" => Object::string_literal("inkbridge-broker"),
+            "InkList" => Object::Reference((999, 0)),
+        };
+        assert_eq!(inkbridge_deletion_marker(&document, &unresolved), None);
+
+        document.reference_table.insert(
+            1001,
+            lopdf::xref::XrefEntry::Compressed {
+                container: 1002,
+                index: 0,
+            },
+        );
+        let neoreader_removed = dictionary! {
+            "Subtype" => "Ink",
+            "NM" => Object::string_literal("neoreader-removed-stroke"),
+            "InkBridgeProducer" => Object::string_literal("inkbridge-broker"),
+            "InkList" => Object::Reference((1001, 0)),
+        };
+        assert_eq!(
+            inkbridge_deletion_marker(&document, &neoreader_removed).as_deref(),
+            Some("neoreader-removed-stroke")
+        );
     }
 
     #[test]

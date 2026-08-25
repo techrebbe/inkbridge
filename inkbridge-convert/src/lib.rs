@@ -1,8 +1,12 @@
 mod baseline;
 mod model;
+mod neoreader_repair;
 mod pdf;
 
-pub use baseline::{parse_baseline_bytes, BaselineExport, BaselineRevisions};
+pub use baseline::{
+    parse_baseline_bytes, parse_document_baseline_bytes, BaselineExport, BaselineRevisions,
+    DocumentBaseline, DOCUMENT_BASELINE_SCHEMA_VERSION,
+};
 pub use model::{
     geometry_fingerprint, CoordinateTransform, DocumentIdentity, Manifest, NativeStyle, Operation,
     StrokeSnapshot, Summary,
@@ -21,15 +25,6 @@ pub fn build_manifest(
     baseline_paths: &[PathBuf],
     normalized_y_offset: f64,
 ) -> Result<Manifest, String> {
-    let pdf_sha256 = sha256_file(pdf_path)?;
-    let PdfStrokeExtraction {
-        page_count,
-        strokes: extracted,
-        mut skipped,
-        incomplete_pages,
-        failed_source_uuids,
-    } = extract_pdf_strokes(pdf_path)?;
-
     let mut baseline_strokes = Vec::new();
     let mut target_file_names = Vec::new();
     for path in baseline_paths {
@@ -39,6 +34,139 @@ pub fn build_manifest(
         }
         baseline_strokes.extend(export.strokes);
     }
+    let extraction = extract_pdf_strokes(pdf_path)?;
+    build_manifest_from_extraction(
+        pdf_path,
+        extraction,
+        baseline_strokes,
+        target_file_names,
+        normalized_y_offset,
+    )
+}
+
+pub fn build_document_baseline(
+    pdf_path: &Path,
+    source_file_name: &str,
+) -> Result<DocumentBaseline, String> {
+    let pdf_sha256 = sha256_file(pdf_path)?;
+    let PdfStrokeExtraction {
+        page_count,
+        strokes,
+        broker_owned_source_uuids,
+        incomplete_pages,
+        failed_source_uuids,
+        ..
+    } = extract_pdf_strokes(pdf_path)?;
+    if !incomplete_pages.is_empty() || !failed_source_uuids.is_empty() {
+        return Err(format!(
+            "could not safely snapshot all editable BOOX strokes in {}",
+            pdf_path.display()
+        ));
+    }
+    let (strokes, immutable_original_source_uuids) =
+        partition_document_baseline_strokes(strokes, &broker_owned_source_uuids);
+    let baseline = DocumentBaseline {
+        schema_version: DOCUMENT_BASELINE_SCHEMA_VERSION,
+        source_file_name: source_file_name.to_owned(),
+        page_count,
+        pdf_sha256,
+        strokes,
+        immutable_original_source_uuids,
+    };
+    baseline.validate()?;
+    Ok(baseline)
+}
+
+fn partition_document_baseline_strokes(
+    strokes: Vec<StrokeSnapshot>,
+    broker_owned_source_uuids: &HashSet<String>,
+) -> (Vec<StrokeSnapshot>, Vec<String>) {
+    let (canonical, immutable_original): (Vec<_>, Vec<_>) = strokes
+        .into_iter()
+        .partition(|stroke| broker_owned_source_uuids.contains(&stroke.source_uuid));
+    let mut immutable_original_source_uuids = immutable_original
+        .into_iter()
+        .map(|stroke| stroke.source_uuid)
+        .collect::<Vec<_>>();
+    immutable_original_source_uuids.sort();
+    immutable_original_source_uuids.dedup();
+    (canonical, immutable_original_source_uuids)
+}
+
+pub fn build_manifest_from_document_baseline(
+    pdf_path: &Path,
+    baseline: &DocumentBaseline,
+    normalized_y_offset: f64,
+) -> Result<Manifest, String> {
+    baseline.validate()?;
+    let extraction = exclude_immutable_original_annotations(
+        extract_pdf_strokes(pdf_path)?,
+        &baseline.immutable_original_source_uuids,
+    );
+    validate_document_page_count(baseline.page_count, extraction.page_count)?;
+    let mut manifest = build_manifest_from_extraction(
+        pdf_path,
+        extraction,
+        baseline.strokes.clone(),
+        vec![baseline.source_file_name.clone()],
+        normalized_y_offset,
+    )?;
+    manifest
+        .document
+        .source_file_name
+        .clone_from(&baseline.source_file_name);
+    Ok(manifest)
+}
+
+fn exclude_immutable_original_annotations(
+    mut extraction: PdfStrokeExtraction,
+    source_uuids: &[String],
+) -> PdfStrokeExtraction {
+    let ignored = source_uuids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    extraction
+        .strokes
+        .retain(|stroke| !ignored.contains(stroke.source_uuid.as_str()));
+    extraction
+        .failed_source_uuids
+        .retain(|source_uuid| !ignored.contains(source_uuid.as_str()));
+    extraction
+        .tombstoned_source_uuids
+        .retain(|source_uuid| !ignored.contains(source_uuid.as_str()));
+    extraction
+}
+
+fn validate_document_page_count(
+    baseline_page_count: usize,
+    returned_page_count: usize,
+) -> Result<(), String> {
+    if returned_page_count != baseline_page_count {
+        return Err(format!(
+            "NeoReader returned a PDF with {returned_page_count} pages, but the BOOX baseline has {baseline_page_count}; full-PDF fallback is required"
+        ));
+    }
+    Ok(())
+}
+
+fn build_manifest_from_extraction(
+    pdf_path: &Path,
+    extraction: PdfStrokeExtraction,
+    baseline_strokes: Vec<StrokeSnapshot>,
+    target_file_names: Vec<String>,
+    normalized_y_offset: f64,
+) -> Result<Manifest, String> {
+    let pdf_sha256 = sha256_file(pdf_path)?;
+    let PdfStrokeExtraction {
+        page_count,
+        strokes: extracted,
+        mut skipped,
+        incomplete_pages,
+        failed_source_uuids,
+        tombstoned_source_uuids,
+        ..
+    } = extraction;
     validate_baseline_pages(&baseline_strokes, page_count)?;
     let baseline = index_baseline(baseline_strokes);
     let (operations, unchanged) = diff_strokes(
@@ -46,6 +174,7 @@ pub fn build_manifest(
         &baseline,
         &incomplete_pages,
         &failed_source_uuids,
+        &tombstoned_source_uuids,
     );
 
     let upserted = operations
@@ -146,6 +275,7 @@ fn diff_strokes(
     baseline: &HashMap<String, StrokeSnapshot>,
     incomplete_pages: &HashSet<u32>,
     failed_source_uuids: &HashSet<String>,
+    tombstoned_source_uuids: &HashSet<String>,
 ) -> (Vec<Operation>, usize) {
     let baseline_pages = baseline
         .values()
@@ -160,8 +290,19 @@ fn diff_strokes(
         let before = baseline.get(&after.source_uuid).cloned();
         if let Some(before) = &before {
             if after.origin == "pdf-ink" {
-                after.native_style = before.native_style.clone();
-                preserve_pressure_profile(&before.samples, &mut after.samples);
+                let same_visible_thickness =
+                    after.native_style.thickness == before.native_style.thickness;
+                let same_visible_color =
+                    after.native_style.pen_color == before.native_style.pen_color;
+                after.native_style.layer_num = before.native_style.layer_num;
+                after.native_style.pen_type = before.native_style.pen_type;
+                if same_visible_thickness {
+                    after.native_style.thickness = before.native_style.thickness;
+                    preserve_pressure_profile(&before.samples, &mut after.samples);
+                }
+                if same_visible_color {
+                    after.native_style.pen_color = before.native_style.pen_color;
+                }
                 after.geometry_fingerprint =
                     geometry_fingerprint(&after.native_style, &after.samples);
             }
@@ -193,7 +334,10 @@ fn diff_strokes(
     }
 
     for before in baseline.values() {
-        if should_infer_deletion(before, &baseline_pages, &active_ids, incomplete_pages) {
+        if !active_ids.contains(&before.source_uuid)
+            && (tombstoned_source_uuids.contains(&before.source_uuid)
+                || should_infer_deletion(before, &baseline_pages, &active_ids, incomplete_pages))
+        {
             operations.push(Operation::DeleteStroke {
                 source_uuid: before.source_uuid.clone(),
                 page_index: before.page_index,
@@ -316,6 +460,7 @@ mod tests {
             &baseline,
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
         );
 
         assert_eq!(unchanged, 0);
@@ -340,6 +485,49 @@ mod tests {
     }
 
     #[test]
+    fn pdf_ink_diff_preserves_explicit_visible_restyle() {
+        let mut before = test_stroke("restyled", 0);
+        before.native_style.layer_num = 3;
+        before.native_style.pen_type = 16;
+        before.native_style.pen_color = 0x9d;
+        before.samples[0][2] = 900.0;
+        before.samples[1][2] = 2200.0;
+        before.geometry_fingerprint = geometry_fingerprint(&before.native_style, &before.samples);
+        let mut after = before.clone();
+        after.origin = "pdf-ink".to_owned();
+        after.native_style.layer_num = 0;
+        after.native_style.pen_type = 10;
+        after.native_style.thickness += 200;
+        after.native_style.pen_color = 0;
+        after.samples[0][2] = 2100.0;
+        after.samples[1][2] = 2100.0;
+        after.geometry_fingerprint = geometry_fingerprint(&after.native_style, &after.samples);
+        let baseline = HashMap::from([(before.source_uuid.clone(), before)]);
+
+        let (operations, unchanged) = diff_strokes(
+            vec![after],
+            &baseline,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(unchanged, 0);
+        let Operation::UpsertStroke { after, .. } = &operations[0] else {
+            panic!("restyle must emit an upsert")
+        };
+        assert_eq!(after.native_style.layer_num, 3);
+        assert_eq!(after.native_style.pen_type, 16);
+        assert_eq!(
+            after.native_style.thickness,
+            baseline["restyled"].native_style.thickness + 200
+        );
+        assert_eq!(after.native_style.pen_color, 0);
+        assert_eq!(after.samples[0][2], 2100.0);
+        assert_eq!(after.samples[1][2], 2100.0);
+    }
+
+    #[test]
     fn baseline_page_must_exist_in_returned_pdf() {
         let baseline = vec![test_stroke("out-of-range", 2)];
         let error = validate_baseline_pages(&baseline, 2)
@@ -347,6 +535,21 @@ mod tests {
         assert!(error.contains("out-of-range"));
         assert!(error.contains("page 3"));
         assert!(error.contains("2 pages"));
+    }
+
+    #[test]
+    fn compact_document_page_count_must_match_baseline() {
+        validate_document_page_count(9, 9).unwrap();
+
+        let added_page = validate_document_page_count(9, 10)
+            .expect_err("adding a page must require the full-PDF fallback");
+        assert!(added_page.contains("10 pages"));
+        assert!(added_page.contains("baseline has 9"));
+
+        let removed_page = validate_document_page_count(9, 8)
+            .expect_err("removing a page must require the full-PDF fallback");
+        assert!(removed_page.contains("8 pages"));
+        assert!(removed_page.contains("baseline has 9"));
     }
 
     #[test]
@@ -374,10 +577,42 @@ mod tests {
             &baseline,
             &incomplete_pages,
             &failed_source_uuids,
+            &HashSet::new(),
         );
 
         assert!(operations.is_empty());
         assert_eq!(unchanged, 0);
+    }
+
+    #[test]
+    fn explicit_broker_tombstone_deletes_only_its_stroke_on_an_incomplete_page() {
+        let deleted = test_stroke("explicitly-deleted", 0);
+        let preserved = test_stroke("unrelated-malformed", 0);
+        let baseline = HashMap::from([
+            (deleted.source_uuid.clone(), deleted.clone()),
+            (preserved.source_uuid.clone(), preserved),
+        ]);
+        let incomplete_pages = HashSet::from([0]);
+        let tombstones = HashSet::from([deleted.source_uuid.clone()]);
+
+        let (operations, unchanged) = diff_strokes(
+            Vec::new(),
+            &baseline,
+            &incomplete_pages,
+            &HashSet::new(),
+            &tombstones,
+        );
+
+        assert_eq!(unchanged, 0);
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            &operations[0],
+            Operation::DeleteStroke {
+                source_uuid,
+                page_index: 0,
+                before,
+            } if source_uuid == "explicitly-deleted" && before == &deleted
+        ));
     }
 
     #[test]
@@ -393,5 +628,53 @@ mod tests {
             sha256_file(&path).unwrap(),
             format!("{:x}", Sha256::digest(&bytes))
         );
+    }
+
+    #[test]
+    fn compact_baseline_ignores_immutable_original_ink_but_keeps_new_boox_ink() {
+        let canonical = test_stroke("canonical", 0);
+        let immutable_original = test_stroke("original-ink", 0);
+        let (baseline_strokes, ignored) = partition_document_baseline_strokes(
+            vec![canonical.clone(), immutable_original.clone()],
+            &HashSet::from([canonical.source_uuid.clone()]),
+        );
+        assert_eq!(baseline_strokes, vec![canonical.clone()]);
+        assert_eq!(ignored, vec![immutable_original.source_uuid.clone()]);
+
+        let mut moved_original = immutable_original.clone();
+        moved_original.samples[0][0] += 0.1;
+        moved_original.geometry_fingerprint =
+            geometry_fingerprint(&moved_original.native_style, &moved_original.samples);
+        let new_boox_stroke = test_stroke("new-boox-stroke", 0);
+        let extraction = PdfStrokeExtraction {
+            page_count: 1,
+            strokes: vec![moved_original, canonical.clone(), new_boox_stroke.clone()],
+            skipped: 0,
+            incomplete_pages: HashSet::new(),
+            failed_source_uuids: HashSet::new(),
+            tombstoned_source_uuids: HashSet::new(),
+            broker_owned_source_uuids: HashSet::from([canonical.source_uuid.clone()]),
+        };
+        let filtered = exclude_immutable_original_annotations(extraction, &ignored);
+        let baseline = HashMap::from([(canonical.source_uuid.clone(), canonical)]);
+        let (operations, unchanged) = diff_strokes(
+            filtered.strokes,
+            &baseline,
+            &filtered.incomplete_pages,
+            &filtered.failed_source_uuids,
+            &filtered.tombstoned_source_uuids,
+        );
+
+        assert_eq!(unchanged, 1);
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            &operations[0],
+            Operation::UpsertStroke {
+                source_uuid,
+                before: None,
+                after,
+                ..
+            } if source_uuid == "new-boox-stroke" && after == &new_boox_stroke
+        ));
     }
 }

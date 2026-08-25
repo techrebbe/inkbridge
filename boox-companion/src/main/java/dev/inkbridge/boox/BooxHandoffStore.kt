@@ -56,6 +56,8 @@ class BooxHandoffStore(
     internal var beforeInstallCommitForTest: ((File?) -> Unit)? = null
     internal var beforePreservedDescriptorForTest: ((File) -> Unit)? = null
     internal var afterPredecessorRetirementForTest: ((File) -> Unit)? = null
+    internal var afterActiveQuietObservationForTest: ((File) -> Unit)? = null
+    internal var afterCompactStateCommitForTest: (() -> Unit)? = null
     fun install(descriptorFile: File): InstallResult {
         val delivery = readDelivery(descriptorFile)
         val documentRoot = documentRoot(delivery.documentId)
@@ -100,6 +102,15 @@ class BooxHandoffStore(
         if (finalizedHash != null) {
             val outputName = requireNotNull(state.finalizedOutputFileName)
             val output = File(outgoingDir(documentRoot), outputName)
+            if (outputName.endsWith(".operations.json")) {
+                check(currentHash == finalizedHash) {
+                    "Wait for the previous compact BOOX finalization to be acknowledged before finalizing again"
+                }
+                check(output.isFile) {
+                    "Compact BOOX finalization payload is missing; reopen NeoReader and return to retry"
+                }
+                return FinalizeResult.AlreadyFinalized(output)
+            }
             val recoverySource = when {
                 currentHash == finalizedHash -> active
                 output.isFile -> output
@@ -146,6 +157,85 @@ class BooxHandoffStore(
         val confirmed = state.copy(openedBrokerEventId = brokerEventId).also(HandoffState::validate)
         writeState(documentRoot, confirmed)
         return confirmed
+    }
+
+    internal fun documentDirectory(documentId: String): File = documentRoot(documentId)
+
+    internal fun activeFile(state: HandoffState): File {
+        state.validate()
+        return File(activeDir(documentRoot(state.documentId)), state.activeFileName)
+    }
+
+    internal fun awaitActivePdfQuiet(state: HandoffState) {
+        val active = activeFile(state)
+        require(active.isFile) { "The opened active PDF is missing" }
+        awaitFileQuiet(active, "active PDF", afterActiveQuietObservationForTest)
+        require(active.isFile) { "The opened active PDF disappeared while waiting for NeoReader" }
+    }
+
+    internal fun outgoingDirectory(documentId: String): File = outgoingDir(documentRoot(documentId))
+
+    internal fun publishPayloadBytesOrVerify(
+        bytes: ByteArray,
+        destination: File,
+        expectedHash: String,
+    ) {
+        if (destination.isFile) {
+            require(sha256Hex(destination) == expectedHash) {
+                "Existing ${destination.name} has unexpected content"
+            }
+            return
+        }
+        publishBytesCreateOnly(bytes, destination)
+        require(sha256Hex(destination) == expectedHash) {
+            "Published ${destination.name} has unexpected content"
+        }
+    }
+
+    internal fun publishDescriptorBytesOrVerify(bytes: ByteArray, destination: File) {
+        requireMetadataSize(bytes, "Compact-finalization descriptor")
+        publishBytesOrVerify(bytes, destination)
+    }
+
+    internal fun recordCompactFinalization(
+        expected: HandoffState,
+        activeSha256: String,
+        outputName: String,
+        payloadSha256: String,
+    ): HandoffState {
+        requireSafeFileName(outputName, "compact finalized output file name")
+        val documentRoot = documentRoot(expected.documentId)
+        recover(documentRoot, verifyRetiredPredecessors = true)
+        val current = readState(documentRoot) ?: error("No active InkBridge document")
+        val localGeneration = Math.addExact(expected.localGeneration, 1)
+        val output = File(outgoingDir(documentRoot), outputName)
+        require(output.isFile && sha256Hex(output) == payloadSha256) {
+            "Compact finalization payload is incomplete"
+        }
+        if (
+            current.finalizedLocalSha256 == activeSha256 &&
+            current.finalizedOutputFileName == outputName &&
+            current.finalizedOutputSha256 == payloadSha256 &&
+            current.localGeneration == localGeneration
+        ) {
+            return current
+        }
+        require(current == expected) { "The active handoff state changed during compact finalization" }
+        require(current.finalizedLocalSha256 == null) {
+            "This BOOX revision is already finalized"
+        }
+        require(sha256Hex(activeFile(current)) == activeSha256) {
+            "NeoReader changed the active PDF during compact finalization"
+        }
+        val next = current.copy(
+            finalizedLocalSha256 = activeSha256,
+            finalizedOutputFileName = outputName,
+            finalizedOutputSha256 = payloadSha256,
+            localGeneration = localGeneration,
+        ).also(HandoffState::validate)
+        writeState(documentRoot, next)
+        afterCompactStateCommitForTest?.invoke()
+        return next
     }
 
     fun findNextDescriptor(): File? = root
@@ -245,6 +335,7 @@ class BooxHandoffStore(
         val next = state.copy(
             finalizedLocalSha256 = currentHash,
             finalizedOutputFileName = outputName,
+            finalizedOutputSha256 = currentHash,
             localGeneration = nextLocalGeneration,
         )
         writeFinalizeIntent(documentRoot, FinalizeIntent(previousState = state, nextState = next))
@@ -515,10 +606,15 @@ class BooxHandoffStore(
         val expectedHash: String
         val recoverySource: File?
         if (state.finalizedLocalSha256 != null) {
-            expectedHash = state.finalizedLocalSha256
-            recoverySource = state.finalizedOutputFileName
-                ?.let { File(outgoingDir(documentRoot), it) }
-                ?.takeIf(File::isFile)
+            if (state.finalizedOutputFileName?.endsWith(".operations.json") == true) {
+                expectedHash = state.installedBrokerSha256
+                recoverySource = findRetainedBrokerPdf(documentRoot, state)
+            } else {
+                expectedHash = state.finalizedLocalSha256
+                recoverySource = state.finalizedOutputFileName
+                    ?.let { File(outgoingDir(documentRoot), it) }
+                    ?.takeIf(File::isFile)
+            }
         } else {
             expectedHash = state.installedBrokerSha256
             recoverySource = findRetainedBrokerPdf(documentRoot, state)
@@ -843,26 +939,52 @@ class BooxHandoffStore(
     }
 
     private fun awaitRetiredPredecessorQuiet(retired: File) {
+        awaitFileQuiet(retired, "retired predecessor")
+    }
+
+    private fun awaitFileQuiet(
+        file: File,
+        description: String,
+        afterInitialObservation: ((File) -> Unit)? = null,
+    ) {
         if (predecessorQuietPeriodMillis == 0L) return
         val pollMillis = minOf(100L, predecessorQuietPeriodMillis)
         val timeoutAt = System.nanoTime() + predecessorSettleTimeoutMillis * 1_000_000L
         var quietUntil = System.nanoTime() + predecessorQuietPeriodMillis * 1_000_000L
-        var observedLength = retired.length()
-        var observedModified = retired.lastModified()
+        var observedLength = file.length()
+        var observedModified = file.lastModified()
+        var observedFingerprint = sha256Hex(file)
+        afterInitialObservation?.invoke(file)
         while (true) {
             val now = System.nanoTime()
-            require(now < timeoutAt) { "NeoReader did not release the retired predecessor in time" }
+            require(now < timeoutAt) { "NeoReader did not release the $description in time" }
             val remainingQuietMillis = ((quietUntil - now) / 1_000_000L).coerceAtLeast(1L)
             Thread.sleep(minOf(pollMillis, remainingQuietMillis))
-            val currentLength = retired.length()
-            val currentModified = retired.lastModified()
+            val currentLength = file.length()
+            val currentModified = file.lastModified()
             val checkedAt = System.nanoTime()
             if (currentLength != observedLength || currentModified != observedModified) {
-                observedLength = currentLength
-                observedModified = currentModified
-                quietUntil = checkedAt + predecessorQuietPeriodMillis * 1_000_000L
+                observedFingerprint = sha256Hex(file)
+                observedLength = file.length()
+                observedModified = file.lastModified()
+                quietUntil = System.nanoTime() + predecessorQuietPeriodMillis * 1_000_000L
             } else if (checkedAt >= quietUntil) {
-                return
+                val currentFingerprint = sha256Hex(file)
+                val fingerprintedAt = System.nanoTime()
+                val fingerprintedLength = file.length()
+                val fingerprintedModified = file.lastModified()
+                if (
+                    currentFingerprint != observedFingerprint ||
+                    fingerprintedLength != currentLength ||
+                    fingerprintedModified != currentModified
+                ) {
+                    observedFingerprint = currentFingerprint
+                    observedLength = fingerprintedLength
+                    observedModified = fingerprintedModified
+                    quietUntil = fingerprintedAt + predecessorQuietPeriodMillis * 1_000_000L
+                } else {
+                    return
+                }
             }
         }
     }
