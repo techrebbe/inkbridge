@@ -82,9 +82,21 @@ The companion validates the producer, document ID, filenames, source generation,
 3. On resume, the companion confirms the handoff and automatically diffs the closed PDF against the saved baseline through the same Rust converter used on desktop.
 4. The companion publishes a small `boox_operation_manifest` plus its `StorageEvent` descriptor. Repeated resume/event delivery is idempotent and cannot duplicate strokes.
 5. The folder transport uploads that manifest directly; it does not read or transfer the active PDF. A stale manifest keeps its original `basedOn` frontier so the broker preserves it as conflict evidence instead of rebasing or choosing latest-file-wins.
-6. If NeoReader did not embed its live ink at close, or the native parser encounters a malformed PDF that requires unavailable `qpdf` recovery, InkBridge reports that compact sync is unavailable. The existing **Embed Data to PDF** and **Finalize BOOX changes** full-PDF path remains the explicit recovery route.
+6. If NeoReader did not embed its live ink at close, or the native parser encounters corruption outside the narrow Android-safe trailing-xref repair, InkBridge reports that compact sync is unavailable. The existing **Embed Data to PDF** and **Finalize BOOX changes** full-PDF path remains the explicit recovery route.
 
-The automatic close behavior still needs one focused Note Air 4C validation on the companion's versioned local path. Integrated-Google-Drive paths already proved that NeoReader embeds locally on normal close, but that result is not assumed to apply to every local path until tested.
+## Note Air 4C compact-handoff hardware result
+
+The companion's versioned local path passed a two-cycle test on a 210 MiB PDF on August 25, 2026:
+
+- The first normal NeoReader close, without manual **Embed Data to PDF** or **Finalize BOOX changes**, produced 7 compact operations in a 136,750-byte manifest. No full PDF was placed in the outgoing folder.
+- The broker accepted BOOX revision 1 and rebuilt the immutable-original-derived BOOX view. NeoReader adopted that fresh versioned path as editable ink.
+- The imported handwriting was moved with lasso and one character was erased, then the document was closed normally again.
+- NeoReader's second rewrite contained a malformed trailing xref-stream `/Length`. The Android-safe in-memory repair recovered the exact stream boundary, after which the converter emitted 8 operations (6 upserts and 2 deletions) in 235,408 bytes. The device manifest was byte-identical to host recovery output, and no full PDF was published.
+- Replaying both device manifests sequentially through one broker state advanced cleanly to BOOX revision 2 with 6 active strokes, 2 tombstones, and both event IDs recorded. The broker rejected neither valid edit and created no duplicate stroke.
+
+The replay also exposed that broker-generated standard PDF `/Ink` is a lossy view of native pen metadata. The broker now requires stable identity, page, visible geometry, width, and grayscale to match the canonical precondition while restoring native-only pen type, layer, origin, and pressure when the visible style was unchanged. A real geometry mismatch is still rejected as stale input.
+
+This validates the 210 MiB case only; it does not claim that every 300-500 MB document or every malformed-PDF variant has passed hardware testing. Broader corruption still uses the explicit full-PDF recovery path.
 
 ## Folder-transport integration
 

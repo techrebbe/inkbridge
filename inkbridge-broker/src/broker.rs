@@ -1,3 +1,4 @@
+use crate::boox_snapshot::{boox_pdf_view_matches, restore_native_metadata};
 use crate::model::*;
 use crate::pdf_view::write_boox_view_with_tombstones_owned;
 use crate::storage::*;
@@ -570,6 +571,7 @@ impl Broker {
                 }
             }
         }
+        let mut projected_baselines = BTreeMap::<String, StrokeSnapshot>::new();
         for (source_uuid, operations) in operation_index {
             let delete = operations.delete;
             let upsert = operations.upsert;
@@ -577,18 +579,21 @@ impl Broker {
                 .strokes
                 .get(source_uuid)
                 .filter(|canonical| canonical.tombstone.is_none());
+            let canonical_snapshot =
+                active.map(|canonical| normalized_supernote_snapshot(&canonical.snapshot));
+            let matches_canonical = |observed: &StrokeSnapshot| {
+                canonical_snapshot.as_ref().is_some_and(|canonical| {
+                    canonical == observed || boox_pdf_view_matches(canonical, observed)
+                })
+            };
             let valid_operation_set = match (delete, upsert, active) {
-                (Some(deleted), None, Some(canonical)) => {
-                    normalized_supernote_snapshot(&canonical.snapshot) == *deleted
-                }
+                (Some(deleted), None, Some(_)) => matches_canonical(deleted),
                 (None, Some((Some(before), after)), Some(canonical)) => {
-                    normalized_supernote_snapshot(&canonical.snapshot) == *before
-                        && after.page_index == canonical.snapshot.page_index
+                    matches_canonical(before) && after.page_index == canonical.snapshot.page_index
                 }
                 (None, Some((None, _)), None) => !state.strokes.contains_key(source_uuid),
                 (Some(deleted), Some((None, after)), Some(canonical)) => {
-                    normalized_supernote_snapshot(&canonical.snapshot) == *deleted
-                        && after.page_index != canonical.snapshot.page_index
+                    matches_canonical(deleted) && after.page_index != canonical.snapshot.page_index
                 }
                 _ => false,
             };
@@ -597,6 +602,34 @@ impl Broker {
                     "BOOX operation manifest does not match active canonical stroke {source_uuid}"
                 )));
             }
+            let observed_before = delete.or_else(|| upsert.and_then(|(before, _)| before.as_ref()));
+            if let (Some(canonical), Some(observed)) =
+                (canonical_snapshot.as_ref(), observed_before)
+            {
+                if boox_pdf_view_matches(canonical, observed) {
+                    projected_baselines.insert(source_uuid.to_owned(), observed.clone());
+                }
+            }
+        }
+        for operation in &mut manifest.operations {
+            let Operation::UpsertStroke {
+                source_uuid, after, ..
+            } = operation
+            else {
+                continue;
+            };
+            let Some(observed_before) = projected_baselines.get(source_uuid) else {
+                continue;
+            };
+            let Some(canonical) = state
+                .strokes
+                .get(source_uuid)
+                .filter(|stroke| stroke.tombstone.is_none())
+            else {
+                continue;
+            };
+            let canonical = normalized_supernote_snapshot(&canonical.snapshot);
+            restore_native_metadata(&canonical, observed_before, after);
         }
         Ok(manifest)
     }

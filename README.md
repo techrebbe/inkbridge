@@ -9,9 +9,10 @@
 
 > InkBridge development note: the private two-folder broker is deployed. The BOOX companion now
 > prepares a local baseline and converts the closed NeoReader PDF on-device into a compact operation
-> manifest, so 300-500 MB PDFs do not need to cross the folder/cloud boundary for each ink edit.
-> The versioned inbound handoff and full-PDF recovery path remain intact; the next gate is focused
-> Note Air 4C validation of automatic close on the companion path. See
+> manifest, so large PDFs do not need to cross the folder/cloud boundary for each ink edit. A two-cycle
+> Note Air 4C test with a 210 MiB PDF passed automatic close, a broker round trip, lasso movement,
+> deletion, malformed-xref recovery, and compact re-finalization without sending the full PDF. The
+> versioned inbound handoff and explicit full-PDF recovery path remain intact. See
 > [docs/INKBRIDGE_BOOX_HANDOFF.md](docs/INKBRIDGE_BOOX_HANDOFF.md) and
 > [docs/INKBRIDGE_FOLDER_TRANSPORT.md](docs/INKBRIDGE_FOLDER_TRANSPORT.md).
 

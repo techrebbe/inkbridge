@@ -1,3 +1,4 @@
+mod boox_snapshot;
 mod broker;
 mod conflict;
 mod model;

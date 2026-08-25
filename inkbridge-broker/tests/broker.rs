@@ -639,6 +639,128 @@ fn compact_manifest_normalizes_pen_colors_before_canonical_storage() {
 }
 
 #[test]
+fn compact_manifest_accepts_the_broker_pdf_projection_and_preserves_native_metadata() {
+    let mut harness = Harness::new();
+    let mut original = stroke("pdf-projected-move", 0.2, 0.3);
+    original.origin = "boox-neoreader".to_owned();
+    original.native_style.layer_num = 3;
+    original.native_style.pen_type = 16;
+    original.native_style.pen_color = 130;
+    original.samples[0][2] = 900.0;
+    original.samples[1][2] = 2200.0;
+    original.geometry_fingerprint = geometry_fingerprint(&original.native_style, &original.samples);
+    let mut deleted_original = original.clone();
+    deleted_original.source_uuid = "pdf-projected-delete".to_owned();
+    for sample in &mut deleted_original.samples {
+        sample[0] += 0.3;
+    }
+    deleted_original.geometry_fingerprint =
+        geometry_fingerprint(&deleted_original.native_style, &deleted_original.samples);
+    let mut first = harness.event(
+        "boox-before-pdf-projection",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        compact_manifest(
+            vec![
+                Operation::UpsertStroke {
+                    source_uuid: original.source_uuid.clone(),
+                    page_index: original.page_index,
+                    before: None,
+                    after: original,
+                },
+                Operation::UpsertStroke {
+                    source_uuid: deleted_original.source_uuid.clone(),
+                    page_index: deleted_original.page_index,
+                    before: None,
+                    after: deleted_original,
+                },
+            ],
+            1,
+        ),
+    );
+    first.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness
+        .broker
+        .process(&mut harness.storage, &first)
+        .unwrap();
+
+    let canonical = harness.state().strokes["pdf-projected-move"]
+        .snapshot
+        .clone();
+    let mut projected = canonical.clone();
+    projected.origin = "pdf-ink".to_owned();
+    projected.native_style.layer_num = 0;
+    projected.native_style.pen_type = 10;
+    for sample in &mut projected.samples {
+        sample[2] = 1612.0;
+    }
+    projected.geometry_fingerprint =
+        geometry_fingerprint(&projected.native_style, &projected.samples);
+    let deleted_canonical = harness.state().strokes["pdf-projected-delete"]
+        .snapshot
+        .clone();
+    let mut projected_deleted = deleted_canonical.clone();
+    projected_deleted.origin = "pdf-ink".to_owned();
+    projected_deleted.native_style.layer_num = 0;
+    projected_deleted.native_style.pen_type = 10;
+    for sample in &mut projected_deleted.samples {
+        sample[2] = 1612.0;
+    }
+    projected_deleted.geometry_fingerprint =
+        geometry_fingerprint(&projected_deleted.native_style, &projected_deleted.samples);
+    let mut moved = projected.clone();
+    for sample in &mut moved.samples {
+        sample[0] += 0.1;
+        sample[1] -= 0.03;
+    }
+    moved.geometry_fingerprint = geometry_fingerprint(&moved.native_style, &moved.samples);
+    let mut second = harness.event(
+        "boox-after-pdf-projection",
+        DeviceSide::Boox,
+        2,
+        RevisionPair {
+            boox: 1,
+            supernote: 0,
+        },
+        compact_manifest(
+            vec![
+                Operation::UpsertStroke {
+                    source_uuid: moved.source_uuid.clone(),
+                    page_index: moved.page_index,
+                    before: Some(projected),
+                    after: moved,
+                },
+                Operation::DeleteStroke {
+                    source_uuid: projected_deleted.source_uuid.clone(),
+                    page_index: projected_deleted.page_index,
+                    before: projected_deleted,
+                },
+            ],
+            1,
+        ),
+    );
+    second.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness
+        .broker
+        .process(&mut harness.storage, &second)
+        .unwrap();
+
+    let stored = &harness.state().strokes["pdf-projected-move"].snapshot;
+    assert_eq!(stored.origin, "boox-neoreader");
+    assert_eq!(stored.native_style.layer_num, 3);
+    assert_eq!(stored.native_style.pen_type, 16);
+    assert_eq!(stored.native_style.pen_color, 0x9d);
+    assert_eq!(stored.samples[0][2], 900.0);
+    assert_eq!(stored.samples[1][2], 2200.0);
+    assert!((stored.samples[0][0] - (canonical.samples[0][0] + 0.1)).abs() < 1.0e-12);
+    assert!((stored.samples[0][1] - (canonical.samples[0][1] - 0.03)).abs() < 1.0e-12);
+    assert!(harness.state().strokes["pdf-projected-delete"]
+        .tombstone
+        .is_some());
+}
+
+#[test]
 fn compact_manifest_indexes_thousands_of_strokes_without_rescanning_operations() {
     const STROKE_COUNT: usize = 5_000;
     let mut harness = Harness::new();
