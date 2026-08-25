@@ -246,8 +246,19 @@ fn diff_strokes(
         let before = baseline.get(&after.source_uuid).cloned();
         if let Some(before) = &before {
             if after.origin == "pdf-ink" {
-                after.native_style = before.native_style.clone();
-                preserve_pressure_profile(&before.samples, &mut after.samples);
+                let same_visible_thickness =
+                    after.native_style.thickness == before.native_style.thickness;
+                let same_visible_color =
+                    after.native_style.pen_color == before.native_style.pen_color;
+                after.native_style.layer_num = before.native_style.layer_num;
+                after.native_style.pen_type = before.native_style.pen_type;
+                if same_visible_thickness {
+                    after.native_style.thickness = before.native_style.thickness;
+                    preserve_pressure_profile(&before.samples, &mut after.samples);
+                }
+                if same_visible_color {
+                    after.native_style.pen_color = before.native_style.pen_color;
+                }
                 after.geometry_fingerprint =
                     geometry_fingerprint(&after.native_style, &after.samples);
             }
@@ -427,6 +438,49 @@ mod tests {
                 after: inserted,
             } if source_uuid == "moved-stroke" && inserted == &after
         )));
+    }
+
+    #[test]
+    fn pdf_ink_diff_preserves_explicit_visible_restyle() {
+        let mut before = test_stroke("restyled", 0);
+        before.native_style.layer_num = 3;
+        before.native_style.pen_type = 16;
+        before.native_style.pen_color = 0x9d;
+        before.samples[0][2] = 900.0;
+        before.samples[1][2] = 2200.0;
+        before.geometry_fingerprint = geometry_fingerprint(&before.native_style, &before.samples);
+        let mut after = before.clone();
+        after.origin = "pdf-ink".to_owned();
+        after.native_style.layer_num = 0;
+        after.native_style.pen_type = 10;
+        after.native_style.thickness += 200;
+        after.native_style.pen_color = 0;
+        after.samples[0][2] = 2100.0;
+        after.samples[1][2] = 2100.0;
+        after.geometry_fingerprint = geometry_fingerprint(&after.native_style, &after.samples);
+        let baseline = HashMap::from([(before.source_uuid.clone(), before)]);
+
+        let (operations, unchanged) = diff_strokes(
+            vec![after],
+            &baseline,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(unchanged, 0);
+        let Operation::UpsertStroke { after, .. } = &operations[0] else {
+            panic!("restyle must emit an upsert")
+        };
+        assert_eq!(after.native_style.layer_num, 3);
+        assert_eq!(after.native_style.pen_type, 16);
+        assert_eq!(
+            after.native_style.thickness,
+            baseline["restyled"].native_style.thickness + 200
+        );
+        assert_eq!(after.native_style.pen_color, 0);
+        assert_eq!(after.samples[0][2], 2100.0);
+        assert_eq!(after.samples[1][2], 2100.0);
     }
 
     #[test]
