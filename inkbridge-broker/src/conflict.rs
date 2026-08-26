@@ -969,7 +969,8 @@ fn describe_change(
         }
         (None, Some((None, after))) => (ConflictChangeKind::Add, after.page_index),
         (None, Some((Some(before), after)))
-            if before.native_style == after.native_style && before.samples != after.samples =>
+            if before.native_style == after.native_style
+                && (before.page_index != after.page_index || before.samples != after.samples) =>
         {
             (ConflictChangeKind::Move, after.page_index)
         }

@@ -2713,6 +2713,80 @@ fn conflict_inspection_separates_safe_changes_from_overlaps() {
 }
 
 #[test]
+fn conflict_inspection_classifies_a_page_only_spread_change_as_a_move() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let original = stroke_on_page("page-only-move", 0, 0.2, 0.3);
+    let initial_pages = [
+        (0, std::slice::from_ref(&original)),
+        (1, &[] as &[StrokeSnapshot]),
+    ];
+    let initial = harness.event(
+        "sn-page-only-move-base",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_pages(&initial_pages),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let mut boox = harness.event(
+        "boox-empty-concurrent-revision",
+        DeviceSide::Boox,
+        1,
+        common,
+        compact_manifest(Vec::new(), 2),
+    );
+    boox.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let mut moved = original.clone();
+    moved.page_index = 1;
+    let moved_pages = [
+        (0, &[] as &[StrokeSnapshot]),
+        (1, std::slice::from_ref(&moved)),
+    ];
+    let incoming = harness.event(
+        "sn-page-only-move-conflict",
+        DeviceSide::Supernote,
+        2,
+        common,
+        supernote_export_pages(&moved_pages),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &incoming)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-page-only-move-conflict",
+        )
+        .unwrap();
+    assert_eq!(
+        analysis
+            .safe_changes
+            .iter()
+            .map(|change| (change.stroke_id.as_str(), change.kind, change.page_index))
+            .collect::<Vec<_>>(),
+        vec![("page-only-move", ConflictChangeKind::Move, 1)]
+    );
+    assert!(analysis.overlapping_changes.is_empty());
+}
+
+#[test]
 fn atomic_spread_conflict_can_merge_safe_half_without_losing_the_other_half() {
     let mut harness = Harness::with_original(original_pdf_with_pages(2));
     let left = stroke_on_page("spread-left", 0, 0.2, 0.3);
