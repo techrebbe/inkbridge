@@ -1714,7 +1714,9 @@ fn sibling_page_export_rebases_across_a_supernote_only_revision() {
     let document = mapping(root.path());
     fs::create_dir_all(&document.supernote_export_directory).unwrap();
     let export = document.supernote_export_directory.join("page-0002.json");
-    fs::write(&export, native_export_at(1, "s2", 0, 0)).unwrap();
+    let export_bytes = native_export_at(1, "s2", 0, 0);
+    let export_hash = sha256_hex(&export_bytes);
+    fs::write(&export, &export_bytes).unwrap();
 
     let cloud = FakeCloud::default();
     accepted_supernote_upload(&cloud, &document, 0, 1, native_export_at(0, "s1", 0, 0));
@@ -1780,6 +1782,116 @@ fn sibling_page_export_rebases_across_a_supernote_only_revision() {
     );
     assert_eq!(payload.pages[0].page_index, 1);
     assert_eq!(payload.pages[0].strokes[0].source_uuid, "s2");
+    let payload_hash = sha256_hex(&uploaded.1);
+    assert_ne!(payload_hash, export_hash);
+    assert_eq!(uploaded.0.metadata[SOURCE_VIEW_SHA256], export_hash);
+    assert_eq!(uploaded.0.metadata[CONTENT_SHA256], payload_hash);
+}
+
+#[test]
+fn accepted_rebased_export_recovers_after_checkpoint_loss_without_allocating_r3() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let export = document.supernote_export_directory.join("page-0002.json");
+    let export_bytes = native_export_at(1, "s2", 0, 0);
+    let export_hash = sha256_hex(&export_bytes);
+    fs::write(&export, &export_bytes).unwrap();
+
+    let cloud = FakeCloud::default();
+    accepted_supernote_upload(&cloud, &document, 0, 1, native_export_at(0, "s1", 0, 0));
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    let (r2_object, r2_bytes) = cloud
+        .objects
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(object, _)| {
+            object
+                .metadata
+                .get(SOURCE_REVISION)
+                .is_some_and(|value| value == "2")
+        })
+        .cloned()
+        .unwrap();
+    let payload_hash = sha256_hex(&r2_bytes);
+    assert_ne!(payload_hash, export_hash);
+    assert_eq!(r2_object.metadata[SOURCE_VIEW_SHA256], export_hash);
+    assert_eq!(r2_object.metadata[CONTENT_SHA256], payload_hash);
+
+    // Simulate broker acceptance followed by loss of every local transport
+    // checkpoint written after the immutable upload completed.
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 2,
+            },
+            ..Default::default()
+        },
+    );
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+
+    assert!(!report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Uploaded {
+            side: DeviceSide::Supernote,
+            ..
+        }
+    )));
+    assert_eq!(
+        state.documents[&document.document_id]
+            .supernote
+            .uploaded_local_hashes[&path_key(&export)],
+        export_hash
+    );
+    let accepted = &state.documents[&document.document_id]
+        .supernote
+        .accepted_local_hashes;
+    let recovered_r2 = accepted
+        .iter()
+        .find(|(path, hash)| path.contains("r00000000000000000002") && *hash == &payload_hash)
+        .unwrap();
+    assert_eq!(sha256_hex(&fs::read(recovered_r2.0).unwrap()), payload_hash);
+    let objects = cloud.objects.lock().unwrap();
+    assert_eq!(
+        objects
+            .iter()
+            .filter(|(object, _)| {
+                object
+                    .metadata
+                    .get(SOURCE_REVISION)
+                    .is_some_and(|value| value == "2")
+            })
+            .count(),
+        1
+    );
+    assert!(objects.iter().all(|(object, _)| {
+        object
+            .metadata
+            .get(SOURCE_REVISION)
+            .is_none_or(|revision| revision != "3")
+    }));
 }
 
 #[test]

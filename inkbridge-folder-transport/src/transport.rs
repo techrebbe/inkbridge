@@ -209,7 +209,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 DeviceSide::Boox => "BOOX_Folder",
                 DeviceSide::Supernote => "Supernote_Folder",
             };
-            let mut accepted_hashes = BTreeMap::<String, (u64, String, CloudObject)>::new();
+            let mut accepted_hashes = BTreeMap::<String, (u64, String, String, CloudObject)>::new();
             for object in self
                 .cloud
                 .list(&format!("{root}/{}/uploads/", document.document_id))?
@@ -237,6 +237,16 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 else {
                     continue;
                 };
+                // New uploads may rewrite transport-owned envelope fields such as
+                // `basedOn` without changing the native export that produced them.
+                // Keep the local source hash for crash recovery, but verify and
+                // materialize the exact immutable payload accepted by the broker.
+                let payload_hash = object
+                    .metadata
+                    .get(CONTENT_SHA256)
+                    .filter(|hash| is_sha256(hash))
+                    .cloned()
+                    .unwrap_or_else(|| source_hash.clone());
                 let source_local_id = match side {
                     DeviceSide::Boox => object
                         .metadata
@@ -248,10 +258,13 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                         self.recover_supernote_source_identity(document, state, &object)?
                     }
                 };
-                if let Some((previous_revision, previous_hash, _)) =
+                if let Some((previous_revision, previous_source_hash, previous_payload_hash, _)) =
                     accepted_hashes.get(&source_local_id)
                 {
-                    if *previous_revision == source_revision && previous_hash != &source_hash {
+                    if *previous_revision == source_revision
+                        && (previous_source_hash != &source_hash
+                            || previous_payload_hash != &payload_hash)
+                    {
                         return Err(format!(
                             "accepted {side:?} revision {source_revision} has multiple immutable source views; preserve both inputs before resuming"
                         ));
@@ -259,9 +272,12 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 }
                 if accepted_hashes
                     .get(&source_local_id)
-                    .is_none_or(|(revision, _, _)| *revision <= source_revision)
+                    .is_none_or(|(revision, _, _, _)| *revision <= source_revision)
                 {
-                    accepted_hashes.insert(source_local_id, (source_revision, source_hash, object));
+                    accepted_hashes.insert(
+                        source_local_id,
+                        (source_revision, source_hash, payload_hash, object),
+                    );
                 }
             }
 
@@ -272,7 +288,9 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .accepted_local_hashes
                     .clear();
             }
-            for (source_local_id, (source_revision, source_hash, object)) in accepted_hashes {
+            for (source_local_id, (source_revision, source_hash, payload_hash, object)) in
+                accepted_hashes
+            {
                 let entry = state
                     .document_mut(&document.document_id)
                     .side_mut(side)
@@ -302,7 +320,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                             document,
                             &source_local_id,
                             source_revision,
-                            &source_hash,
+                            &payload_hash,
                             &object,
                         )?,
                     )],
@@ -326,9 +344,13 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                             .uploaded_local_hashes
                             .insert(local_key.clone(), source_hash.clone());
                     }
+                    let accepted_hash = match side {
+                        DeviceSide::Boox => source_hash.clone(),
+                        DeviceSide::Supernote => payload_hash.clone(),
+                    };
                     side_state
                         .accepted_local_hashes
-                        .insert(local_key, source_hash.clone());
+                        .insert(local_key, accepted_hash);
                 }
             }
             if side == DeviceSide::Supernote {
@@ -352,14 +374,14 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         document: &DocumentFolders,
         source_local_id: &str,
         source_revision: u64,
-        source_hash: &str,
+        payload_hash: &str,
         object: &CloudObject,
     ) -> Result<PathBuf, String> {
         let destination = supernote_accepted_snapshot_path(
             document,
             source_local_id,
             source_revision,
-            source_hash,
+            payload_hash,
         );
         match symlink_metadata_if_exists(&destination)? {
             Some(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -370,7 +392,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
             Some(_) => {
                 let actual_hash = sha256_file(&destination)?;
-                if actual_hash == source_hash {
+                if actual_hash == payload_hash {
                     return Ok(destination);
                 }
                 // This directory is transport-managed cache data. A corrupt
@@ -388,16 +410,16 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         remove_file_if_exists(&temporary)?;
         self.cloud.download(object, &temporary)?;
         let downloaded_hash = sha256_file(&temporary)?;
-        if downloaded_hash != source_hash {
+        if downloaded_hash != payload_hash {
             let _ = fs::remove_file(&temporary);
             return Err(format!(
-                "accepted Supernote upload {} hash {downloaded_hash} does not match immutable source hash {source_hash}",
+                "accepted Supernote upload {} hash {downloaded_hash} does not match immutable payload hash {payload_hash}",
                 object.path
             ));
         }
         let _ = publish_create_only(&temporary, &destination)?;
         let installed_hash = sha256_file(&destination)?;
-        if installed_hash != source_hash {
+        if installed_hash != payload_hash {
             return Err(format!(
                 "accepted Supernote snapshot {} changed while it was being installed",
                 destination.display()
@@ -440,12 +462,13 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             })?;
             let expected_hash = object
                 .metadata
-                .get(SOURCE_VIEW_SHA256)
-                .ok_or_else(|| format!("{} has no source view hash", object.path))?;
+                .get(CONTENT_SHA256)
+                .or_else(|| object.metadata.get(SOURCE_VIEW_SHA256))
+                .ok_or_else(|| format!("{} has no immutable payload hash", object.path))?;
             let actual_hash = sha256_hex(&bytes);
             if &actual_hash != expected_hash {
                 return Err(format!(
-                    "legacy Supernote upload {} content hash {actual_hash} does not match source view hash {expected_hash}",
+                    "legacy Supernote upload {} content hash {actual_hash} does not match immutable payload hash {expected_hash}",
                     object.path
                 ));
             }
@@ -1585,7 +1608,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 &snapshot_key,
                 &source_local_id,
                 &source_page_indices,
-                &payload_hash,
+                &content_hash,
                 &payload_hash,
                 "device_view",
                 "json",
