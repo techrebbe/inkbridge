@@ -4228,6 +4228,75 @@ fn compact_conflict_recovers_legacy_page_count_before_validating_pages() {
 }
 
 #[test]
+fn supernote_conflict_recovers_legacy_page_count_before_validating_pages() {
+    let mut harness = Harness::new();
+    let boox = stroke("boox-current-before-legacy-supernote-conflict", 0.2, 0.3);
+    let initial_pdf = write_boox_view(&harness.original, [boox]).unwrap();
+    let initial = harness.event(
+        "boox-base-legacy-supernote-conflict",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        initial_pdf,
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let mut legacy = harness.state();
+    legacy.original_page_count = 0;
+    harness.storage.put_unchecked(
+        state_path(&harness.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+
+    let incoming = stroke("supernote-after-legacy-migration", 0.7, 0.7);
+    let event = harness.event(
+        "supernote-legacy-page-count-conflict",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_pages(&[(0, std::slice::from_ref(&incoming))]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &event)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "supernote-legacy-page-count-conflict",
+        )
+        .unwrap();
+    assert!(analysis
+        .safe_changes
+        .iter()
+        .any(|change| change.stroke_id == incoming.source_uuid));
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-legacy-supernote-page-count",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(state.original_page_count, 1);
+    assert!(state.strokes.contains_key(&incoming.source_uuid));
+}
+
+#[test]
 fn resolving_valid_compact_conflict_persists_recovered_legacy_page_count() {
     let mut harness = Harness::new();
     let initial = harness.event(

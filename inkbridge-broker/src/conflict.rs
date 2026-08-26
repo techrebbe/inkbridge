@@ -613,8 +613,9 @@ fn load_context_from_state<S: BrokerStorage>(
                 state.document_id
             ))
         })?;
-    if conflict.source == DeviceSide::Boox
-        && conflict.payload_kind == DevicePayloadKind::BooxOperationManifest
+    if conflict.source == DeviceSide::Supernote
+        || (conflict.source == DeviceSide::Boox
+            && conflict.payload_kind == DevicePayloadKind::BooxOperationManifest)
     {
         ensure_original_page_count(storage, &mut state)?;
     }
