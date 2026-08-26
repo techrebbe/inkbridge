@@ -24,6 +24,7 @@ const SOURCE_REVISION: &str = "inkbridge-source-revision";
 const SOURCE_VIEW_SHA256: &str = "inkbridge-source-view-sha256";
 const SOURCE_LOCAL_ID: &str = "inkbridge-source-local-id";
 const SOURCE_PAGE_INDEX: &str = "inkbridge-source-page-index";
+const SOURCE_PAGE_INDICES: &str = "inkbridge-source-page-indices";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 
 #[derive(Default)]
@@ -254,6 +255,27 @@ fn native_export_at(page_index: u32, source_uuid: &str, boox: u64, supernote: u6
     .into_bytes()
 }
 
+fn native_export_pages_at(pages: &[(u32, &str)], boox: u64, supernote: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "sourceFileName": "book.pdf",
+        "basedOn": {"boox": boox, "supernote": supernote},
+        "pages": pages.iter().map(|(page_index, source_uuid)| serde_json::json!({
+            "pageIndex": page_index,
+            "strokes": [{
+                "sourceUuid": source_uuid,
+                "sourceKey": source_uuid,
+                "layerNum": 0,
+                "thickness": 2,
+                "penColor": 0,
+                "penType": 16,
+                "samples": [[0.1, 0.2, 900], [0.2, 0.3, 1000]]
+            }]
+        })).collect::<Vec<_>>()
+    }))
+    .unwrap()
+}
+
 fn generated_metadata(
     document_id: &str,
     revisions: &str,
@@ -288,6 +310,15 @@ fn supernote_page_id(document_id: &str, page_index: u32) -> String {
     sha256_hex(format!("{document_id}\0supernote-page\0{page_index}").as_bytes())
 }
 
+fn supernote_pages_id(document_id: &str, page_indices: &[u32]) -> String {
+    let pages = page_indices
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    sha256_hex(format!("{document_id}\0supernote-pages-v1\0{pages}").as_bytes())
+}
+
 fn accepted_supernote_upload(
     cloud: &FakeCloud,
     document: &DocumentFolders,
@@ -311,6 +342,40 @@ fn accepted_supernote_upload(
                 supernote_page_id(&document.document_id, page_index),
             ),
             (SOURCE_PAGE_INDEX.to_owned(), page_index.to_string()),
+        ]),
+    );
+}
+
+fn accepted_supernote_batch_upload(
+    cloud: &FakeCloud,
+    document: &DocumentFolders,
+    page_indices: &[u32],
+    revision: u64,
+    bytes: Vec<u8>,
+) {
+    let source_hash = sha256_hex(&bytes);
+    cloud.put(
+        &format!(
+            "Supernote_Folder/{}/uploads/supernote-r{revision}.json",
+            document.document_id
+        ),
+        bytes,
+        BTreeMap::from([
+            (DOCUMENT_ID.to_owned(), document.document_id.clone()),
+            (SOURCE_REVISION.to_owned(), revision.to_string()),
+            (SOURCE_VIEW_SHA256.to_owned(), source_hash),
+            (
+                SOURCE_LOCAL_ID.to_owned(),
+                supernote_pages_id(&document.document_id, page_indices),
+            ),
+            (
+                SOURCE_PAGE_INDICES.to_owned(),
+                page_indices
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
         ]),
     );
 }
@@ -1528,6 +1593,116 @@ fn supernote_export_upload_is_revisioned_and_duplicate_scan_is_idempotent() {
         .unwrap();
     assert!(second.actions.is_empty());
     assert_eq!(cloud.objects.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn virtual_spread_export_is_uploaded_as_one_atomic_page_set() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let export = document
+        .supernote_export_directory
+        .join("spread-page-0072.json");
+    fs::write(
+        &export,
+        native_export_pages_at(&[(142, "left"), (143, "right")], 0, 0),
+    )
+    .unwrap();
+    let cloud = FakeCloud::default();
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+    let mut state = TransportState::empty();
+
+    let first = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(matches!(
+        first.actions.as_slice(),
+        [TransportAction::Uploaded {
+            side: DeviceSide::Supernote,
+            source_revision: 1,
+            ..
+        }]
+    ));
+    let objects = cloud.objects.lock().unwrap();
+    assert_eq!(objects.len(), 1);
+    let uploaded = &objects[0].0;
+    assert_eq!(
+        uploaded
+            .metadata
+            .get(SOURCE_PAGE_INDICES)
+            .map(String::as_str),
+        Some("142,143")
+    );
+    assert!(!uploaded.metadata.contains_key(SOURCE_PAGE_INDEX));
+    assert_eq!(
+        uploaded.metadata.get(SOURCE_LOCAL_ID),
+        Some(&supernote_pages_id(&document.document_id, &[142, 143]))
+    );
+    drop(objects);
+
+    let second = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(second.actions.is_empty());
+    assert_eq!(cloud.objects.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn accepted_spread_revision_blocks_a_stale_export_of_either_half() {
+    let root = tempdir().unwrap();
+    let document = mapping(root.path());
+    fs::create_dir_all(&document.supernote_export_directory).unwrap();
+    let stale = document
+        .supernote_export_directory
+        .join("page-0144-stale.json");
+    fs::write(&stale, native_export_at(143, "stale-right", 0, 0)).unwrap();
+
+    let cloud = FakeCloud::default();
+    accepted_supernote_batch_upload(
+        &cloud,
+        &document,
+        &[142, 143],
+        1,
+        native_export_pages_at(&[(142, "left"), (143, "right")], 0, 0),
+    );
+    let mut state = TransportState::empty();
+    state.documents.insert(
+        document.document_id.clone(),
+        DocumentTransportState {
+            revisions: RevisionPair {
+                boox: 0,
+                supernote: 1,
+            },
+            ..Default::default()
+        },
+    );
+    let builder = FakeBuilder;
+    let transport = FolderTransport::new(&cloud, &builder, Duration::ZERO);
+
+    let report = transport
+        .sync_document(&document, &mut state, SystemTime::now())
+        .unwrap();
+    assert!(report.actions.iter().any(|action| matches!(
+        action,
+        TransportAction::Deferred {
+            side: DeviceSide::Supernote,
+            reason,
+        } if reason.contains("same Supernote page changed")
+    )));
+    assert_eq!(
+        state.documents[&document.document_id]
+            .supernote
+            .accepted_source_revisions
+            .get(&supernote_page_id(&document.document_id, 143)),
+        Some(&1)
+    );
+    assert!(cloud.objects.lock().unwrap().iter().all(|(object, _)| {
+        object
+            .metadata
+            .get(SOURCE_REVISION)
+            .is_none_or(|revision| revision != "2")
+    }));
 }
 
 #[test]

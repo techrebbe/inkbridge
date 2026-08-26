@@ -3,7 +3,8 @@ use crate::model::*;
 use crate::pdf_view::write_boox_view_with_tombstones_owned;
 use crate::storage::*;
 use inkbridge_convert::{
-    build_manifest, geometry_fingerprint, parse_baseline_bytes, Manifest, Operation, StrokeSnapshot,
+    build_manifest, geometry_fingerprint, parse_baseline_bytes, BaselineExport, BaselinePage,
+    Manifest, Operation, StrokeSnapshot,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -282,7 +283,9 @@ impl Broker {
                 &source.bytes,
             );
         }
-        if event.payload_kind == DevicePayloadKind::BooxOperationManifest {
+        if event.payload_kind == DevicePayloadKind::BooxOperationManifest
+            || event.source == DeviceSide::Supernote
+        {
             ensure_original_page_count(storage, &mut state)?;
         }
 
@@ -982,19 +985,25 @@ pub(crate) fn apply_supernote_export(
 ) -> Result<(), BrokerError> {
     let export =
         parse_baseline_bytes(bytes, &event.object_path).map_err(BrokerError::Conversion)?;
+    validate_supernote_export(state, event, &export)?;
     if let Some(source_file_name) = export.source_file_name.clone() {
         state.supernote.source_file_name = Some(source_file_name);
     }
-    let page_index = export.page_index;
-    let incoming_ids = export
-        .strokes
+    let affected_pages = export
+        .pages
         .iter()
+        .map(|page| page.page_index)
+        .collect::<BTreeSet<_>>();
+    let incoming_ids = export
+        .pages
+        .iter()
+        .flat_map(|page| page.strokes.iter())
         .map(|stroke| stroke.source_uuid.clone())
         .collect::<BTreeSet<_>>();
     let mut revisions = event.based_on;
     revisions.set(event.source, event.source_revision);
     for canonical in state.strokes.values_mut().filter(|stroke| {
-        stroke.snapshot.page_index == page_index
+        affected_pages.contains(&stroke.snapshot.page_index)
             && stroke.tombstone.is_none()
             && !incoming_ids.contains(&stroke.stroke_id)
     }) {
@@ -1006,18 +1015,56 @@ pub(crate) fn apply_supernote_export(
             event_id: event.event_id.clone(),
         });
     }
-    for snapshot in export.strokes {
-        let stroke_id = snapshot.source_uuid.clone();
-        state.strokes.insert(
-            stroke_id.clone(),
-            CanonicalStroke {
-                stroke_id,
-                snapshot,
-                last_modified_by: event.source,
-                source_revisions: revisions,
-                tombstone: None,
-            },
-        );
+    for page in export.pages {
+        for snapshot in page.strokes {
+            let stroke_id = snapshot.source_uuid.clone();
+            state.strokes.insert(
+                stroke_id.clone(),
+                CanonicalStroke {
+                    stroke_id,
+                    snapshot,
+                    last_modified_by: event.source,
+                    source_revisions: revisions,
+                    tombstone: None,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_supernote_export(
+    state: &CanonicalDocumentState,
+    event: &StorageEvent,
+    export: &BaselineExport,
+) -> Result<(), BrokerError> {
+    if export
+        .document_id
+        .as_deref()
+        .is_some_and(|document_id| document_id != state.document_id)
+    {
+        return Err(BrokerError::InvalidEvent(format!(
+            "Supernote export documentId does not match {}",
+            state.document_id
+        )));
+    }
+    if export.based_on.is_some_and(|based_on| {
+        based_on.boox != event.based_on.boox || based_on.supernote != event.based_on.supernote
+    }) {
+        return Err(BrokerError::InvalidEvent(
+            "Supernote export basedOn does not match its storage event".to_owned(),
+        ));
+    }
+    if let Some(page) = export
+        .pages
+        .iter()
+        .find(|page| page.page_index as usize >= state.original_page_count)
+    {
+        return Err(BrokerError::InvalidEvent(format!(
+            "Supernote export references page {}, but the immutable original has {} pages",
+            page.page_index + 1,
+            state.original_page_count
+        )));
     }
     Ok(())
 }
@@ -1046,35 +1093,72 @@ pub(crate) fn write_baselines(
     let mut paths = Vec::new();
     for (page_index, mut strokes) in pages {
         strokes.sort_by(|left, right| left.source_uuid.cmp(&right.source_uuid));
-        let exported = strokes
-            .iter()
-            .map(|stroke| {
-                json!({
-                    "sourceUuid": stroke.source_uuid,
-                    "sourceKey": stroke.source_uuid,
-                    "layerNum": stroke.native_style.layer_num,
-                    "thickness": stroke.native_style.thickness,
-                    "penColor": stroke.native_style.pen_color,
-                    "penType": stroke.native_style.pen_type,
-                    "samples": stroke.samples,
-                })
-            })
-            .collect::<Vec<_>>();
-        let page = json!({
-            "sourceFileName": state.supernote.source_file_name.as_deref().unwrap_or(&state.original_file_name),
-            "pageIndex": page_index,
-            "strokes": exported,
-        });
         let path = directory.join(format!("baseline-page-{page_index}.json"));
-        std::fs::write(
+        write_baseline_page(
             &path,
-            serde_json::to_vec(&page)
-                .map_err(|error| BrokerError::Conversion(error.to_string()))?,
-        )
-        .map_err(|error| BrokerError::Conversion(error.to_string()))?;
+            state
+                .supernote
+                .source_file_name
+                .as_deref()
+                .unwrap_or(&state.original_file_name),
+            page_index,
+            strokes,
+        )?;
         paths.push(path);
     }
     Ok(paths)
+}
+
+pub(crate) fn write_baseline_export_pages(
+    directory: &Path,
+    source_file_name: &str,
+    pages: &[BaselinePage],
+) -> Result<Vec<PathBuf>, BrokerError> {
+    pages
+        .iter()
+        .map(|page| {
+            let path = directory.join(format!("baseline-page-{}.json", page.page_index));
+            write_baseline_page(
+                &path,
+                source_file_name,
+                page.page_index,
+                page.strokes.iter(),
+            )?;
+            Ok(path)
+        })
+        .collect()
+}
+
+fn write_baseline_page<'a>(
+    path: &Path,
+    source_file_name: &str,
+    page_index: u32,
+    strokes: impl IntoIterator<Item = &'a StrokeSnapshot>,
+) -> Result<(), BrokerError> {
+    let exported = strokes
+        .into_iter()
+        .map(|stroke| {
+            json!({
+                "sourceUuid": stroke.source_uuid,
+                "sourceKey": stroke.source_uuid,
+                "layerNum": stroke.native_style.layer_num,
+                "thickness": stroke.native_style.thickness,
+                "penColor": stroke.native_style.pen_color,
+                "penType": stroke.native_style.pen_type,
+                "samples": stroke.samples,
+            })
+        })
+        .collect::<Vec<_>>();
+    let page = json!({
+        "sourceFileName": source_file_name,
+        "pageIndex": page_index,
+        "strokes": exported,
+    });
+    std::fs::write(
+        path,
+        serde_json::to_vec(&page).map_err(|error| BrokerError::Conversion(error.to_string()))?,
+    )
+    .map_err(|error| BrokerError::Conversion(error.to_string()))
 }
 
 pub(crate) fn state_write(

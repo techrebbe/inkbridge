@@ -1,8 +1,9 @@
 use crate::broker::{
     add_newline, apply_manifest, decode_state, destination_precondition,
     ensure_original_page_count, event_path_segment, normalize_supernote_pen_color, output_metadata,
-    refresh_manifest_id, state_write, valid_supernote_native_style, write_baselines,
-    GENERATED_BY_KEY, GENERATED_DOCUMENT_KEY, GENERATED_EVENT_KEY,
+    refresh_manifest_id, state_write, valid_supernote_native_style, validate_supernote_export,
+    write_baseline_export_pages, write_baselines, GENERATED_BY_KEY, GENERATED_DOCUMENT_KEY,
+    GENERATED_EVENT_KEY,
 };
 use crate::model::*;
 use crate::pdf_view::write_boox_view_with_tombstones_owned;
@@ -390,7 +391,7 @@ impl Broker {
                     validate_conflict_boox_manifest(state, &input, self.normalized_y_offset)
                 }
             },
-            DeviceSide::Supernote => supernote_export_manifest(state, &input),
+            DeviceSide::Supernote => supernote_export_manifest(state, &event, &input),
         }
     }
 
@@ -408,13 +409,15 @@ impl Broker {
         if conflict.source == DeviceSide::Supernote {
             let export = parse_baseline_bytes(conflict_input, &conflict.object_path)
                 .map_err(BrokerError::Conversion)?;
-            let path = work
-                .path()
-                .join(format!("baseline-page-{}.json", export.page_index));
-            std::fs::write(&path, conflict_input)
-                .map_err(|error| BrokerError::Conversion(error.to_string()))?;
-            if !baselines.contains(&path) {
-                baselines.push(path);
+            let source_file_name = export
+                .source_file_name
+                .as_deref()
+                .or(previous_state.supernote.source_file_name.as_deref())
+                .unwrap_or(&previous_state.original_file_name);
+            for path in write_baseline_export_pages(work.path(), source_file_name, &export.pages)? {
+                if !baselines.contains(&path) {
+                    baselines.push(path);
+                }
             }
         }
         let pdf_path = work.path().join("resolved.pdf");
@@ -788,36 +791,45 @@ fn validate_conflict_snapshot(
 
 fn supernote_export_manifest(
     state: &CanonicalDocumentState,
+    event: &StorageEvent,
     bytes: &[u8],
 ) -> Result<Manifest, BrokerError> {
     let export =
         parse_baseline_bytes(bytes, "conflict-supernote.json").map_err(BrokerError::Conversion)?;
+    validate_supernote_export(state, event, &export)?;
+    let affected_pages = export
+        .pages
+        .iter()
+        .map(|page| page.page_index)
+        .collect::<std::collections::BTreeSet<_>>();
     let mut active = state
         .strokes
         .values()
         .filter(|stroke| {
-            stroke.tombstone.is_none() && stroke.snapshot.page_index == export.page_index
+            stroke.tombstone.is_none() && affected_pages.contains(&stroke.snapshot.page_index)
         })
         .map(|stroke| (stroke.stroke_id.clone(), stroke.snapshot.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut operations = Vec::new();
     let mut unchanged = 0;
-    for snapshot in export.strokes {
-        let source_uuid = snapshot.source_uuid.clone();
-        match active.remove(&source_uuid) {
-            Some(before) if before == snapshot => unchanged += 1,
-            Some(before) => operations.push(Operation::UpsertStroke {
-                source_uuid,
-                page_index: snapshot.page_index,
-                before: Some(before),
-                after: snapshot,
-            }),
-            None => operations.push(Operation::UpsertStroke {
-                source_uuid,
-                page_index: snapshot.page_index,
-                before: None,
-                after: snapshot,
-            }),
+    for page in export.pages {
+        for snapshot in page.strokes {
+            let source_uuid = snapshot.source_uuid.clone();
+            match active.remove(&source_uuid) {
+                Some(before) if before == snapshot => unchanged += 1,
+                Some(before) => operations.push(Operation::UpsertStroke {
+                    source_uuid,
+                    page_index: snapshot.page_index,
+                    before: Some(before),
+                    after: snapshot,
+                }),
+                None => operations.push(Operation::UpsertStroke {
+                    source_uuid,
+                    page_index: snapshot.page_index,
+                    before: None,
+                    after: snapshot,
+                }),
+            }
         }
     }
     for (source_uuid, before) in active {

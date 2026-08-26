@@ -1,3 +1,10 @@
+use crate::supernote_snapshot::{
+    accepted_snapshot_path as supernote_accepted_snapshot_path,
+    materialize_non_overlapping_baselines as materialize_non_overlapping_supernote_baselines,
+    object_page_indices as supernote_object_page_indices, page_identity as supernote_page_identity,
+    persist_snapshot_bytes as persist_supernote_snapshot_bytes,
+    snapshot_identity as supernote_snapshot_identity, SOURCE_PAGE_INDEX, SOURCE_PAGE_INDICES,
+};
 use crate::{
     boox_handoff::{
         BooxHandoffEndpoint, FinalizedBooxArtifact, InstalledBooxDelivery, MAX_DESCRIPTOR_BYTES,
@@ -22,7 +29,6 @@ const SOURCE_REVISIONS: &str = "inkbridge-source-revisions";
 const SOURCE_REVISION: &str = "inkbridge-source-revision";
 const SOURCE_VIEW_SHA256: &str = "inkbridge-source-view-sha256";
 const SOURCE_LOCAL_ID: &str = "inkbridge-source-local-id";
-const SOURCE_PAGE_INDEX: &str = "inkbridge-source-page-index";
 const CONTENT_SHA256: &str = "inkbridge-content-sha256";
 const RECOVERED_MISSING_PREFIX: &str = "inkbridge-missing-accepted://";
 const MAX_SUPERNOTE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -271,6 +277,21 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     .entry(source_local_id.clone())
                     .or_insert(source_revision);
                 *entry = (*entry).max(source_revision);
+                if side == DeviceSide::Supernote {
+                    if let Some(page_indices) = supernote_object_page_indices(&object)? {
+                        for page_index in page_indices {
+                            let page_identity =
+                                supernote_page_identity(&document.document_id, page_index);
+                            let page_entry = state
+                                .document_mut(&document.document_id)
+                                .supernote
+                                .accepted_source_revisions
+                                .entry(page_identity)
+                                .or_insert(source_revision);
+                            *page_entry = (*page_entry).max(source_revision);
+                        }
+                    }
+                }
                 let local_keys = match side {
                     DeviceSide::Boox => vec![canonical_path_key(&document.boox_pdf)],
                     DeviceSide::Supernote => vec![canonical_path_key(
@@ -306,6 +327,18 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                         .accepted_local_hashes
                         .insert(local_key, source_hash.clone());
                 }
+            }
+            if side == DeviceSide::Supernote {
+                let accepted = state
+                    .document_mut(&document.document_id)
+                    .supernote
+                    .accepted_local_hashes
+                    .clone();
+                state
+                    .document_mut(&document.document_id)
+                    .supernote
+                    .accepted_local_hashes =
+                    materialize_non_overlapping_supernote_baselines(document, &accepted)?;
             }
         }
         Ok(())
@@ -376,14 +409,8 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         state: &mut TransportState,
         object: &CloudObject,
     ) -> Result<String, String> {
-        if let Some(page_index) = object.metadata.get(SOURCE_PAGE_INDEX) {
-            let page_index = page_index.parse::<u32>().map_err(|error| {
-                format!(
-                    "accepted Supernote upload {} has invalid page index {page_index}: {error}",
-                    object.path
-                )
-            })?;
-            return Ok(supernote_page_identity(&document.document_id, page_index));
+        if let Some(page_indices) = supernote_object_page_indices(object)? {
+            return supernote_snapshot_identity(&document.document_id, &page_indices);
         }
         let generation_key = object.generation_key();
         if let Some(identity) = state
@@ -421,10 +448,12 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             }
             let parsed = parse_baseline_bytes(&bytes, &object.path)?;
             validate_supernote_export_identity(&parsed, document, &object.path)?;
-            Ok(supernote_page_identity(
-                &document.document_id,
-                parsed.page_index,
-            ))
+            let page_indices = parsed
+                .pages
+                .iter()
+                .map(|page| page.page_index)
+                .collect::<Vec<_>>();
+            supernote_snapshot_identity(&document.document_id, &page_indices)
         })();
         let identity = recovered?;
         state
@@ -1084,7 +1113,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             &artifact.payload_path,
             &local_key,
             &source_local_id,
-            None,
+            &[],
             &source_view_hash,
             payload_hash,
             "boox_operation_manifest",
@@ -1122,7 +1151,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             &artifact.payload_path,
             &canonical_path_key(&artifact.payload_path),
             &source_local_id,
-            None,
+            &[],
             source_hash,
             source_hash,
             "device_view",
@@ -1346,7 +1375,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             &temporary,
             &local_key,
             &source_local_id,
-            None,
+            &[],
             &source_hash,
             &payload_hash,
             "boox_operation_manifest",
@@ -1461,11 +1490,16 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 boox: based_on.boox,
                 supernote: based_on.supernote,
             });
-            // A Supernote page is the logical local source. Its identity must
-            // survive export-file renames so accepted revisions supersede the
-            // earlier revision instead of leaving an obsolete missing-path
-            // sentinel that blocks later BOOX updates.
-            let source_local_id = supernote_page_identity(&document.document_id, parsed.page_index);
+            // The complete set of represented original pages is the logical local source.
+            // Its identity survives export-file renames and keeps one Virtual Spread
+            // revision atomic from the device folder through broker acceptance.
+            let source_page_indices = parsed
+                .pages
+                .iter()
+                .map(|page| page.page_index)
+                .collect::<Vec<_>>();
+            let source_local_id =
+                supernote_snapshot_identity(&document.document_id, &source_page_indices)?;
             if exported_at.is_none() && current != RevisionPair::default() {
                 report.actions.push(TransportAction::Deferred {
                     side: DeviceSide::Supernote,
@@ -1477,12 +1511,19 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 return Ok(());
             }
             if let Some(exported_at) = exported_at {
-                let same_page_revision = state
-                    .document_mut(&document.document_id)
-                    .supernote
-                    .accepted_source_revisions
-                    .get(&source_local_id)
-                    .copied()
+                let same_page_revision = source_page_indices
+                    .iter()
+                    .map(|page_index| supernote_page_identity(&document.document_id, *page_index))
+                    .chain(std::iter::once(source_local_id.clone()))
+                    .filter_map(|identity| {
+                        state
+                            .document_mut(&document.document_id)
+                            .supernote
+                            .accepted_source_revisions
+                            .get(&identity)
+                            .copied()
+                    })
+                    .max()
                     .unwrap_or(0);
                 let unsafe_to_rebase = exported_at.boox != current.boox
                     || exported_at.supernote > current.supernote
@@ -1528,7 +1569,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 &temporary,
                 &snapshot_key,
                 &source_local_id,
-                Some(parsed.page_index),
+                &source_page_indices,
                 &content_hash,
                 &content_hash,
                 "device_view",
@@ -1568,7 +1609,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         payload_path: &Path,
         local_key: &str,
         source_local_id: &str,
-        source_page_index: Option<u32>,
+        source_page_indices: &[u32],
         local_hash: &str,
         payload_hash: &str,
         payload_kind: &str,
@@ -1583,7 +1624,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             payload_path,
             local_key,
             source_local_id,
-            source_page_index,
+            source_page_indices,
             local_hash,
             payload_hash,
             payload_kind,
@@ -1602,7 +1643,7 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
         payload_path: &Path,
         local_key: &str,
         source_local_id: &str,
-        source_page_index: Option<u32>,
+        source_page_indices: &[u32],
         local_hash: &str,
         payload_hash: &str,
         payload_kind: &str,
@@ -1654,8 +1695,21 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
             (SOURCE_VIEW_SHA256.to_owned(), local_hash.to_owned()),
             (SOURCE_LOCAL_ID.to_owned(), source_local_id.to_owned()),
         ]);
-        if let Some(page_index) = source_page_index {
-            metadata.insert(SOURCE_PAGE_INDEX.to_owned(), page_index.to_string());
+        match source_page_indices {
+            [] => {}
+            [page_index] => {
+                metadata.insert(SOURCE_PAGE_INDEX.to_owned(), page_index.to_string());
+            }
+            page_indices => {
+                metadata.insert(
+                    SOURCE_PAGE_INDICES.to_owned(),
+                    page_indices
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
         }
         let object = self
             .cloud
@@ -1738,72 +1792,6 @@ fn required_metadata<'a>(object: &'a CloudObject, key: &str) -> Result<&'a str, 
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn supernote_page_identity(document_id: &str, page_index: u32) -> String {
-    sha256_hex(format!("{document_id}\0supernote-page\0{page_index}").as_bytes())
-}
-
-fn supernote_accepted_snapshot_path(
-    document: &DocumentFolders,
-    source_local_id: &str,
-    source_revision: u64,
-    source_hash: &str,
-) -> PathBuf {
-    let root = document.supernote_accepted_directory();
-    root.join(format!(
-        "r{source_revision:020}-{source_local_id}-{source_hash}.json"
-    ))
-}
-
-fn persist_supernote_snapshot_bytes(
-    document: &DocumentFolders,
-    source_local_id: &str,
-    source_revision: u64,
-    expected_hash: &str,
-    bytes: &[u8],
-) -> Result<PathBuf, String> {
-    let actual_hash = sha256_hex(bytes);
-    if actual_hash != expected_hash {
-        return Err(format!(
-            "Supernote snapshot bytes hash {actual_hash} does not match expected hash {expected_hash}"
-        ));
-    }
-    let destination =
-        supernote_accepted_snapshot_path(document, source_local_id, source_revision, expected_hash);
-    match symlink_metadata_if_exists(&destination)? {
-        Some(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(format!(
-                "Supernote snapshot destination {} is not a regular file",
-                destination.display()
-            ));
-        }
-        Some(_) => {
-            let installed_hash = sha256_file(&destination)?;
-            if installed_hash == expected_hash {
-                return Ok(destination);
-            }
-            remove_file_if_exists(&destination)?;
-        }
-        None => {}
-    }
-
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    let temporary = sibling_temporary(&destination, "snapshot");
-    remove_file_if_exists(&temporary)?;
-    fs::write(&temporary, bytes)
-        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-    let _ = publish_create_only(&temporary, &destination)?;
-    let installed_hash = sha256_file(&destination)?;
-    if installed_hash != expected_hash {
-        return Err(format!(
-            "Supernote snapshot {} changed while it was being installed",
-            destination.display()
-        ));
-    }
-    Ok(destination)
 }
 
 fn parse_revision_metadata(object: &CloudObject) -> Result<RevisionPair, String> {
@@ -2192,13 +2180,15 @@ fn validate_unique_baseline_pages(paths: &[PathBuf]) -> Result<(), String> {
         let bytes = fs::read(path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let export = parse_baseline_bytes(&bytes, &path.to_string_lossy())?;
-        if let Some(previous) = pages.insert(export.page_index, path) {
-            return Err(format!(
-                "Supernote outgoing folder has more than one accepted export for page {}: {} and {}",
-                export.page_index + 1,
-                previous.display(),
-                path.display()
-            ));
+        for page in export.pages {
+            if let Some(previous) = pages.insert(page.page_index, path) {
+                return Err(format!(
+                    "Supernote outgoing folder has more than one accepted export for page {}: {} and {}",
+                    page.page_index + 1,
+                    previous.display(),
+                    path.display()
+                ));
+            }
         }
     }
     Ok(())
@@ -2234,7 +2224,7 @@ fn unix_millis(value: SystemTime) -> Result<u64, String> {
         .map_err(|_| "filesystem timestamp predates the Unix epoch".to_owned())
 }
 
-fn canonical_path_key(path: &Path) -> String {
+pub(crate) fn canonical_path_key(path: &Path) -> String {
     let value = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
@@ -2288,7 +2278,7 @@ fn metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>, String> {
     }
 }
 
-fn symlink_metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>, String> {
+pub(crate) fn symlink_metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>, String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2299,7 +2289,7 @@ fn symlink_metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>, Strin
     }
 }
 
-fn remove_file_if_exists(path: &Path) -> Result<(), String> {
+pub(crate) fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2320,7 +2310,7 @@ where
     Ok((bytes, content_hash, current_hash))
 }
 
-fn sibling_temporary(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sibling_temporary(path: &Path, suffix: &str) -> PathBuf {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -2922,8 +2912,10 @@ mod snapshot_tests {
             source_file_name: Some("Supernote Copy.pdf".to_owned()),
             document_id: Some(document.document_id.clone()),
             based_on: None,
-            page_index: 0,
-            strokes: Vec::new(),
+            pages: vec![inkbridge_convert::BaselinePage {
+                page_index: 0,
+                strokes: Vec::new(),
+            }],
         };
         validate_supernote_export_identity(&export, &document, "page-0001.json").unwrap();
     }
@@ -2953,8 +2945,10 @@ mod snapshot_tests {
             source_file_name: Some("Different.pdf".to_owned()),
             document_id: None,
             based_on: None,
-            page_index: 0,
-            strokes: Vec::new(),
+            pages: vec![inkbridge_convert::BaselinePage {
+                page_index: 0,
+                strokes: Vec::new(),
+            }],
         };
         let error =
             validate_supernote_export_identity(&export, &document, "page-0001.json").unwrap_err();
