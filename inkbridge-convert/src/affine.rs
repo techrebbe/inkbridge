@@ -108,20 +108,38 @@ impl AffineTransform {
 
     pub fn inverse(self) -> Result<Self, AffineError> {
         let [a, b, c, d, e, f] = self.coefficients;
-        let determinant = a * d - b * c;
-        let linear_scale = a.abs().max(b.abs()).max(c.abs()).max(d.abs()).max(1.0);
-        if !determinant.is_finite()
-            || determinant.abs() <= SINGULARITY_EPSILON * linear_scale * linear_scale
+        let linear_scale = a.abs().max(b.abs()).max(c.abs()).max(d.abs());
+        if linear_scale == 0.0 {
+            return Err(AffineError::SingularTransform);
+        }
+
+        // Normalize before computing the determinant. This makes the
+        // condition check relative to the actual linear coefficients and
+        // avoids overflow/underflow when coordinate units differ greatly.
+        let normalized = [
+            a / linear_scale,
+            b / linear_scale,
+            c / linear_scale,
+            d / linear_scale,
+        ];
+        let normalized_determinant = normalized[0] * normalized[3] - normalized[1] * normalized[2];
+        if !normalized_determinant.is_finite()
+            || normalized_determinant.abs() <= SINGULARITY_EPSILON
         {
             return Err(AffineError::SingularTransform);
         }
+        let inverse_factor = (1.0 / linear_scale) / normalized_determinant;
+        let inverse_a = normalized[3] * inverse_factor;
+        let inverse_b = -normalized[1] * inverse_factor;
+        let inverse_c = -normalized[2] * inverse_factor;
+        let inverse_d = normalized[0] * inverse_factor;
         let inverse = [
-            d / determinant,
-            -b / determinant,
-            -c / determinant,
-            a / determinant,
-            (c * f - d * e) / determinant,
-            (b * e - a * f) / determinant,
+            inverse_a,
+            inverse_b,
+            inverse_c,
+            inverse_d,
+            -(inverse_a * e + inverse_c * f),
+            -(inverse_b * e + inverse_d * f),
         ];
         if !inverse.iter().all(|value| value.is_finite()) {
             return Err(AffineError::NonFiniteResult);
@@ -196,6 +214,21 @@ mod tests {
             AffineTransform::new([1.0, 1.0, 1.0, 1.0 + 1.0e-14, 0.0, 0.0]),
             Err(AffineError::SingularTransform)
         );
+    }
+
+    #[test]
+    fn accepts_well_conditioned_mappings_across_coordinate_units() {
+        for scale in [1.0e-100, 1.0e-7, 1.0e100] {
+            let forward = AffineTransform::new([scale, 0.0, 0.0, scale, 0.0, 0.0]).unwrap();
+            let source = AffinePoint::new(2.0, 3.0);
+            let recovered = forward
+                .inverse()
+                .unwrap()
+                .apply(forward.apply(source).unwrap())
+                .unwrap();
+            assert!((recovered.x - source.x).abs() < 1.0e-12);
+            assert!((recovered.y - source.y).abs() < 1.0e-12);
+        }
     }
 
     #[test]
