@@ -3,7 +3,10 @@ use inkbridge_broker::{
     DevicePayloadKind, DeviceSide, MemoryStorage, RevisionPair, StorageEvent, BROKER_PRODUCER,
     EVENT_SCHEMA_VERSION,
 };
-use inkbridge_convert::{geometry_fingerprint, Manifest, Operation, StrokeSnapshot};
+use inkbridge_convert::{
+    geometry_fingerprint, parse_baseline_bytes, BaselineRevisions, Manifest, Operation,
+    StrokeSnapshot,
+};
 use inkbridge_folder_transport::{
     BooxManifestBuilder, BuiltBooxManifest, CloudFolder, CloudObject, DocumentFolders,
     DocumentTransportState, FileObservation, FolderTransport, NativeBooxManifestBuilder,
@@ -1744,8 +1747,7 @@ fn sibling_page_export_rebases_across_a_supernote_only_revision() {
     let objects = cloud.objects.lock().unwrap();
     let uploaded = objects
         .iter()
-        .map(|(object, _)| object)
-        .find(|object| {
+        .find(|(object, _)| {
             object
                 .metadata
                 .get(SOURCE_REVISION)
@@ -1754,15 +1756,30 @@ fn sibling_page_export_rebases_across_a_supernote_only_revision() {
         .unwrap();
     assert_eq!(
         uploaded
+            .0
             .metadata
             .get("inkbridge-based-on-supernote")
             .map(String::as_str),
         Some("1")
     );
     assert_eq!(
-        uploaded.metadata.get(SOURCE_PAGE_INDEX).map(String::as_str),
+        uploaded
+            .0
+            .metadata
+            .get(SOURCE_PAGE_INDEX)
+            .map(String::as_str),
         Some("1")
     );
+    let payload = parse_baseline_bytes(&uploaded.1, "rebased-upload.json").unwrap();
+    assert_eq!(
+        payload.based_on,
+        Some(BaselineRevisions {
+            boox: 0,
+            supernote: 1,
+        })
+    );
+    assert_eq!(payload.pages[0].page_index, 1);
+    assert_eq!(payload.pages[0].strokes[0].source_uuid, "s2");
 }
 
 #[test]

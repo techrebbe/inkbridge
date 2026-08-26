@@ -183,21 +183,7 @@ pub fn serialize_baseline_page(
     export: &BaselineExport,
     page: &BaselinePage,
 ) -> Result<Vec<u8>, String> {
-    let strokes = page
-        .strokes
-        .iter()
-        .map(|stroke| {
-            serde_json::json!({
-                "sourceUuid": stroke.source_uuid,
-                "sourceKey": stroke.source_uuid,
-                "layerNum": stroke.native_style.layer_num,
-                "thickness": stroke.native_style.thickness,
-                "penColor": stroke.native_style.pen_color,
-                "penType": stroke.native_style.pen_type,
-                "samples": stroke.samples,
-            })
-        })
-        .collect::<Vec<_>>();
+    let strokes = serialize_strokes(page);
     let mut value = serde_json::Map::from_iter([
         (
             "schemaVersion".to_owned(),
@@ -228,6 +214,65 @@ pub fn serialize_baseline_page(
         );
     }
     serde_json::to_vec(&serde_json::Value::Object(value)).map_err(|error| error.to_string())
+}
+
+/// Serialize a complete parsed snapshot with an authoritative revision
+/// frontier supplied by the transport that verified a safe rebase.
+pub fn serialize_baseline_export(
+    export: &BaselineExport,
+    based_on: BaselineRevisions,
+) -> Result<Vec<u8>, String> {
+    let pages = export
+        .pages
+        .iter()
+        .map(|page| {
+            serde_json::json!({
+                "pageIndex": page.page_index,
+                "strokes": serialize_strokes(page),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut value = serde_json::Map::from_iter([
+        (
+            "schemaVersion".to_owned(),
+            serde_json::Value::from(SUPERNOTE_EXPORT_SCHEMA_VERSION),
+        ),
+        ("pages".to_owned(), serde_json::Value::Array(pages)),
+        (
+            "basedOn".to_owned(),
+            serde_json::to_value(based_on).map_err(|error| error.to_string())?,
+        ),
+    ]);
+    if let Some(source_file_name) = &export.source_file_name {
+        value.insert(
+            "sourceFileName".to_owned(),
+            serde_json::Value::String(source_file_name.clone()),
+        );
+    }
+    if let Some(document_id) = &export.document_id {
+        value.insert(
+            "documentId".to_owned(),
+            serde_json::Value::String(document_id.clone()),
+        );
+    }
+    serde_json::to_vec(&serde_json::Value::Object(value)).map_err(|error| error.to_string())
+}
+
+fn serialize_strokes(page: &BaselinePage) -> Vec<serde_json::Value> {
+    page.strokes
+        .iter()
+        .map(|stroke| {
+            serde_json::json!({
+                "sourceUuid": stroke.source_uuid,
+                "sourceKey": stroke.source_uuid,
+                "layerNum": stroke.native_style.layer_num,
+                "thickness": stroke.native_style.thickness,
+                "penColor": stroke.native_style.pen_color,
+                "penType": stroke.native_style.pen_type,
+                "samples": stroke.samples,
+            })
+        })
+        .collect()
 }
 
 fn parse_baseline_text(text: &str, source_name: &str) -> Result<BaselineExport, String> {
@@ -600,5 +645,38 @@ mod tests {
         assert_eq!(page.document_id, batch.document_id);
         assert_eq!(page.based_on, batch.based_on);
         assert_eq!(page.pages, vec![batch.pages[1].clone()]);
+    }
+
+    #[test]
+    fn complete_snapshot_serialization_replaces_only_the_revision_frontier() {
+        let json = r#"{
+            "schemaVersion":1,
+            "sourceFileName":"book.pdf",
+            "documentId":"inkbridge-doc-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "basedOn":{"boox":2,"supernote":3},
+            "pages":[
+                {"pageIndex":142,"strokes":[]},
+                {"pageIndex":143,"strokes":[{
+                    "sourceUuid":"right-stroke",
+                    "sourceKey":"right-stroke",
+                    "thickness":400,
+                    "penColor":0,
+                    "penType":16,
+                    "samples":[[0.1,0.2,1000],[0.2,0.3,1100]]
+                }]}
+            ]
+        }"#;
+        let original = parse_baseline_bytes(json.as_bytes(), "batch.json").unwrap();
+        let rebased = BaselineRevisions {
+            boox: 2,
+            supernote: 4,
+        };
+        let bytes = serialize_baseline_export(&original, rebased).unwrap();
+        let parsed = parse_baseline_bytes(&bytes, "rebased.json").unwrap();
+
+        assert_eq!(parsed.pages, original.pages);
+        assert_eq!(parsed.source_file_name, original.source_file_name);
+        assert_eq!(parsed.document_id, original.document_id);
+        assert_eq!(parsed.based_on, Some(rebased));
     }
 }

@@ -6,9 +6,9 @@ mod pdf;
 
 pub use affine::{AffineError, AffinePoint, AffineTransform};
 pub use baseline::{
-    parse_baseline_bytes, parse_document_baseline_bytes, serialize_baseline_page, BaselineExport,
-    BaselinePage, BaselineRevisions, DocumentBaseline, DOCUMENT_BASELINE_SCHEMA_VERSION,
-    SUPERNOTE_EXPORT_SCHEMA_VERSION,
+    parse_baseline_bytes, parse_document_baseline_bytes, serialize_baseline_export,
+    serialize_baseline_page, BaselineExport, BaselinePage, BaselineRevisions, DocumentBaseline,
+    DOCUMENT_BASELINE_SCHEMA_VERSION, SUPERNOTE_EXPORT_SCHEMA_VERSION,
 };
 pub use model::{
     geometry_fingerprint, CoordinateTransform, DocumentIdentity, Manifest, NativeStyle, Operation,

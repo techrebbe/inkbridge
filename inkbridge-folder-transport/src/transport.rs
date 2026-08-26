@@ -14,7 +14,10 @@ use crate::{
     PendingUpload, SyncReport, TransportAction, TransportState, VerifiedBooxInstall,
 };
 use inkbridge_broker::{sha256_hex, DevicePayloadKind, DeviceSide, RevisionPair, BROKER_PRODUCER};
-use inkbridge_convert::{build_manifest, parse_baseline_bytes, BaselineExport, Manifest};
+use inkbridge_convert::{
+    build_manifest, parse_baseline_bytes, serialize_baseline_export, BaselineExport,
+    BaselineRevisions, Manifest,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -1550,17 +1553,29 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                     return Ok(());
                 }
             }
+            let payload_bytes = if exported_at.is_some_and(|frontier| frontier != current) {
+                serialize_baseline_export(
+                    &parsed,
+                    BaselineRevisions {
+                        boox: current.boox,
+                        supernote: current.supernote,
+                    },
+                )?
+            } else {
+                bytes
+            };
+            let payload_hash = sha256_hex(&payload_bytes);
             let source_revision = current.supernote + 1;
             let snapshot = persist_supernote_snapshot_bytes(
                 document,
                 &source_local_id,
                 source_revision,
-                &content_hash,
-                &bytes,
+                &payload_hash,
+                &payload_bytes,
             )?;
             let snapshot_key = canonical_path_key(&snapshot);
             let temporary = sibling_temporary(&export, "native-upload");
-            fs::write(&temporary, &bytes)
+            fs::write(&temporary, &payload_bytes)
                 .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
             let result = self.upload_source(
                 document,
@@ -1570,8 +1585,8 @@ impl<'a, C: CloudFolder, B: BooxManifestBuilder> FolderTransport<'a, C, B> {
                 &snapshot_key,
                 &source_local_id,
                 &source_page_indices,
-                &content_hash,
-                &content_hash,
+                &payload_hash,
+                &payload_hash,
                 "device_view",
                 "json",
             );
