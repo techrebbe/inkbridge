@@ -15,6 +15,8 @@
 > versioned inbound handoff and explicit full-PDF recovery path remain intact. See
 > [docs/INKBRIDGE_BOOX_HANDOFF.md](docs/INKBRIDGE_BOOX_HANDOFF.md) and
 > [docs/INKBRIDGE_FOLDER_TRANSPORT.md](docs/INKBRIDGE_FOLDER_TRANSPORT.md).
+> The schema-independent prerequisites for Supernote Virtual Spread integration are recorded in
+> [docs/INKBRIDGE_VIRTUAL_SPREAD_PREP.md](docs/INKBRIDGE_VIRTUAL_SPREAD_PREP.md).
 
 <p align="center">
   <strong>A Rust-core, e-ink-first document reader with first-class handwriting.</strong><br>

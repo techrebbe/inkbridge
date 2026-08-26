@@ -1,11 +1,14 @@
+mod affine;
 mod baseline;
 mod model;
 mod neoreader_repair;
 mod pdf;
 
+pub use affine::{AffineError, AffinePoint, AffineTransform};
 pub use baseline::{
-    parse_baseline_bytes, parse_document_baseline_bytes, BaselineExport, BaselineRevisions,
-    DocumentBaseline, DOCUMENT_BASELINE_SCHEMA_VERSION,
+    parse_baseline_bytes, parse_document_baseline_bytes, serialize_baseline_export,
+    serialize_baseline_page, BaselineExport, BaselinePage, BaselineRevisions, DocumentBaseline,
+    DOCUMENT_BASELINE_SCHEMA_VERSION, SUPERNOTE_EXPORT_SCHEMA_VERSION,
 };
 pub use model::{
     geometry_fingerprint, CoordinateTransform, DocumentIdentity, Manifest, NativeStyle, Operation,
@@ -32,7 +35,7 @@ pub fn build_manifest(
         if let Some(source_file_name) = export.source_file_name {
             add_target_file_name(&mut target_file_names, source_file_name)?;
         }
-        baseline_strokes.extend(export.strokes);
+        baseline_strokes.extend(export.pages.into_iter().flat_map(|page| page.strokes));
     }
     let extraction = extract_pdf_strokes(pdf_path)?;
     build_manifest_from_extraction(
@@ -392,7 +395,12 @@ pub fn baseline_by_id(
 ) -> Result<HashMap<String, StrokeSnapshot>, String> {
     let mut all = Vec::new();
     for path in baseline_paths {
-        all.extend(load_baseline(path)?.strokes);
+        all.extend(
+            load_baseline(path)?
+                .pages
+                .into_iter()
+                .flat_map(|page| page.strokes),
+        );
     }
     Ok(index_baseline(all))
 }

@@ -137,6 +137,26 @@ fn supernote_export_page(page_index: u32, strokes: &[StrokeSnapshot]) -> Vec<u8>
     .unwrap()
 }
 
+fn supernote_export_pages(pages: &[(u32, &[StrokeSnapshot])]) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schemaVersion": 1,
+        "sourceFileName": "document.pdf",
+        "pages": pages.iter().map(|(page_index, strokes)| json!({
+            "pageIndex": page_index,
+            "strokes": strokes.iter().map(|stroke| json!({
+                "sourceUuid": stroke.source_uuid,
+                "sourceKey": stroke.source_uuid,
+                "layerNum": stroke.native_style.layer_num,
+                "thickness": stroke.native_style.thickness,
+                "penColor": stroke.native_style.pen_color,
+                "penType": stroke.native_style.pen_type,
+                "samples": stroke.samples,
+            })).collect::<Vec<_>>()
+        })).collect::<Vec<_>>()
+    }))
+    .unwrap()
+}
+
 struct Harness {
     broker: Broker,
     storage: MemoryStorage,
@@ -1953,6 +1973,166 @@ fn empty_supernote_page_export_tombstones_every_stroke_on_that_page() {
 }
 
 #[test]
+fn atomic_spread_snapshot_moves_and_deletes_without_touching_other_pages() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(3));
+    let outside = stroke_on_page("outside-spread", 2, 0.1, 0.2);
+    let outside_event = harness.event(
+        "sn-outside",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_page(2, std::slice::from_ref(&outside)),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &outside_event)
+        .unwrap();
+
+    let left = stroke_on_page("move-between-halves", 0, 0.2, 0.3);
+    let right = stroke_on_page("delete-on-right", 1, 0.6, 0.5);
+    let initial_pages = [
+        (0, std::slice::from_ref(&left)),
+        (1, std::slice::from_ref(&right)),
+    ];
+    let initial = harness.event(
+        "sn-spread-initial",
+        DeviceSide::Supernote,
+        2,
+        RevisionPair {
+            boox: 0,
+            supernote: 1,
+        },
+        supernote_export_pages(&initial_pages),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let moved = stroke_on_page("move-between-halves", 1, 0.35, 0.4);
+    let empty: &[StrokeSnapshot] = &[];
+    let replacement_pages = [(0, empty), (1, std::slice::from_ref(&moved))];
+    let replacement = harness.event(
+        "sn-spread-replacement",
+        DeviceSide::Supernote,
+        3,
+        RevisionPair {
+            boox: 0,
+            supernote: 2,
+        },
+        supernote_export_pages(&replacement_pages),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &replacement)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
+
+    let state = harness.state();
+    let moved_state = &state.strokes["move-between-halves"];
+    assert_eq!(moved_state.snapshot.page_index, 1);
+    assert_eq!(
+        moved_state.snapshot.geometry_fingerprint,
+        moved.geometry_fingerprint
+    );
+    assert!(moved_state.tombstone.is_none());
+    assert!(state.strokes["delete-on-right"].tombstone.is_some());
+    assert_eq!(
+        state.strokes["outside-spread"]
+            .snapshot
+            .geometry_fingerprint,
+        outside.geometry_fingerprint
+    );
+    assert_eq!(state.strokes["outside-spread"].snapshot.page_index, 2);
+    assert!(state.strokes["outside-spread"].tombstone.is_none());
+
+    let state_revision = state.state_revision;
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &replacement)
+            .unwrap(),
+        ProcessOutcome::Duplicate { .. }
+    ));
+    assert_eq!(harness.state().state_revision, state_revision);
+}
+
+#[test]
+fn invalid_spread_snapshot_fails_before_canonical_state_changes() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let before = harness.state();
+    let duplicate_id = stroke_on_page("duplicate", 0, 0.1, 0.2);
+    let same_id_other_page = stroke_on_page("duplicate", 1, 0.3, 0.4);
+    let pages = [
+        (0, std::slice::from_ref(&duplicate_id)),
+        (1, std::slice::from_ref(&same_id_other_page)),
+    ];
+    let event = harness.event(
+        "sn-invalid-spread",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_pages(&pages),
+    );
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::Conversion(message)) if message.contains("repeats stroke identity duplicate")
+    ));
+    assert_eq!(harness.state(), before);
+}
+
+#[test]
+fn spread_snapshot_rejects_a_mismatched_document_or_revision_frontier() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let wrong_document = serde_json::to_vec(&json!({
+        "schemaVersion": 1,
+        "documentId": format!("inkbridge-doc-v1-{}", "f".repeat(64)),
+        "basedOn": {"boox": 0, "supernote": 0},
+        "pages": [
+            {"pageIndex": 0, "strokes": []},
+            {"pageIndex": 1, "strokes": []}
+        ]
+    }))
+    .unwrap();
+    let event = harness.event(
+        "sn-wrong-document",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        wrong_document,
+    );
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(message)) if message.contains("documentId does not match")
+    ));
+
+    let wrong_frontier = serde_json::to_vec(&json!({
+        "schemaVersion": 1,
+        "documentId": harness.document_id,
+        "basedOn": {"boox": 1, "supernote": 0},
+        "pages": [
+            {"pageIndex": 0, "strokes": []},
+            {"pageIndex": 1, "strokes": []}
+        ]
+    }))
+    .unwrap();
+    let event = harness.event(
+        "sn-wrong-frontier",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        wrong_frontier,
+    );
+    assert!(matches!(
+        harness.broker.process(&mut harness.storage, &event),
+        Err(BrokerError::InvalidEvent(message)) if message.contains("basedOn does not match")
+    ));
+    assert_eq!(harness.state().state_revision, 0);
+}
+
+#[test]
 fn malformed_neoreader_pdf_is_recovered_with_qpdf() {
     if std::process::Command::new("qpdf")
         .arg("--version")
@@ -2530,6 +2710,176 @@ fn conflict_inspection_separates_safe_changes_from_overlaps() {
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["boox-current", "shared"])
     );
+}
+
+#[test]
+fn conflict_inspection_classifies_a_page_only_spread_change_as_a_move() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let original = stroke_on_page("page-only-move", 0, 0.2, 0.3);
+    let initial_pages = [
+        (0, std::slice::from_ref(&original)),
+        (1, &[] as &[StrokeSnapshot]),
+    ];
+    let initial = harness.event(
+        "sn-page-only-move-base",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_pages(&initial_pages),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let mut boox = harness.event(
+        "boox-empty-concurrent-revision",
+        DeviceSide::Boox,
+        1,
+        common,
+        compact_manifest(Vec::new(), 2),
+    );
+    boox.payload_kind = DevicePayloadKind::BooxOperationManifest;
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let mut moved = original.clone();
+    moved.page_index = 1;
+    let moved_pages = [
+        (0, &[] as &[StrokeSnapshot]),
+        (1, std::slice::from_ref(&moved)),
+    ];
+    let incoming = harness.event(
+        "sn-page-only-move-conflict",
+        DeviceSide::Supernote,
+        2,
+        common,
+        supernote_export_pages(&moved_pages),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &incoming)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "sn-page-only-move-conflict",
+        )
+        .unwrap();
+    assert_eq!(
+        analysis
+            .safe_changes
+            .iter()
+            .map(|change| (change.stroke_id.as_str(), change.kind, change.page_index))
+            .collect::<Vec<_>>(),
+        vec![("page-only-move", ConflictChangeKind::Move, 1)]
+    );
+    assert!(analysis.overlapping_changes.is_empty());
+}
+
+#[test]
+fn atomic_spread_conflict_can_merge_safe_half_without_losing_the_other_half() {
+    let mut harness = Harness::with_original(original_pdf_with_pages(2));
+    let left = stroke_on_page("spread-left", 0, 0.2, 0.3);
+    let right = stroke_on_page("spread-right", 1, 0.6, 0.5);
+    let initial_pages = [
+        (0, std::slice::from_ref(&left)),
+        (1, std::slice::from_ref(&right)),
+    ];
+    let initial = harness.event(
+        "sn-spread-base",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_pages(&initial_pages),
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let common = RevisionPair {
+        boox: 0,
+        supernote: 1,
+    };
+    let boox_left = stroke_on_page("spread-left", 0, 0.3, 0.35);
+    let boox_pdf = write_boox_view(&harness.original, [boox_left.clone(), right.clone()]).unwrap();
+    let boox = harness.event("boox-spread-edit", DeviceSide::Boox, 1, common, boox_pdf);
+    harness.broker.process(&mut harness.storage, &boox).unwrap();
+
+    let supernote_right = stroke_on_page("spread-right", 1, 0.7, 0.55);
+    let supernote_new = stroke_on_page("spread-new", 0, 0.75, 0.7);
+    let incoming_left = [left.clone(), supernote_new.clone()];
+    let incoming_pages = [
+        (0, incoming_left.as_slice()),
+        (1, std::slice::from_ref(&supernote_right)),
+    ];
+    let incoming = harness.event(
+        "sn-spread-conflict",
+        DeviceSide::Supernote,
+        2,
+        common,
+        supernote_export_pages(&incoming_pages),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &incoming)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(&harness.storage, &harness.document_id, "sn-spread-conflict")
+        .unwrap();
+    assert!(analysis
+        .safe_changes
+        .iter()
+        .any(|change| change.stroke_id == "spread-right"));
+    assert!(analysis
+        .safe_changes
+        .iter()
+        .any(|change| change.stroke_id == "spread-new"));
+    assert!(analysis
+        .overlapping_changes
+        .iter()
+        .any(|change| change.stroke_id == "spread-left"));
+
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-spread-conflict",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(
+        state.strokes["spread-left"].snapshot.geometry_fingerprint,
+        boox_left.geometry_fingerprint
+    );
+    assert_eq!(
+        state.strokes["spread-right"].snapshot.geometry_fingerprint,
+        supernote_right.geometry_fingerprint
+    );
+    assert_eq!(
+        state.strokes["spread-new"].snapshot.geometry_fingerprint,
+        supernote_new.geometry_fingerprint
+    );
+    assert!(state.conflicts.is_empty());
 }
 
 #[test]
@@ -3949,6 +4299,75 @@ fn compact_conflict_recovers_legacy_page_count_before_validating_pages() {
         Err(BrokerError::InvalidEvent(message))
             if message.contains("page count 2 does not match original page count 1")
     ));
+}
+
+#[test]
+fn supernote_conflict_recovers_legacy_page_count_before_validating_pages() {
+    let mut harness = Harness::new();
+    let boox = stroke("boox-current-before-legacy-supernote-conflict", 0.2, 0.3);
+    let initial_pdf = write_boox_view(&harness.original, [boox]).unwrap();
+    let initial = harness.event(
+        "boox-base-legacy-supernote-conflict",
+        DeviceSide::Boox,
+        1,
+        RevisionPair::default(),
+        initial_pdf,
+    );
+    harness
+        .broker
+        .process(&mut harness.storage, &initial)
+        .unwrap();
+
+    let mut legacy = harness.state();
+    legacy.original_page_count = 0;
+    harness.storage.put_unchecked(
+        state_path(&harness.document_id),
+        serde_json::to_vec(&legacy).unwrap(),
+        BTreeMap::new(),
+    );
+
+    let incoming = stroke("supernote-after-legacy-migration", 0.7, 0.7);
+    let event = harness.event(
+        "supernote-legacy-page-count-conflict",
+        DeviceSide::Supernote,
+        1,
+        RevisionPair::default(),
+        supernote_export_pages(&[(0, std::slice::from_ref(&incoming))]),
+    );
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &event)
+            .unwrap(),
+        ProcessOutcome::Conflict { .. }
+    ));
+
+    let analysis = harness
+        .broker
+        .inspect_conflict(
+            &harness.storage,
+            &harness.document_id,
+            "supernote-legacy-page-count-conflict",
+        )
+        .unwrap();
+    assert!(analysis
+        .safe_changes
+        .iter()
+        .any(|change| change.stroke_id == incoming.source_uuid));
+    let request = resolution_request(
+        &harness,
+        &analysis,
+        "resolve-legacy-supernote-page-count",
+        ConflictResolutionStrategy::MergePreservingCurrent,
+    );
+    harness
+        .broker
+        .resolve_conflict(&mut harness.storage, &request)
+        .unwrap();
+
+    let state = harness.state();
+    assert_eq!(state.original_page_count, 1);
+    assert!(state.strokes.contains_key(&incoming.source_uuid));
 }
 
 #[test]
