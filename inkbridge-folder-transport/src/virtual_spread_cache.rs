@@ -401,8 +401,7 @@ fn validate_versioned_candidate(
     previous: &VirtualSpreadViewEvidence,
     candidate: &VirtualSpreadViewEvidence,
 ) -> Result<(), String> {
-    if previous.view_id == candidate.view_id
-        || previous.cache_basename == candidate.cache_basename
+    if previous.view_id == candidate.view_id || previous.cache_basename == candidate.cache_basename
     {
         return Err(
             "Virtual Spread regeneration requires a new versioned candidate view".to_owned(),
