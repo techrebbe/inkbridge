@@ -6,16 +6,24 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::Formatter;
 
+mod golden;
+
+pub use golden::{
+    verify_virtual_spread_golden_fixture, VirtualSpreadGoldenVerification,
+    VIRTUAL_SPREAD_PAGE_143_FIXTURE_SHA256,
+};
+
 pub const VIRTUAL_SPREAD_SCHEMA: &str = "techrebbe.supernote.virtual-spread/v3";
 pub const VIRTUAL_SPREAD_GENERATOR_VERSION: &str =
     "techrebbe.supernote.virtual-spread-generator/v1";
 pub const VIRTUAL_SPREAD_MAPPING_DOMAIN: &str = "techrebbe.supernote.virtual-spread-mapping/v1";
 pub const VIRTUAL_SPREAD_VIEW_DOMAIN: &str = "techrebbe.supernote.virtual-spread-view/v1";
+pub const VIRTUAL_SPREAD_GOLDEN_SCHEMA: &str = "techrebbe.supernote.virtual-spread-golden/v1";
+pub const VIRTUAL_SPREAD_CONTRACT_TOLERANCE: f64 = 1.0e-12;
 pub const VIRTUAL_SPREAD_PRODUCTION_ACTIVATION_ENABLED: bool = false;
 
 const DOCUMENT_ID_PREFIX: &str = "inkbridge-doc-v1-";
 const VIEW_ID_PREFIX: &str = "inkbridge-view-v1-";
-const CONTRACT_TOLERANCE: f64 = 1.0e-12;
 const MAX_PAGE_INDEX: u32 = i32::MAX as u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +97,7 @@ impl VirtualSpreadMapping {
         let reproduced = self.canonical_to_spread(canonical)?;
         if !within(reproduced.x, point.x) || !within(reproduced.y, point.y) {
             return Err(format!(
-                "Virtual Spread inverse round trip exceeded {CONTRACT_TOLERANCE}"
+                "Virtual Spread inverse round trip exceeded {VIRTUAL_SPREAD_CONTRACT_TOLERANCE}"
             ));
         }
         Ok(canonical)
@@ -681,12 +689,16 @@ fn canonical_mapping_record(mapping: &MappingWire) -> Result<String, String> {
 }
 
 fn mapping_authority(records: &[String]) -> String {
+    hex_sha256(canonical_mapping(records).as_bytes())
+}
+
+fn canonical_mapping(records: &[String]) -> String {
     let mut canonical = format!("{VIRTUAL_SPREAD_MAPPING_DOMAIN}\n");
     for record in records {
         canonical.push_str(record);
         canonical.push('\n');
     }
-    hex_sha256(canonical.as_bytes())
+    canonical
 }
 
 fn compute_view_id(
@@ -696,14 +708,30 @@ fn compute_view_id(
     gutter: f64,
     mapping_authority_sha256: &str,
 ) -> String {
-    let canonical = format!(
+    let canonical = canonical_view(
+        source_sha256,
+        cover_separate,
+        spread_size,
+        gutter,
+        mapping_authority_sha256,
+    );
+    format!("{VIEW_ID_PREFIX}{}", hex_sha256(canonical.as_bytes()))
+}
+
+fn canonical_view(
+    source_sha256: &str,
+    cover_separate: bool,
+    spread_size: [f64; 2],
+    gutter: f64,
+    mapping_authority_sha256: &str,
+) -> String {
+    format!(
         "{VIRTUAL_SPREAD_VIEW_DOMAIN}\nsource|{source_sha256}\nschema|{VIRTUAL_SPREAD_SCHEMA}\ngenerator|{VIRTUAL_SPREAD_GENERATOR_VERSION}\ndirection|rtl\ncover|{}\nspread|{:016x}|{:016x}|{:016x}\nmapping|{mapping_authority_sha256}\n",
         u8::from(cover_separate),
         spread_size[0].to_bits(),
         spread_size[1].to_bits(),
         gutter.to_bits(),
-    );
-    format!("{VIEW_ID_PREFIX}{}", hex_sha256(canonical.as_bytes()))
+    )
 }
 
 fn mapping_placement_matches(
@@ -771,7 +799,15 @@ fn rect_within(actual: [f64; 4], expected: [f64; 4]) -> bool {
 }
 
 fn within(left: f64, right: f64) -> bool {
-    left.is_finite() && right.is_finite() && (left - right).abs() <= CONTRACT_TOLERANCE
+    within_tolerance(left, right, VIRTUAL_SPREAD_CONTRACT_TOLERANCE)
+}
+
+fn within_tolerance(left: f64, right: f64, tolerance: f64) -> bool {
+    left.is_finite()
+        && right.is_finite()
+        && tolerance.is_finite()
+        && tolerance >= 0.0
+        && (left - right).abs() <= tolerance
 }
 
 fn validate_normalized_point(point: AffinePoint) -> Result<(), String> {
@@ -787,15 +823,17 @@ fn validate_normalized_point(point: AffinePoint) -> Result<(), String> {
 
 fn clamp_normalized(point: AffinePoint) -> Result<AffinePoint, String> {
     fn clamp(value: f64) -> Result<f64, String> {
-        if !value.is_finite() || !(-CONTRACT_TOLERANCE..=1.0 + CONTRACT_TOLERANCE).contains(&value)
+        if !value.is_finite()
+            || !(-VIRTUAL_SPREAD_CONTRACT_TOLERANCE..=1.0 + VIRTUAL_SPREAD_CONTRACT_TOLERANCE)
+                .contains(&value)
         {
             return Err(
                 "inverse Virtual Spread point is outside normalized [0,1] bounds".to_owned(),
             );
         }
-        Ok(if value.abs() <= CONTRACT_TOLERANCE {
+        Ok(if value.abs() <= VIRTUAL_SPREAD_CONTRACT_TOLERANCE {
             0.0
-        } else if (value - 1.0).abs() <= CONTRACT_TOLERANCE {
+        } else if (value - 1.0).abs() <= VIRTUAL_SPREAD_CONTRACT_TOLERANCE {
             1.0
         } else {
             value
@@ -1078,6 +1116,27 @@ mod tests {
                 .unwrap_err()
                 .contains("reflection")
         );
+    }
+
+    #[test]
+    fn diagnostic_host_names_and_paths_do_not_change_authority() {
+        let original = parse_virtual_spread_manifest(&manifest_bytes(), HASH).unwrap();
+        let mut renamed = manifest_value();
+        renamed["source"]["name"] = Value::String("renamed-source.pdf".to_owned());
+        renamed["source"]["path"] = Value::String("/different/diagnostic/source".to_owned());
+        renamed["output"]["name"] = Value::String("temporary-staging-name.pdf".to_owned());
+        renamed["output"]["path"] = Value::String("D:\\temporary\\diagnostic".to_owned());
+        let renamed =
+            parse_virtual_spread_manifest(&serde_json::to_vec(&renamed).unwrap(), HASH).unwrap();
+
+        assert_eq!(renamed.document_id, original.document_id);
+        assert_eq!(
+            renamed.mapping_authority_sha256,
+            original.mapping_authority_sha256
+        );
+        assert_eq!(renamed.view_id, original.view_id);
+        assert_eq!(renamed.cache_basename, original.cache_basename);
+        assert_eq!(renamed.mappings, original.mappings);
     }
 
     #[test]
