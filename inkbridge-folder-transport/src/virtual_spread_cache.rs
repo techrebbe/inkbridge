@@ -262,6 +262,9 @@ impl CacheRegenerationTransaction {
         if self.schema_version != VIRTUAL_SPREAD_CACHE_TRANSACTION_SCHEMA_VERSION {
             return Err("unsupported Virtual Spread cache transaction schema".to_owned());
         }
+        if self.transaction_id.trim().is_empty() {
+            return Err("Virtual Spread cache transaction ID is empty".to_owned());
+        }
         validate_sha256(&self.original_pdf_sha256, "original PDF SHA-256")?;
         if self.document_id != format!("inkbridge-doc-v1-{}", self.original_pdf_sha256) {
             return Err("cache transaction document ID does not match original PDF".to_owned());
@@ -381,7 +384,14 @@ impl CacheRegenerationTransaction {
                     return Err("activated candidate lacks durable activation evidence".to_owned());
                 }
             }
-            CacheRegenerationPhase::RolledBack => {}
+            CacheRegenerationPhase::RolledBack => {
+                if self.active_mapping_sha256.is_some() {
+                    return Err(
+                        "rolled-back Virtual Spread transaction retains activation evidence"
+                            .to_owned(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -414,13 +424,10 @@ fn validate_view(view: &VirtualSpreadViewEvidence, document_id: &str) -> Result<
     if view.document_id != document_id {
         return Err("Virtual Spread view belongs to a different original document".to_owned());
     }
-    if !view.view_id.starts_with("inkbridge-view-v1-") {
+    let Some(view_hash) = view.view_id.strip_prefix("inkbridge-view-v1-") else {
         return Err("Virtual Spread view ID has an unsupported prefix".to_owned());
-    }
-    validate_sha256(
-        view.view_id.trim_start_matches("inkbridge-view-v1-"),
-        "Virtual Spread view hash",
-    )?;
+    };
+    validate_sha256(view_hash, "Virtual Spread view hash")?;
     if view.cache_basename != format!("{document_id}.{}.virtual-spread.pdf", view.view_id) {
         return Err("Virtual Spread cache basename is not document/view derived".to_owned());
     }
@@ -619,6 +626,25 @@ mod tests {
     }
 
     #[test]
+    fn view_identity_prefix_is_stripped_exactly_once() {
+        let mut candidate = view('b');
+        candidate.view_id = format!("inkbridge-view-v1-{}", candidate.view_id);
+        candidate.cache_basename = format!(
+            "{}.{}.virtual-spread.pdf",
+            candidate.document_id, candidate.view_id
+        );
+        assert!(CacheRegenerationTransaction::begin_clean(
+            "transaction-6".to_owned(),
+            ORIGINAL.to_owned(),
+            7,
+            vec![142, 143],
+            None,
+            candidate,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn persisted_transaction_rejects_injected_future_phase_evidence() {
         let candidate = view('b');
         let mut transaction = CacheRegenerationTransaction::begin_clean(
@@ -646,5 +672,20 @@ mod tests {
             .validate_persisted()
             .unwrap_err()
             .contains("previous view"));
+
+        transaction.dirty_export = None;
+        transaction.transaction_id.clear();
+        assert!(transaction
+            .validate_persisted()
+            .unwrap_err()
+            .contains("transaction ID"));
+
+        transaction.transaction_id = "transaction-5".to_owned();
+        transaction.phase = CacheRegenerationPhase::RolledBack;
+        transaction.active_mapping_sha256 = Some("f".repeat(64));
+        assert!(transaction
+            .validate_persisted()
+            .unwrap_err()
+            .contains("activation evidence"));
     }
 }
