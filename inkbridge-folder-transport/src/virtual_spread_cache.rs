@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const VIRTUAL_SPREAD_CACHE_TRANSACTION_SCHEMA_VERSION: u32 = 1;
+pub const VIRTUAL_SPREAD_CACHE_TRANSACTION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -59,6 +59,13 @@ pub enum CacheRegenerationPhase {
     RolledBack,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRegenerationMode {
+    Clean,
+    Dirty,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CacheRegenerationTransaction {
@@ -69,6 +76,7 @@ pub struct CacheRegenerationTransaction {
     pub represented_source_pages: Vec<u32>,
     pub previous_view: Option<VirtualSpreadViewEvidence>,
     pub candidate_view: VirtualSpreadViewEvidence,
+    pub mode: CacheRegenerationMode,
     pub phase: CacheRegenerationPhase,
     pub canonical_revision: Option<u64>,
     pub dirty_export: Option<DirtyMarkExportEvidence>,
@@ -93,6 +101,7 @@ impl CacheRegenerationTransaction {
             represented_source_pages,
             previous_view,
             candidate_view,
+            CacheRegenerationMode::Clean,
             Some(canonical_revision),
         )
     }
@@ -110,6 +119,7 @@ impl CacheRegenerationTransaction {
             represented_source_pages,
             Some(previous_view),
             candidate_view,
+            CacheRegenerationMode::Dirty,
             None,
         )
     }
@@ -120,6 +130,7 @@ impl CacheRegenerationTransaction {
         represented_source_pages: Vec<u32>,
         previous_view: Option<VirtualSpreadViewEvidence>,
         candidate_view: VirtualSpreadViewEvidence,
+        mode: CacheRegenerationMode,
         canonical_revision: Option<u64>,
     ) -> Result<Self, String> {
         if transaction_id.trim().is_empty() {
@@ -146,6 +157,7 @@ impl CacheRegenerationTransaction {
             represented_source_pages,
             previous_view,
             candidate_view,
+            mode,
             phase,
             canonical_revision,
             dirty_export: None,
@@ -321,6 +333,40 @@ impl CacheRegenerationTransaction {
         }
         if let Some(active_mapping_sha256) = &self.active_mapping_sha256 {
             validate_sha256(active_mapping_sha256, "active mapping SHA-256")?;
+        }
+        match self.mode {
+            CacheRegenerationMode::Clean => {
+                if self.canonical_revision.is_none()
+                    || self.dirty_export.is_some()
+                    || self.phase == CacheRegenerationPhase::AwaitingDirtyExport
+                {
+                    return Err("invalid clean cache regeneration mode/evidence".to_owned());
+                }
+            }
+            CacheRegenerationMode::Dirty => {
+                if self.previous_view.is_none() {
+                    return Err("dirty cache regeneration has no previous view".to_owned());
+                }
+                match self.phase {
+                    CacheRegenerationPhase::AwaitingDirtyExport => {}
+                    CacheRegenerationPhase::RolledBack => {
+                        if self.canonical_revision.is_some() != self.dirty_export.is_some() {
+                            return Err(
+                                "rolled-back dirty regeneration has incomplete export evidence"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    _ => {
+                        if self.canonical_revision.is_none() || self.dirty_export.is_none() {
+                            return Err(
+                                "dirty cache regeneration is missing required export evidence"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                }
+            }
         }
         match self.phase {
             CacheRegenerationPhase::AwaitingDirtyExport => {
@@ -566,6 +612,16 @@ mod tests {
                 canonical_revision: 7,
             })
             .unwrap();
+        transaction.validate_persisted().unwrap();
+
+        let mut persisted = serde_json::to_value(&transaction).unwrap();
+        persisted.as_object_mut().unwrap().remove("dirtyExport");
+        let restored: CacheRegenerationTransaction = serde_json::from_value(persisted).unwrap();
+        assert!(restored
+            .validate_persisted()
+            .unwrap_err()
+            .contains("required export evidence"));
+
         transaction.record_generated(&candidate).unwrap();
     }
 
