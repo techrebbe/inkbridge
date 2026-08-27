@@ -16,9 +16,11 @@ pub use model::{
     StrokeSnapshot, Summary,
 };
 pub use virtual_spread::{
-    parse_virtual_spread_manifest, stable_supernote_annotation_id, VirtualSpreadManifest,
-    VirtualSpreadMapping, VirtualSpreadSide, VIRTUAL_SPREAD_GENERATOR_VERSION,
-    VIRTUAL_SPREAD_MAPPING_DOMAIN, VIRTUAL_SPREAD_PRODUCTION_ACTIVATION_ENABLED,
+    parse_virtual_spread_manifest, stable_supernote_annotation_id,
+    verify_virtual_spread_golden_fixture, VirtualSpreadGoldenVerification, VirtualSpreadManifest,
+    VirtualSpreadMapping, VirtualSpreadSide, VIRTUAL_SPREAD_CONTRACT_TOLERANCE,
+    VIRTUAL_SPREAD_GENERATOR_VERSION, VIRTUAL_SPREAD_GOLDEN_SCHEMA, VIRTUAL_SPREAD_MAPPING_DOMAIN,
+    VIRTUAL_SPREAD_PAGE_143_FIXTURE_SHA256, VIRTUAL_SPREAD_PRODUCTION_ACTIVATION_ENABLED,
     VIRTUAL_SPREAD_SCHEMA, VIRTUAL_SPREAD_VIEW_DOMAIN,
 };
 

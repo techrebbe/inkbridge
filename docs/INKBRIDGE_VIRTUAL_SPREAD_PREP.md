@@ -1,8 +1,8 @@
 # Virtual Spread integration preparation
 
-Status: schema-v3 adapter scaffolding implemented against RTL Reader's provisional v0.0.25 wire
-contract. Production activation and exact page-143 golden bytes remain gated on the reviewed,
-merged v0.0.25 head.
+Status: RTL Reader v0.0.25's frozen schema-v3 mapping contract and synthetic page-143 golden
+vectors are imported from merged commit `025d870bd73f1133664aa37b8443feb7ce10d12d`.
+Production activation remains gated on RTL Reader's separately reviewed real-PDF fixture bundle.
 
 ## Boundary
 
@@ -16,15 +16,14 @@ identity. InkBridge owns canonical annotation state, merge semantics, inverse/fo
 translation, and complete cache hydration. The Nomad companion owns verification, dirty-cache
 checkpointing, installation, and atomic activation of a generated view.
 
-## Implemented before the manifest is frozen
+## Implemented contract foundation
 
 ### Generic affine validation
 
 `inkbridge-convert::AffineTransform` implements conventional six-coefficient affine arithmetic,
 inverse derivation, finite-result checks, relative singularity rejection, and point-set round-trip
-validation. It intentionally accepts already authenticated coefficients rather than parsing the
-current Virtual Spread sidecar. This keeps the mathematical core reusable without blessing an
-interim manifest schema.
+validation. The schema-v3 adapter accepts only the authoritative forward matrix and derives its
+inverse locally; the inverse and diagnostic host paths never participate in mapping authority.
 
 ### Atomic original-page snapshots
 
@@ -84,8 +83,12 @@ mapping-authority mismatches, and internally inconsistent view/cache identities.
 Only the authenticated forward matrix is retained. InkBridge derives the inverse locally and
 validates source-normalized-to-spread round trips at the contract tolerance. Canonical points use
 displayed-CropBox `[0,1]` coordinates with a top-left origin. Production cache activation is
-explicitly disabled in this scaffold, because PDF-tail authority and the final merged golden vectors
-have not yet been imported.
+explicitly disabled until the separate real-PDF/PDF-tail fixture gate lands.
+
+The exact merged `page-143-contract-v1.json` fixture now pins canonical mapping and view bytes,
+lowercase SHA-256 identities, zero-based int32 indices, binary64 field order, signed-zero
+preservation, positive-orientation quarter-turn transforms, and point/stroke forward/inverse
+round trips at an absolute `1e-12`. Contract drift fails closed.
 
 The annotation identity helper preserves a retained `sourceUuid`. If Supernote `userData` loses it,
 the adapter derives a document-bound ID from a nonempty native element key. It fails closed rather
@@ -100,25 +103,23 @@ every represented source page from one canonical revision, match its generated P
 mapping authority, and new `.mark` evidence, and retain rollback evidence before activation can be
 committed. No transaction field or transition copies an old `.mark` onto a different PDF.
 
-The external fixture harness currently loads a clearly labeled synthetic schema-v3 sidecar. The
-normative page-143 fixture is intentionally not copied or hardcoded until the final RTL Reader head
-merges.
+The cache transaction tests use the frozen synthetic view identity to exercise dirty checkpoint,
+two-page hydration from one canonical revision, verification, activation evidence, persistence,
+and rollback. They do not represent a real generated PDF or native `.mark`.
 
-## Deliberately deferred until RTL Reader v0.0.25 merges
+## Deliberately deferred until the real-PDF fixture bundle merges
 
-- importing the final page-143 source, generated PDF, sidecar, digest, view ID, and round-trip
-  vectors as normative cross-project fixtures;
-- verifying the schema-v3 digest and view authority embedded in the generated PDF tail;
-- selecting the hardware-proven hidden cache directory;
+- importing the original source PDF, generated Virtual Spread PDF and sidecar, stable artifact
+  hashes, exact real-PDF vectors, and descriptor-verified PDF-tail evidence;
+- binding the hardware-proven hidden cache directory into Nomad publication code;
 - enabling production transform acceptance and cache activation;
 - transforming real native Supernote element samples into original-page snapshots;
 - importing complete canonical state into a replacement `.mark`; and
 - automatic dirty-cache checkpoint, regeneration, activation, and rollback.
 
 The parser and transaction APIs are intentionally representation plumbing rather than activation
-authority. The final bytes and production switch begin only when RTL Reader publishes the reviewed
-v0.0.25 source PDF, generated PDF, sidecar, expected mapping digest, expected view ID, PDF-tail
-evidence, and coordinate round-trip vectors.
+authority. The production switch begins only after RTL Reader's fixture-only pull request freezes
+and merges the real PDF pair, sidecar, hashes, PDF-tail evidence, and exact real-PDF vectors.
 
 ## First integrated acceptance gate
 
