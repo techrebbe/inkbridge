@@ -3,6 +3,7 @@ mod baseline;
 mod model;
 mod neoreader_repair;
 mod pdf;
+mod virtual_spread;
 
 pub use affine::{AffineError, AffinePoint, AffineTransform};
 pub use baseline::{
@@ -13,6 +14,12 @@ pub use baseline::{
 pub use model::{
     geometry_fingerprint, CoordinateTransform, DocumentIdentity, Manifest, NativeStyle, Operation,
     StrokeSnapshot, Summary,
+};
+pub use virtual_spread::{
+    parse_virtual_spread_manifest, stable_supernote_annotation_id, VirtualSpreadManifest,
+    VirtualSpreadMapping, VirtualSpreadSide, VIRTUAL_SPREAD_GENERATOR_VERSION,
+    VIRTUAL_SPREAD_MAPPING_DOMAIN, VIRTUAL_SPREAD_PRODUCTION_ACTIVATION_ENABLED,
+    VIRTUAL_SPREAD_SCHEMA, VIRTUAL_SPREAD_VIEW_DOMAIN,
 };
 
 use baseline::{index_baseline, load_baseline};

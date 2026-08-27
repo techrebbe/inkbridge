@@ -1,7 +1,8 @@
 # Virtual Spread integration preparation
 
-Status: InkBridge-side prerequisites implemented; representation-specific parsing waits for the
-authenticated RTL Reader v0.0.25 contract and `page-143` golden fixture.
+Status: schema-v3 adapter scaffolding implemented against RTL Reader's provisional v0.0.25 wire
+contract. Production activation and exact page-143 golden bytes remain gated on the reviewed,
+merged v0.0.25 head.
 
 ## Boundary
 
@@ -72,20 +73,52 @@ either half cannot overwrite a newer spread snapshot. During migration, if a new
 export supersedes only one half of an accepted batch, the local converter materializes only the
 still-current half; overlapping baselines are never passed to the BOOX diff engine.
 
-## Deliberately deferred until the RTL contract lands
+### Schema-v3 representation adapter scaffold
 
-- parsing and recomputing the Virtual Spread mapping-authority digest;
-- binding concrete CropBox, rotation, destination-rectangle, and coordinate-basis fields;
-- validating the deterministic view ID and versioned cache basename;
+`inkbridge-convert` now has a strict schema-v3 parser which is always bound to the immutable
+original PDF SHA-256 and its `inkbridge-doc-v1-*` identity. It rejects duplicate JSON keys, unknown
+fields, wrong JSON types, non-finite numbers, non-int32 page indices, incomplete or duplicate page
+mappings, invalid rectangles, wrong RTL cover placement, non-uniform/skewed/reflected transforms,
+mapping-authority mismatches, and internally inconsistent view/cache identities.
+
+Only the authenticated forward matrix is retained. InkBridge derives the inverse locally and
+validates source-normalized-to-spread round trips at the contract tolerance. Canonical points use
+displayed-CropBox `[0,1]` coordinates with a top-left origin. Production cache activation is
+explicitly disabled in this scaffold, because PDF-tail authority and the final merged golden vectors
+have not yet been imported.
+
+The annotation identity helper preserves a retained `sourceUuid`. If Supernote `userData` loses it,
+the adapter derives a document-bound ID from a nonempty native element key. It fails closed rather
+than pretending a geometry fingerprint is stable across lasso movement. The native-key path still
+requires a real-device reopen/move round trip before production use.
+
+### Versioned cache-regeneration transaction model
+
+`inkbridge-folder-transport` now models regeneration as a durable state machine. A dirty active
+view must be exported first. A candidate must have a new document/view-derived cache name, hydrate
+every represented source page from one canonical revision, match its generated PDF, sidecar,
+mapping authority, and new `.mark` evidence, and retain rollback evidence before activation can be
+committed. No transaction field or transition copies an old `.mark` onto a different PDF.
+
+The external fixture harness currently loads a clearly labeled synthetic schema-v3 sidecar. The
+normative page-143 fixture is intentionally not copied or hardcoded until the final RTL Reader head
+merges.
+
+## Deliberately deferred until RTL Reader v0.0.25 merges
+
+- importing the final page-143 source, generated PDF, sidecar, digest, view ID, and round-trip
+  vectors as normative cross-project fixtures;
+- verifying the schema-v3 digest and view authority embedded in the generated PDF tail;
 - selecting the hardware-proven hidden cache directory;
-- transforming native Supernote element samples into original-page samples;
+- enabling production transform acceptance and cache activation;
+- transforming real native Supernote element samples into original-page snapshots;
 - importing complete canonical state into a replacement `.mark`; and
 - automatic dirty-cache checkpoint, regeneration, activation, and rollback.
 
-Implementing these against the current manifest would create a second temporary authority and risk
-coordinate drift. They begin when RTL Reader publishes the new manifest schema and its exact
-`page-143` source PDF, generated PDF, sidecar, expected mapping digest, expected view ID, and
-coordinate round-trip vectors.
+The parser and transaction APIs are intentionally representation plumbing rather than activation
+authority. The final bytes and production switch begin only when RTL Reader publishes the reviewed
+v0.0.25 source PDF, generated PDF, sidecar, expected mapping digest, expected view ID, PDF-tail
+evidence, and coordinate round-trip vectors.
 
 ## First integrated acceptance gate
 
