@@ -131,14 +131,7 @@ impl CacheRegenerationTransaction {
         validate_view(&candidate_view, &document_id)?;
         if let Some(previous) = &previous_view {
             validate_view(previous, &document_id)?;
-            if previous.view_id == candidate_view.view_id
-                || previous.cache_basename == candidate_view.cache_basename
-            {
-                return Err(
-                    "Virtual Spread regeneration requires a new versioned candidate view"
-                        .to_owned(),
-                );
-            }
+            validate_versioned_candidate(previous, &candidate_view)?;
         }
         let phase = if canonical_revision.is_some() {
             CacheRegenerationPhase::AwaitingGeneration
@@ -277,6 +270,7 @@ impl CacheRegenerationTransaction {
         validate_view(&self.candidate_view, &self.document_id)?;
         if let Some(previous) = &self.previous_view {
             validate_view(previous, &self.document_id)?;
+            validate_versioned_candidate(previous, &self.candidate_view)?;
         }
         if let Some(export) = &self.dirty_export {
             let previous = self
@@ -401,6 +395,20 @@ impl CacheRegenerationTransaction {
         }
         Ok(())
     }
+}
+
+fn validate_versioned_candidate(
+    previous: &VirtualSpreadViewEvidence,
+    candidate: &VirtualSpreadViewEvidence,
+) -> Result<(), String> {
+    if previous.view_id == candidate.view_id
+        || previous.cache_basename == candidate.cache_basename
+    {
+        return Err(
+            "Virtual Spread regeneration requires a new versioned candidate view".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_view(view: &VirtualSpreadViewEvidence, document_id: &str) -> Result<(), String> {
@@ -590,6 +598,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("new versioned candidate"));
+    }
+
+    #[test]
+    fn persisted_transaction_rejects_reused_active_cache_identity() {
+        let active = view('a');
+        let mut transaction = CacheRegenerationTransaction::begin_clean(
+            "transaction-5".to_owned(),
+            ORIGINAL.to_owned(),
+            7,
+            vec![142, 143],
+            Some(active.clone()),
+            view('b'),
+        )
+        .unwrap();
+        transaction.candidate_view = active;
+        assert!(transaction
+            .validate_persisted()
+            .unwrap_err()
+            .contains("new versioned candidate"));
     }
 
     #[test]
