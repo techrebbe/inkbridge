@@ -7,13 +7,37 @@ export function parseUserData(userData) {
   }
 }
 
-export function exportedStrokeIdentity(nativeUuid, userData) {
+export function exportedStrokeIdentity(
+  nativeUuid,
+  userData,
+  expectedDocumentId = null,
+) {
   const tagged = parseUserData(userData);
+  if (tagged?.inkBridgeOrigin === 'inkbridge-sync') {
+    if (
+      typeof tagged.sourceUuid !== 'string' ||
+      !tagged.sourceUuid.trim()
+    ) {
+      throw new Error(
+        'A synchronized native stroke has invalid InkBridge identity metadata.',
+      );
+    }
+    return tagged.sourceUuid;
+  }
   if (
-    tagged?.inkBridgeOrigin === 'inkbridge-sync' &&
+    tagged?.inkBridgeOrigin === 'inkbridge-supernote-native' &&
     typeof tagged.sourceUuid === 'string' &&
     tagged.sourceUuid.trim()
   ) {
+    // These identities belong to an immutable original document.  A caller
+    // that has not validated that document must treat the native element as a
+    // new local stroke rather than publishing a foreign canonical identity.
+    if (expectedDocumentId === null) return nativeUuid ?? null;
+    if (tagged.documentId !== expectedDocumentId) {
+      throw new Error(
+        'A native stroke carries InkBridge identity metadata for another document.',
+      );
+    }
     return tagged.sourceUuid;
   }
   return nativeUuid ?? null;

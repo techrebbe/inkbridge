@@ -18,6 +18,7 @@ import {
   requireCompatibleTargetFileName,
   requireSameDocumentPath,
 } from './folderCompanionCore';
+import {manifestToVirtualSpread} from './virtualSpreadAdapterCore';
 
 async function requireResult(promise, label) {
   const response = await promise;
@@ -427,4 +428,17 @@ export async function applyManifest(
 
 export async function applyEmbeddedManifest() {
   return applyManifest(EMBEDDED_MANIFEST);
+}
+
+export async function applyVirtualSpreadManifest(
+  inputManifest,
+  representation,
+  expectedFilePath = null,
+) {
+  const canonical = validateManifest(inputManifest);
+  return applyManifest(
+    manifestToVirtualSpread(canonical, representation),
+    expectedFilePath,
+    true,
+  );
 }

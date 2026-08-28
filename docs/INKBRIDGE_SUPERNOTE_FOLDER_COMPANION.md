@@ -1,6 +1,6 @@
 # InkBridge Supernote folder companion
 
-InkBridge 0.2.0 moves the proven native-stroke export and manifest importer onto the finalized
+InkBridge 0.2.1 moves the proven native-stroke export and manifest importer onto the finalized
 folder contract. The `.snplg` contains its own small native Android bridge; it does not require a
 second companion application, logcat capture, a document-specific plugin package, or changes to the
 actively developed RTL Reader project.
@@ -26,6 +26,12 @@ instead of requiring the BOOX and Supernote filenames to match; filename-only va
 available for older proof exports. Folder-delivered manifests are already bound to the stable ID
 and exact open path, so a later Supernote rename does not invalidate a legitimate update.
 
+For the page-143 Virtual Spread hardware gate, the plugin recognizes only the exact authenticated
+fixture cache basename. It verifies the generated PDF and sidecar bytes, their mapping authority,
+the hidden versioned cache path, and the immutable original document ID before any folder action.
+The original PDF identity and filename—not the derived spread hash or cache name—select the folder.
+This is deliberately fixture-scoped; generic production cache activation remains disabled.
+
 Configure `inkbridge-folder-transport` to use that document directory's `outgoing` and `incoming`
 paths after the whole document directory, including `acknowledged`, is mirrored to the machine
 running the transport. An outgoing Supernote export remains blocked while any delivered manifest
@@ -37,8 +43,11 @@ another private file transport.
 ## Toolbar actions
 
 - **Export InkBridge** reads every native stroke on the current page and publishes one complete
-  page snapshot. It writes and fsyncs a temporary part file before a same-directory rename. An empty
-  page is a valid export, allowing deletion of the final stroke on a page to synchronize. The
+  page snapshot. On the authenticated Virtual Spread fixture it scans the physical spread once,
+  applies the locally-derived inverse transform, and atomically publishes complete snapshots for
+  both represented original pages—including an empty half. It writes and fsyncs a temporary part
+  file before a same-directory rename. An empty page is a valid export, allowing deletion of the
+  final stroke on a page to synchronize. The
   plugin hashes the PDF before collecting native ink and requires the same stable identity when it
   publishes afterward. It refuses to publish if the user switched documents or a mirror replaced
   the same-path PDF during collection. It also refuses to queue a page snapshot while any
@@ -46,9 +55,12 @@ another private file transport.
   newer broker revision. Every snapshot records the exact applied BOOX/Supernote revision pair.
   The transport rejects an older snapshot if a manifest was delivered or applied before upload;
   tapping Export again produces a fresh snapshot at the new frontier.
-  Strokes inserted by InkBridge retain the canonical broker UUID stored in their native user data;
-  the Supernote host-assigned UUID is used only for device-native strokes. This keeps later moves
-  and deletions attached to the same cross-device identity.
+  Strokes inserted by InkBridge retain the canonical broker UUID stored in their native user data.
+  On the first Virtual Spread export, the plugin also persists a document-bound InkBridge tag on
+  each otherwise-untagged native stroke. Later exports therefore retain the first chosen identity
+  even if the Supernote host changes its own UUID after reopening. Unknown third-party `userData`
+  fails closed instead of being overwritten. This keeps later moves and deletions attached to the
+  same cross-device identity.
 - **Apply InkBridge Sync** reads the oldest unacknowledged `*.operations.json`, applies its moves,
   insertions, and deletions through the official Supernote element API, reloads the document, and
   only then publishes a durable acknowledgement. The folder transport prefixes delivered files
@@ -58,7 +70,11 @@ another private file transport.
   delivery; a same-path file replacement therefore fails safely. The acknowledgement records that
   manifest's source revision pair. If mirroring exposes revision N+1 before N, both the local
   transport and plugin leave N+1 untouched and report that the missing predecessor is required.
-  All queue validation and response construction finish before the acknowledgement commit, so a
+  For the authenticated Virtual Spread fixture, original-page canonical samples are transformed
+  onto the correct physical spread page and half before native application. A move between two
+  halves sharing one physical spread replaces the native element without a subsequent delete of
+  the new destination. All queue validation and response construction finish before the
+  acknowledgement commit, so a
   later malformed incoming file cannot turn an already acknowledged update into a false failure.
 - **InkBridge Status** reports `synced`, `pending`, `conflict`, or `error` using the incoming queue,
   durable acknowledgements/failures, and the transport's `inkbridge-status.json` checkpoint. The

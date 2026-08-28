@@ -65,6 +65,7 @@ pub struct BaselinePage {
 }
 
 pub const SUPERNOTE_EXPORT_SCHEMA_VERSION: u32 = 1;
+const LEGACY_SINGLE_PAGE_EXPORT_SCHEMA_VERSION: u32 = 2;
 
 pub const DOCUMENT_BASELINE_SCHEMA_VERSION: u32 = 1;
 
@@ -279,10 +280,10 @@ fn parse_baseline_text(text: &str, source_name: &str) -> Result<BaselineExport, 
     let json = extract_json(text)?;
     let envelope: ExportEnvelope = serde_json::from_str(&json)
         .map_err(|error| format!("invalid baseline JSON in {source_name}: {error}"))?;
-    if envelope
-        .schema_version
-        .is_some_and(|version| version != SUPERNOTE_EXPORT_SCHEMA_VERSION)
-    {
+    if envelope.schema_version.is_some_and(|version| {
+        version != SUPERNOTE_EXPORT_SCHEMA_VERSION
+            && version != LEGACY_SINGLE_PAGE_EXPORT_SCHEMA_VERSION
+    }) {
         return Err(format!(
             "unsupported Supernote export schema {} in {source_name}",
             envelope.schema_version.unwrap_or_default()
@@ -515,6 +516,28 @@ mod tests {
                 supernote: 7,
             })
         );
+    }
+
+    #[test]
+    fn accepts_the_installed_companions_legacy_schema_two_page_export() {
+        let json = r#"{
+            "schemaVersion":2,
+            "sourceFileName":"book.pdf",
+            "pageIndex":0,
+            "strokes":[]
+        }"#;
+        let parsed = parse_baseline_bytes(json.as_bytes(), "page-0001.json").unwrap();
+        assert_eq!(parsed.pages.len(), 1);
+        assert_eq!(parsed.pages[0].page_index, 0);
+        assert!(parsed.pages[0].strokes.is_empty());
+
+        let invalid_batch = r#"{
+            "schemaVersion":2,
+            "pages":[{"pageIndex":0,"strokes":[]}]
+        }"#;
+        assert!(parse_baseline_bytes(invalid_batch.as_bytes(), "batch.json")
+            .unwrap_err()
+            .contains("must declare schemaVersion 1"));
     }
 
     #[test]

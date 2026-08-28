@@ -1,7 +1,10 @@
 import {NativeModules} from 'react-native';
 import {NativeUIUtils, PluginCommAPI} from 'sn-plugin-lib';
-import {collectCurrentSupernotePage} from './App';
-import {applyManifest} from './manifestApply';
+import {
+  collectCurrentSupernotePage,
+  collectCurrentVirtualSpread,
+} from './App';
+import {applyManifest, applyVirtualSpreadManifest} from './manifestApply';
 import {
   describeFolderResult,
   parseNativeJson,
@@ -10,6 +13,10 @@ import {
   requirePluginResult,
   requireSameDocumentId,
 } from './folderCompanionCore';
+import {
+  fixtureForOpenPath,
+  fixtureNativeDescriptor,
+} from './virtualSpreadFixture';
 
 const {InkBridgeFolderModule} = NativeModules;
 
@@ -32,11 +39,31 @@ async function currentFilePath() {
 export async function publishCurrentPageExport() {
   const native = requireNativeModule();
   const filePath = await currentFilePath();
+  const representation = fixtureForOpenPath(filePath);
+  const nativeDescriptor = representation
+    ? fixtureNativeDescriptor(representation)
+    : '';
   const identity = parseNativeJson(
-    await native.getDocumentIdentity(filePath),
+    await native.getDocumentIdentity(filePath, nativeDescriptor),
     'getDocumentIdentity',
   );
-  const collected = await collectCurrentSupernotePage();
+  const collected = representation
+    ? await collectCurrentVirtualSpread(
+        representation,
+        filePath,
+        async () => {
+          const revalidated = parseNativeJson(
+            await native.validateDocumentIdentity(
+              filePath,
+              identity.documentId,
+              nativeDescriptor,
+            ),
+            'validateDocumentIdentity before identity persistence',
+          );
+          requireSameDocumentId(identity.documentId, revalidated.documentId);
+        },
+      )
+    : await collectCurrentSupernotePage(identity.documentId);
   await revalidateCollectedDocument(filePath, async () => collected.filePath);
   await revalidateCollectedDocument(collected.filePath, currentFilePath);
   const result = parseNativeJson(
@@ -44,6 +71,7 @@ export async function publishCurrentPageExport() {
       collected.filePath,
       identity.documentId,
       JSON.stringify(collected.payload),
+      nativeDescriptor,
     ),
     'publishPageExport',
   );
@@ -58,8 +86,12 @@ export async function publishCurrentPageExport() {
 export async function applyNextFolderManifest() {
   const native = requireNativeModule();
   const filePath = await currentFilePath();
+  const representation = fixtureForOpenPath(filePath);
+  const nativeDescriptor = representation
+    ? fixtureNativeDescriptor(representation)
+    : '';
   const delivery = parseNativeJson(
-    await native.loadNextManifest(filePath),
+    await native.loadNextManifest(filePath, nativeDescriptor),
     'loadNextManifest',
   );
   return processManifestDelivery({
@@ -69,12 +101,16 @@ export async function applyNextFolderManifest() {
         await native.validateDocumentIdentity(
           filePath,
           currentDelivery.documentId,
+          nativeDescriptor,
         ),
         'validateDocumentIdentity',
       );
       requireSameDocumentId(currentDelivery.documentId, revalidated.documentId);
     },
-    apply: manifest => applyManifest(manifest, filePath, true),
+    apply: manifest =>
+      representation
+        ? applyVirtualSpreadManifest(manifest, representation, filePath)
+        : applyManifest(manifest, filePath, true),
     acknowledge: async ({deliveryId, manifestId, applied}) =>
       parseNativeJson(
         await native.acknowledgeManifest(
@@ -82,18 +118,31 @@ export async function applyNextFolderManifest() {
           deliveryId,
           manifestId,
           JSON.stringify(applied),
+          nativeDescriptor,
         ),
         'acknowledgeManifest',
       ),
     recordFailure: ({deliveryId, message}) =>
-      native.recordManifestFailure(filePath, deliveryId, message),
+      native.recordManifestFailure(
+        filePath,
+        deliveryId,
+        message,
+        nativeDescriptor,
+      ),
   });
 }
 
 export async function getFolderStatus() {
   const native = requireNativeModule();
   const filePath = await currentFilePath();
-  return parseNativeJson(await native.getStatus(filePath), 'getStatus');
+  const representation = fixtureForOpenPath(filePath);
+  const nativeDescriptor = representation
+    ? fixtureNativeDescriptor(representation)
+    : '';
+  return parseNativeJson(
+    await native.getStatus(filePath, nativeDescriptor),
+    'getStatus',
+  );
 }
 
 export async function showFolderResult(result) {

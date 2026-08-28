@@ -32,6 +32,14 @@ pub struct CompanionStatus {
     #[serde(default, skip_serializing_if = "is_false")]
     pub supernote_delivery_pending: bool,
     pub supernote_accepted_content_sha256: BTreeSet<String>,
+    /// Hashes of the exact native export bytes accepted by the broker.
+    ///
+    /// `supernote_accepted_content_sha256` identifies the possibly rebased
+    /// broker payload retained as a baseline.  The companion needs this
+    /// source-view hash set before it can safely replace a same-page outgoing
+    /// file during an ordinary-PDF/Virtual-Spread representation switch.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub supernote_accepted_source_view_sha256: BTreeSet<String>,
     pub conflict_count: usize,
     pub updated_at_unix_millis: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +74,11 @@ impl CompanionStatus {
         } else {
             CompanionSyncStatus::Synced
         };
+        let pending_source_view = current
+            .supernote
+            .pending
+            .as_ref()
+            .map(|pending| pending.local_content_sha256.as_str());
         Ok(Self {
             schema_version: COMPANION_STATUS_SCHEMA_VERSION,
             document_id: document.document_id.clone(),
@@ -78,6 +91,13 @@ impl CompanionStatus {
                 .supernote
                 .accepted_local_hashes
                 .values()
+                .cloned()
+                .collect(),
+            supernote_accepted_source_view_sha256: current
+                .supernote
+                .uploaded_local_hashes
+                .values()
+                .filter(|hash| Some(hash.as_str()) != pending_source_view)
                 .cloned()
                 .collect(),
             conflict_count: current.conflicts.len(),
@@ -226,6 +246,12 @@ mod tests {
             DocumentTransportState {
                 supernote: SideTransportState {
                     pending: Some(pending()),
+                    uploaded_local_hashes: [
+                        ("accepted-page.json".to_owned(), "d".repeat(64)),
+                        ("pending-page.json".to_owned(), "a".repeat(64)),
+                    ]
+                    .into_iter()
+                    .collect(),
                     accepted_local_hashes: [("page-0001.json".to_owned(), "c".repeat(64))]
                         .into_iter()
                         .collect(),
@@ -241,6 +267,10 @@ mod tests {
             pending.supernote_accepted_content_sha256,
             ["c".repeat(64)].into_iter().collect()
         );
+        assert_eq!(
+            pending.supernote_accepted_source_view_sha256,
+            ["d".repeat(64)].into_iter().collect()
+        );
 
         state
             .documents
@@ -250,6 +280,10 @@ mod tests {
             .pending = None;
         let synced = CompanionStatus::from_state(&document, &state, now, None).unwrap();
         assert_eq!(synced.status, CompanionSyncStatus::Synced);
+        assert_eq!(
+            synced.supernote_accepted_source_view_sha256,
+            ["a".repeat(64), "d".repeat(64)].into_iter().collect()
+        );
 
         state
             .documents

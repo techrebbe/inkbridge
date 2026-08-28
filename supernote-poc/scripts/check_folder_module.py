@@ -28,6 +28,7 @@ def main() -> None:
         encoding="utf-8"
     )
     companion = (root / "overlay" / "folderCompanion.js").read_text(encoding="utf-8")
+    app = (root / "overlay" / "App.js").read_text(encoding="utf-8")
     index = (root / "overlay" / "index.js").read_text(encoding="utf-8")
     build_script = (root / "build.sh").read_text(encoding="utf-8")
 
@@ -46,7 +47,7 @@ def main() -> None:
     )
     ordered(
         companion,
-        ["getDocumentIdentity(filePath)", "collectCurrentSupernotePage()", "publishPageExport("],
+        ["getDocumentIdentity(", "const collected = representation", "publishPageExport("],
         "hash-before-collect-before-publish",
     )
     ordered(
@@ -78,7 +79,7 @@ def main() -> None:
         "Executors.newSingleThreadExecutor",
         "FileInputStream(pdf).use",
         'payload.put("documentId", context.documentId)',
-        'value.optJSONArray("supernoteAcceptedContentSha256")',
+        'checkpointHashes(value, "supernoteAcceptedContentSha256")',
         "recordNativeFailure(",
         "reconcileFailureRecords(context, liveDeliveryIds)",
         "regularFiles(context.incoming).sortedBy { it.name }",
@@ -97,6 +98,20 @@ def main() -> None:
         "fun getDocumentIdentity(",
         "The PDF bytes changed while this page's native ink was collected",
         "Transport checkpoint ${file.name} is incomplete or invalid",
+        "validateRepresentation(pdf, it)",
+        "Virtual Spread PDF bytes changed after verification",
+        "Virtual Spread sidecar bytes changed after verification",
+        "inkBridgeDirectory.parentFile?.canonicalFile == sharedStorageRoot",
+        'sidecarJson.optString("schema") == "techrebbe.supernote.virtual-spread/v3"',
+        'File(context.outgoing, "spread-pages-$suffix.json")',
+        "acceptedSupernoteSourceViewHashes(context)",
+        'checkpointHashes(checkpoint, "supernoteAcceptedContentSha256")',
+        'checkpointHashes(value, "supernoteAcceptedSourceViewSha256")',
+        "val overlappingExports = outgoingPageFiles(context)",
+        "outgoingExportPages(existing).any(representedPageSet::contains)",
+        "existingHash != sourceViewHash",
+        "allow it to finish before switching document representations",
+        "Could not retire superseded native export",
     ):
         if required not in module:
             fail(f"native module is missing required invariant: {required}")
@@ -117,6 +132,32 @@ def main() -> None:
     ):
         if required not in index:
             fail(f"embedded-manifest regression action is missing: {required}")
+    for required in (
+        "collectCurrentVirtualSpread(",
+        "validateDocumentIdentity before identity persistence",
+        "applyVirtualSpreadManifest(manifest, representation, filePath)",
+        "fixtureNativeDescriptor(representation)",
+    ):
+        if required not in companion:
+            fail(f"Virtual Spread folder integration is missing: {required}")
+    for required in (
+        'cp "$ROOT/overlay/virtualSpreadAdapterCore.js"',
+        'cp "$ROOT/overlay/virtualSpreadFixture.js"',
+    ):
+        if required not in build_script:
+            fail(f"Virtual Spread package input is missing: {required}")
+    ordered(
+        app,
+        [
+            "collectCurrentVirtualSpread(",
+            "requireSameDocumentPath(expectedFilePath, filePath)",
+            "getCurrentFilePath before identity persistence",
+            "await revalidateDocumentIdentity()",
+            "getCurrentFilePath after identity validation",
+            "persist InkBridge stroke identities",
+        ],
+        "Virtual Spread identity persistence document revalidation",
+    )
     print("InkBridge native folder invariants passed")
 
 

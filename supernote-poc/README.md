@@ -1,11 +1,17 @@
 # InkBridge Supernote native folder plugin
 
-Version 0.2.0 turns the proven native-stroke proof into the Supernote endpoint for the finalized
+Version 0.2.1 turns the proven native-stroke proof into the Supernote endpoint for the finalized
 folder transport. **Export InkBridge** atomically writes the current page snapshot, **Apply
 InkBridge Sync** applies the next incoming manifest and durably acknowledges it, and **InkBridge
 Status** reports synced, pending, conflict, or error. No logcat capture or document-specific plugin
 package is required. See
 [`../docs/INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md`](../docs/INKBRIDGE_SUPERNOTE_FOLDER_COMPANION.md).
+
+The normal package also contains a deliberately fixture-scoped Virtual Spread gate. When the exact
+authenticated page-143 cache is open, Export scans both source-page halves atomically in original
+PDF coordinates and Apply maps canonical operations back to the correct native half. All other
+documents continue through the ordinary-PDF path. Generic Virtual Spread activation is not yet
+enabled.
 
 The earlier hardware proofs and repair-build notes are retained below as the evidence behind the
 current converter and native manifest application.
@@ -35,7 +41,7 @@ current converter and native manifest application.
 The page payload also includes the source filename, page index and page pixel size.
 
 The legacy `exportCurrentSupernotePage()` helper can still emit numbered `INKBRIDGE_EXPORT` logcat
-chunks for regression diagnosis. The installed 0.2.0 toolbar uses the packaged, fail-closed native
+chunks for regression diagnosis. The installed 0.2.1 toolbar uses the packaged, fail-closed native
 folder module instead.
 
 The exported Supernote UUID is carried into the PDF annotation `/NM` identity. NeoReader preserved those values while editing imported `/Ink`, allowing the returned PDF to be matched back to the original Supernote elements.

@@ -7,7 +7,9 @@ import {
 } from 'sn-plugin-lib';
 import {BOOX_NATIVE_STROKE_FIXTURE} from './booxFixture';
 import {BOOX_RETURN_FIXTURE} from './booxReturnFixture';
+import {requireSameDocumentPath} from './folderCompanionCore';
 import {exportedStrokeIdentity} from './manifestCore';
+import {buildVirtualSpreadSnapshot} from './virtualSpreadAdapterCore';
 
 const OFFSET_X_PX = 80;
 const OFFSET_Y_PX = 50;
@@ -318,7 +320,13 @@ export async function applyBooxReturnTest() {
   };
 }
 
-async function serializeSupernoteStroke(source, elementIndex, pageSize, page) {
+async function serializeSupernoteStroke(
+  source,
+  elementIndex,
+  pageSize,
+  page,
+  expectedDocumentId = null,
+) {
   const pointCount = await source.stroke.points.size();
   if (!pointCount) return null;
 
@@ -342,7 +350,11 @@ async function serializeSupernoteStroke(source, elementIndex, pageSize, page) {
     ];
   });
 
-  const sourceUuid = exportedStrokeIdentity(source.uuid, source.userData);
+  const sourceUuid = exportedStrokeIdentity(
+    source.uuid,
+    source.userData,
+    expectedDocumentId,
+  );
   return {
     sourceUuid,
     sourceKey: sourceUuid ?? `supernote-page-${page}-element-${elementIndex}`,
@@ -356,7 +368,7 @@ async function serializeSupernoteStroke(source, elementIndex, pageSize, page) {
   };
 }
 
-export async function collectCurrentSupernotePage() {
+export async function collectCurrentSupernotePage(expectedDocumentId = null) {
   const {filePath, page, pageSize} = await currentDocumentContext();
   const elements = await requireResult(
     PluginFileAPI.getElements(page, filePath),
@@ -369,7 +381,13 @@ export async function collectCurrentSupernotePage() {
   const strokes = [];
   let totalSamples = 0;
   for (const {element, elementIndex} of nativeStrokes) {
-    const serialized = await serializeSupernoteStroke(element, elementIndex, pageSize, page);
+    const serialized = await serializeSupernoteStroke(
+      element,
+      elementIndex,
+      pageSize,
+      page,
+      expectedDocumentId,
+    );
     if (serialized) {
       totalSamples += serialized.samples.length;
       strokes.push(serialized);
@@ -394,6 +412,119 @@ export async function collectCurrentSupernotePage() {
     payload,
     page,
     strokeCount: strokes.length,
+    sampleCount: totalSamples,
+  };
+}
+
+export async function collectCurrentVirtualSpread(
+  representation,
+  expectedFilePath = null,
+  revalidateDocumentIdentity = null,
+) {
+  const {filePath, page, pageSize} = await currentDocumentContext();
+  requireSameDocumentPath(expectedFilePath, filePath);
+  const elements = await requireResult(
+    PluginFileAPI.getElements(page, filePath),
+    'getElements',
+  );
+  const nativeStrokes = (elements ?? [])
+    .map((element, elementIndex) => ({element, elementIndex}))
+    .filter(({element}) => element?.type === 0 && element?.stroke);
+  const strokes = [];
+  const identityTags = [];
+  let totalSamples = 0;
+  for (const {element, elementIndex} of nativeStrokes) {
+    const retained = parseUserData(element.userData);
+    if (retained?.inkBridgeOrigin === 'inkbridge-supernote-native') {
+      if (
+        retained.documentId !== representation.documentId ||
+        typeof retained.sourceUuid !== 'string' ||
+        !retained.sourceUuid.trim()
+      ) {
+        throw new Error(
+          'A native stroke carries InkBridge identity metadata for another document.',
+        );
+      }
+    } else if (retained?.inkBridgeOrigin === 'inkbridge-sync') {
+      if (
+        typeof retained.sourceUuid !== 'string' ||
+        !retained.sourceUuid.trim()
+      ) {
+        throw new Error(
+          'A synchronized native stroke has invalid InkBridge identity metadata.',
+        );
+      }
+    } else {
+      if (element.userData) {
+        throw new Error(
+          'A native stroke has non-InkBridge metadata, so InkBridge cannot safely assign it a stable identity.',
+        );
+      }
+      if (typeof element.uuid !== 'string' || !element.uuid.trim()) {
+        throw new Error(
+          'A native stroke has no UUID that InkBridge can persist as its stable identity.',
+        );
+      }
+      element.userData = JSON.stringify({
+        inkBridgeOrigin: 'inkbridge-supernote-native',
+        sourceUuid: element.uuid,
+        documentId: representation.documentId,
+      });
+      identityTags.push(element);
+    }
+    const serialized = await serializeSupernoteStroke(
+      element,
+      elementIndex,
+      pageSize,
+      page,
+      representation.documentId,
+    );
+    if (serialized) {
+      totalSamples += serialized.samples.length;
+      strokes.push(serialized);
+    }
+  }
+  if (identityTags.length) {
+    if (typeof revalidateDocumentIdentity !== 'function') {
+      throw new Error(
+        'InkBridge cannot persist stable stroke identities without revalidating the original document.',
+      );
+    }
+    const currentBeforeIdentityWrite = await requireResult(
+      PluginCommAPI.getCurrentFilePath(),
+      'getCurrentFilePath before identity persistence',
+    );
+    requireSameDocumentPath(filePath, currentBeforeIdentityWrite);
+    await revalidateDocumentIdentity();
+    const currentAfterIdentityValidation = await requireResult(
+      PluginCommAPI.getCurrentFilePath(),
+      'getCurrentFilePath after identity validation',
+    );
+    requireSameDocumentPath(filePath, currentAfterIdentityValidation);
+    await requireResult(
+      PluginFileAPI.modifyElements(filePath, page, identityTags),
+      'persist InkBridge stroke identities',
+    );
+  }
+  const pages = buildVirtualSpreadSnapshot({
+    representation,
+    virtualPageIndex: page,
+    nativePageSize: pageSize,
+    strokes,
+  });
+  return {
+    filePath,
+    payload: {
+      schemaVersion: 1,
+      sourceFileName: representation.sourceFileName,
+      pages,
+    },
+    page,
+    representedPageIndices: pages.map(snapshot => snapshot.pageIndex),
+    strokeCount: pages.reduce(
+      (count, snapshot) => count + snapshot.strokes.length,
+      0,
+    ),
     sampleCount: totalSamples,
   };
 }

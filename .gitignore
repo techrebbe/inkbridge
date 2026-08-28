@@ -59,6 +59,7 @@ keystore.properties
 # Build outputs
 *.aab
 outputs/
+supernote-poc/out/
 
 # ───────────────────────────────────────────────────────────────
 # OS / editor / logs

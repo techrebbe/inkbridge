@@ -1,0 +1,352 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import test from 'node:test';
+import {fileURLToPath} from 'node:url';
+import {
+  buildVirtualSpreadSnapshot,
+  canonicalPointToSpread,
+  manifestToVirtualSpread,
+  spreadPointToCanonical,
+  validateVirtualSpreadRepresentation,
+} from '../overlay/virtualSpreadAdapterCore.js';
+import {
+  fixtureForOpenPath,
+  fixtureNativeDescriptor,
+  PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+} from '../overlay/virtualSpreadFixture.js';
+
+const fixtureRoot = fileURLToPath(
+  new URL('../../inkbridge-convert/tests/fixtures/virtual-spread/page-143-v1/', import.meta.url),
+);
+const sidecar = JSON.parse(
+  readFileSync(`${fixtureRoot}/page-143-virtual-spread-v1.pdf.json`, 'utf8'),
+);
+const artifacts = JSON.parse(
+  readFileSync(`${fixtureRoot}/page-143-artifacts-v1.json`, 'utf8'),
+);
+
+function close(left, right, tolerance = 1e-12) {
+  assert.ok(
+    Math.abs(left - right) <= tolerance,
+    `${left} differs from ${right} by more than ${tolerance}`,
+  );
+}
+
+const style = {layerNum: 0, thickness: 400, penColor: 0, penType: 16};
+const nativePageSize = {width: 1404, height: 1872};
+
+test('embedded hardware-gate descriptor is pinned to the normative real fixture', () => {
+  const fixture = validateVirtualSpreadRepresentation(
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+  );
+  assert.equal(fixture.documentId, sidecar.source.documentId);
+  assert.equal(fixture.viewId, sidecar.output.viewId);
+  assert.equal(fixture.cacheBasename, sidecar.output.cacheBasename);
+  assert.equal(fixture.generatedPdfSha256, artifacts.output.sha256);
+  assert.equal(fixture.sidecarSha256, artifacts.output.sidecarSha256);
+  assert.equal(fixture.mappingAuthoritySha256, sidecar.output.mappingAuthoritySha256);
+  assert.equal(fixture.sourceFileName, sidecar.source.name);
+  assert.deepEqual(fixture.spreadSize, sidecar.output.spreadSize);
+  assert.deepEqual(
+    fixture.mappings,
+    sidecar.sourcePages.map(mapping => ({
+      sourcePageIndex: mapping.sourcePageIndex,
+      virtualPageIndex: mapping.virtualPageIndex,
+      side: mapping.side,
+      sourceRotation: mapping.sourceRotation,
+      sourceBox: mapping.sourceBox,
+      destination: mapping.destination,
+      transform: mapping.transform,
+    })),
+  );
+  assert.equal(
+    fixtureForOpenPath(`/storage/cache/${fixture.cacheBasename}`),
+    fixture,
+  );
+  assert.equal(fixtureForOpenPath('/storage/cache/ordinary.pdf'), null);
+  assert.deepEqual(JSON.parse(fixtureNativeDescriptor()), {
+    schemaVersion: 1,
+    documentId: fixture.documentId,
+    viewId: fixture.viewId,
+    cacheBasename: fixture.cacheBasename,
+    generatedPdfSha256: fixture.generatedPdfSha256,
+    sidecarSha256: fixture.sidecarSha256,
+    mappingAuthoritySha256: fixture.mappingAuthoritySha256,
+    sourceFileName: fixture.sourceFileName,
+    sourcePageCount: fixture.sourcePageCount,
+  });
+});
+
+test('page-143 exact point and stroke vectors round trip through the local inverse', () => {
+  const mapping = PAGE_143_VIRTUAL_SPREAD_FIXTURE.mappings[2];
+  for (const vector of artifacts.pointRoundTrips) {
+    const spread = canonicalPointToSpread(mapping, vector.normalized);
+    close(spread[0], vector.spread[0]);
+    close(spread[1], vector.spread[1]);
+    const recovered = spreadPointToCanonical(mapping, vector.spread);
+    close(recovered[0], vector.normalizedAfterInverse[0]);
+    close(recovered[1], vector.normalizedAfterInverse[1]);
+  }
+  artifacts.strokeRoundTrip.normalized.forEach((point, index) => {
+    const spread = canonicalPointToSpread(mapping, point);
+    close(spread[0], artifacts.strokeRoundTrip.spread[index][0]);
+    close(spread[1], artifacts.strokeRoundTrip.spread[index][1]);
+    const recovered = spreadPointToCanonical(
+      mapping,
+      artifacts.strokeRoundTrip.spread[index],
+    );
+    close(recovered[0], artifacts.strokeRoundTrip.normalizedAfterInverse[index][0]);
+    close(recovered[1], artifacts.strokeRoundTrip.normalizedAfterInverse[index][1]);
+  });
+});
+
+test('one native spread scan produces two complete original-page snapshots', () => {
+  const samples = artifacts.strokeRoundTrip.spread.map(([x, y], index) => [
+    x / PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[0],
+    1 - y / PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[1],
+    1000 + index,
+  ]);
+  const pages = buildVirtualSpreadSnapshot({
+    representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    virtualPageIndex: 1,
+    nativePageSize,
+    strokes: [
+      {
+        sourceUuid: 'page-143-stroke',
+        sourceKey: 'page-143-stroke',
+        layerNum: 0,
+        thickness: 400,
+        penColor: 0,
+        penType: 16,
+        samples,
+      },
+    ],
+  });
+  assert.deepEqual(pages.map(page => page.pageIndex), [1, 2]);
+  assert.deepEqual(pages[0].strokes, []);
+  assert.equal(pages[1].strokes[0].sourceUuid, 'page-143-stroke');
+  pages[1].strokes[0].samples.forEach((sample, index) => {
+    close(sample[0], artifacts.strokeRoundTrip.normalizedAfterInverse[index][0]);
+    close(sample[1], artifacts.strokeRoundTrip.normalizedAfterInverse[index][1]);
+    assert.equal(sample[2], 1000 + index);
+  });
+});
+
+test('canonical upserts and tombstones target the correct native spread page and half', () => {
+  const canonicalSamples = artifacts.strokeRoundTrip.normalized.map(([x, y], index) => [
+    x,
+    y,
+    1200 + index,
+  ]);
+  const snapshot = {
+    sourceUuid: 'gate-stroke',
+    origin: 'supernote-native',
+    pageIndex: 2,
+    nativeStyle: style,
+    samples: canonicalSamples,
+    geometryFingerprint: 'canonical-fingerprint',
+  };
+  const transformed = manifestToVirtualSpread(
+    {
+      schemaVersion: 1,
+      manifestId: 'page-143-hardware-gate',
+      coordinateTransform: {pdfToSupernoteNormalizedYOffset: -0.0008},
+      operations: [
+        {
+          type: 'upsert_stroke',
+          sourceUuid: 'gate-stroke',
+          pageIndex: 2,
+          before: null,
+          after: snapshot,
+        },
+        {
+          type: 'delete_stroke',
+          sourceUuid: 'deleted-stroke',
+          pageIndex: 2,
+          before: snapshot,
+          after: null,
+        },
+      ],
+    },
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+  );
+  assert.equal(transformed.coordinateTransform.pdfToSupernoteNormalizedYOffset, 0);
+  assert.deepEqual(transformed.operations.map(operation => operation.pageIndex), [1, 1]);
+  const native = transformed.operations[0].after;
+  native.samples.forEach((sample, index) => {
+    close(
+      sample[0],
+      artifacts.strokeRoundTrip.spread[index][0] /
+        PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[0],
+    );
+    close(
+      sample[1],
+      1 -
+        artifacts.strokeRoundTrip.spread[index][1] /
+          PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[1],
+    );
+    assert.equal(sample[2], 1200 + index);
+  });
+  assert.notEqual(native.geometryFingerprint, 'canonical-fingerprint');
+  assert.equal(transformed.operations[1].after, null);
+  assert.equal(transformed.operations[1].before.pageIndex, 1);
+});
+
+test('a cross-half move does not delete its destination when both halves share one native page', () => {
+  const snapshot = {
+    sourceUuid: 'cross-half',
+    origin: 'supernote-native',
+    pageIndex: 2,
+    nativeStyle: style,
+    samples: [
+      [0.1, 0.2, 1000],
+      [0.2, 0.3, 1100],
+    ],
+    geometryFingerprint: 'after',
+  };
+  const transformed = manifestToVirtualSpread(
+    {
+      schemaVersion: 1,
+      manifestId: 'cross-half-move',
+      operations: [
+        {
+          type: 'upsert_stroke',
+          sourceUuid: 'cross-half',
+          pageIndex: 2,
+          before: null,
+          after: snapshot,
+        },
+        {
+          type: 'delete_stroke',
+          sourceUuid: 'cross-half',
+          pageIndex: 1,
+          before: {...snapshot, pageIndex: 1, geometryFingerprint: 'before'},
+          after: null,
+        },
+      ],
+    },
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+  );
+  assert.equal(transformed.operations.length, 1);
+  assert.equal(transformed.operations[0].type, 'upsert_stroke');
+  assert.equal(transformed.operations[0].pageIndex, 1);
+  assert.ok(transformed.operations[0].before);
+  assert.equal(transformed.operations[0].before.pageIndex, 1);
+  const sourceMapping = PAGE_143_VIRTUAL_SPREAD_FIXTURE.mappings.find(
+    mapping => mapping.sourcePageIndex === 1,
+  );
+  const expectedSource = canonicalPointToSpread(sourceMapping, [0.1, 0.2]);
+  close(
+    transformed.operations[0].before.samples[0][0],
+    expectedSource[0] / PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[0],
+  );
+  close(
+    transformed.operations[0].before.samples[0][1],
+    1 - expectedSource[1] / PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[1],
+  );
+  assert.notEqual(
+    transformed.operations[0].before.geometryFingerprint,
+    'before',
+  );
+});
+
+test('strokes in the gutter or crossing source halves fail closed', () => {
+  const base = {
+    sourceUuid: 'bad-stroke',
+    sourceKey: 'bad-stroke',
+    layerNum: 0,
+    thickness: 400,
+    penColor: 0,
+    penType: 16,
+  };
+  assert.throws(
+    () =>
+      buildVirtualSpreadSnapshot({
+        representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        virtualPageIndex: 1,
+        nativePageSize,
+        strokes: [{...base, samples: [[0.25, 0.05, 1000], [0.3, 0.06, 1000]]}],
+      }),
+    /margin/,
+  );
+  assert.throws(
+    () =>
+      buildVirtualSpreadSnapshot({
+        representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        virtualPageIndex: 1,
+        nativePageSize,
+        strokes: [{...base, samples: [[0.25, 0.5, 1000], [0.75, 0.5, 1000]]}],
+      }),
+    /boundary/,
+  );
+});
+
+test('native pixel drift at a source-page edge snaps back without changing halves', () => {
+  const mapping = PAGE_143_VIRTUAL_SPREAD_FIXTURE.mappings.find(
+    candidate => candidate.sourcePageIndex === 2,
+  );
+  const canonical = [
+    [1, 0.2],
+    [0.9, 0.3],
+  ];
+  const nativeSamples = canonical.map(([x, y], index) => {
+    const [spreadX, spreadY] = canonicalPointToSpread(mapping, [x, y]);
+    return [
+      spreadX / PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[0] +
+        (index === 0 ? 0.5 / (nativePageSize.width - 1) : 0),
+      1 - spreadY / PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[1],
+      1000 + index,
+    ];
+  });
+  const pages = buildVirtualSpreadSnapshot({
+    representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    virtualPageIndex: 1,
+    nativePageSize,
+    strokes: [
+      {
+        sourceUuid: 'edge-stroke',
+        sourceKey: 'edge-stroke',
+        layerNum: 0,
+        thickness: 400,
+        penColor: 0,
+        penType: 16,
+        samples: nativeSamples,
+      },
+    ],
+  });
+  const exported = pages.find(page => page.pageIndex === 2).strokes[0];
+  assert.equal(exported.sourceUuid, 'edge-stroke');
+  close(exported.samples[0][0], 1);
+  close(exported.samples[0][1], 0.2);
+  close(exported.samples[1][0], 0.9);
+  close(exported.samples[1][1], 0.3);
+});
+
+test('a stroke wholly on the shared seam remains ambiguous and fails closed', () => {
+  const base = {
+    sourceUuid: 'seam-stroke',
+    sourceKey: 'seam-stroke',
+    layerNum: 0,
+    thickness: 400,
+    penColor: 0,
+    penType: 16,
+  };
+  assert.throws(
+    () =>
+      buildVirtualSpreadSnapshot({
+        representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        virtualPageIndex: 1,
+        nativePageSize,
+        strokes: [
+          {
+            ...base,
+            samples: [
+              [0.5, 0.4, 1000],
+              [0.5, 0.5, 1001],
+            ],
+          },
+        ],
+      }),
+    /ambiguous/,
+  );
+});

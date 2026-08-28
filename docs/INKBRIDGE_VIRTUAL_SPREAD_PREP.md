@@ -125,9 +125,20 @@ hydration from one canonical revision, verification, rollback evidence, persiste
 The `.mark` itself is still represented by content-hash evidence; production native hydration is
 the next shared hardware gate.
 
+### Fixture-scoped native adapter
+
+The Supernote plugin now packages an exact-fixture adapter for the first integrated hardware gate.
+It accepts only the authenticated page-143 cache pair at its hidden versioned path. One native
+spread scan exports both represented original pages in one folder artifact, using the locally
+derived inverse. Incoming canonical operations use the authoritative forward mapping to target the
+correct physical page and half. Canonical identity is persisted into untagged native strokes on
+their first export so reopen/move/delete tests do not depend on a host UUID remaining stable.
+
+This adapter is not a general production activation path. Its embedded representation is pinned to
+the normative fixture and production activation remains false.
+
 ## Remaining shared-gate work
 
-- transforming real native Supernote element samples into original-page snapshots;
 - importing complete canonical state into a replacement `.mark`; and
 - automatic dirty-cache checkpoint, regeneration, activation, and rollback.
 

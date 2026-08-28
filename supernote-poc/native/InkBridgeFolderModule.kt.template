@@ -8,6 +8,7 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
@@ -32,8 +33,15 @@ class InkBridgeFolderModule(
         private const val ACK_SCHEMA_VERSION = 1
         private const val MAX_EXPORT_BYTES = 32 * 1024 * 1024
         private const val MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+        private const val MAX_REPRESENTATION_SIDECAR_BYTES = 2 * 1024 * 1024
         private const val ROOT_DIRECTORY = "EXPORT/InkBridge/Supernote_Folder"
         private val DELIVERY_ID = Regex("^[0-9a-f]{64}$")
+        private val DOCUMENT_ID = Regex("^inkbridge-doc-v1-[0-9a-f]{64}$")
+        private val VIEW_ID = Regex("^inkbridge-view-v1-[0-9a-f]{64}$")
+        private val SINGLE_PAGE_EXPORT = Regex("^page-([0-9]+)\\.json$")
+        private val SPREAD_PAGE_EXPORT = Regex(
+            "^spread-pages-([0-9]+(?:-[0-9]+)+)\\.json$",
+        )
         private val ORDERED_MANIFEST = Regex(
             "^r([0-9]{20})-r([0-9]{20})-g([0-9]{20})-.+\\.operations\\.json$",
         )
@@ -42,11 +50,24 @@ class InkBridgeFolderModule(
     private data class DocumentContext(
         val pdf: File,
         val documentId: String,
+        val sourceFileName: String,
+        val sourcePageCount: Int?,
         val directory: File,
         val outgoing: File,
         val incoming: File,
         val acknowledged: File,
         val failures: File,
+    )
+
+    private data class RepresentationDescriptor(
+        val documentId: String,
+        val viewId: String,
+        val cacheBasename: String,
+        val generatedPdfSha256: String,
+        val sidecarSha256: String,
+        val mappingAuthoritySha256: String,
+        val sourceFileName: String,
+        val sourcePageCount: Int,
     )
 
     private data class PendingManifest(
@@ -88,13 +109,14 @@ class InkBridgeFolderModule(
         filePath: String,
         expectedDocumentId: String,
         payloadJson: String,
+        representationJson: String,
         promise: Promise,
     ) {
         onWorker(promise, "INKBRIDGE_EXPORT_FAILED") {
             require(expectedDocumentId.startsWith(DOCUMENT_ID_PREFIX)) {
                 "Invalid expected InkBridge document ID"
             }
-            val context = documentContext(filePath)
+            val context = documentContext(filePath, representationJson)
             require(context.documentId == expectedDocumentId) {
                 "The PDF bytes changed while this page's native ink was collected; reopen the intended document and export again"
             }
@@ -106,33 +128,99 @@ class InkBridgeFolderModule(
                 "Native page export exceeds $MAX_EXPORT_BYTES bytes"
             }
             val payload = JSONObject(payloadJson)
-            require(payload.optInt("schemaVersion", -1) == EXPORT_SCHEMA_VERSION) {
+            require(payload.optInt("schemaVersion", -1) in setOf(1, EXPORT_SCHEMA_VERSION)) {
                 "Unsupported Supernote export schema"
             }
-            require(payload.optString("sourceFileName") == context.pdf.name) {
-                "Export targets ${payload.optString("sourceFileName")}, not ${context.pdf.name}"
+            require(payload.optString("sourceFileName") == context.sourceFileName) {
+                "Export targets ${payload.optString("sourceFileName")}, not ${context.sourceFileName}"
             }
             val pageIndex = payload.optInt("pageIndex", -1)
-            require(pageIndex >= 0) { "Export has no valid pageIndex" }
-            val strokes = payload.optJSONArray("strokes")
-                ?: throw IllegalArgumentException("Export has no strokes array")
+            val legacyStrokes = payload.optJSONArray("strokes")
+            val pages = payload.optJSONArray("pages")
+            val representedPages = mutableListOf<Int>()
+            var strokeCount = 0
+            if (pageIndex >= 0 || legacyStrokes != null) {
+                require(pageIndex >= 0 && legacyStrokes != null && pages == null) {
+                    "Legacy export must provide pageIndex and strokes together"
+                }
+                representedPages += pageIndex
+                strokeCount = legacyStrokes.length()
+            } else {
+                require(payload.optInt("schemaVersion", -1) == 1 && pages != null && pages.length() > 0) {
+                    "Atomic Virtual Spread export has no pages"
+                }
+                var previous = -1
+                for (index in 0 until pages.length()) {
+                    val page = pages.optJSONObject(index)
+                        ?: throw IllegalArgumentException("Virtual Spread page snapshot is not an object")
+                    val sourcePageIndex = page.optInt("pageIndex", -1)
+                    require(sourcePageIndex > previous) {
+                        "Virtual Spread page indices must be nonnegative, unique, and sorted"
+                    }
+                    val strokes = page.optJSONArray("strokes")
+                        ?: throw IllegalArgumentException("Virtual Spread page has no strokes array")
+                    representedPages += sourcePageIndex
+                    strokeCount += strokes.length()
+                    previous = sourcePageIndex
+                }
+            }
+            require(
+                representedPages.all { page ->
+                    page >= 0 &&
+                        (context.sourcePageCount == null || page < context.sourcePageCount)
+                },
+            ) {
+                "Export references a page outside the immutable original"
+            }
             payload.put("documentId", context.documentId)
             payload.put("basedOn", exportRevisionFrontier(context).toJson())
             val bytes = payload.toString().toByteArray(StandardCharsets.UTF_8)
             require(bytes.size <= MAX_EXPORT_BYTES) {
                 "Final native page export exceeds $MAX_EXPORT_BYTES bytes"
             }
-            val destination = File(context.outgoing, "page-%04d.json".format(pageIndex + 1))
-            atomicWrite(destination, appendNewline(bytes))
+            val destination = if (representedPages.size == 1) {
+                File(context.outgoing, "page-%04d.json".format(representedPages.single() + 1))
+            } else {
+                val suffix = representedPages.joinToString("-") { "%04d".format(it + 1) }
+                File(context.outgoing, "spread-pages-$suffix.json")
+            }
+            val representedPageSet = representedPages.toSet()
+            val overlappingExports = outgoingPageFiles(context).filter { existing ->
+                outgoingExportPages(existing).any(representedPageSet::contains)
+            }
+            val finalBytes = appendNewline(bytes)
+            val sourceViewHash = sha256(finalBytes)
+            val acceptedSourceViewHashes = acceptedSupernoteSourceViewHashes(context)
+            val unacceptedSuperseded = overlappingExports.filter { existing ->
+                val existingHash = sha256(readBytes(existing, MAX_EXPORT_BYTES))
+                existingHash != sourceViewHash && existingHash !in acceptedSourceViewHashes
+            }
+            require(unacceptedSuperseded.isEmpty()) {
+                "A prior export for the same original page(s) is still waiting for sync; allow it to finish before switching document representations"
+            }
+            atomicWrite(destination, finalBytes)
+            val supersededExports = overlappingExports.filter { existing ->
+                existing.absolutePath != destination.absolutePath
+            }
+            var retiredSuperseded = false
+            for (superseded in supersededExports) {
+                check(superseded.delete()) {
+                    "Could not retire superseded native export ${superseded.name}"
+                }
+                retiredSuperseded = true
+            }
+            if (retiredSuperseded) syncDirectory(context.outgoing)
             Log.i(
                 LOG_TAG,
-                "INKBRIDGE_FOLDER_EXPORT document=${context.documentId} page=${pageIndex + 1} strokes=${strokes.length()} path=${destination.absolutePath}",
+                "INKBRIDGE_FOLDER_EXPORT document=${context.documentId} pages=${representedPages.joinToString(",") { (it + 1).toString() }} strokes=$strokeCount path=${destination.absolutePath}",
             )
             JSONObject()
                 .put("status", "pending")
                 .put("documentId", context.documentId)
-                .put("pageIndex", pageIndex)
-                .put("strokeCount", strokes.length())
+                .put("pageIndex", representedPages.first())
+                .put("representedPageCount", representedPages.size)
+                .put("representedPageIndices", JSONArray(representedPages))
+                .put("strokeCount", strokeCount)
                 .put("outgoingPath", destination.absolutePath)
                 .put("pendingCount", 0)
                 .toString()
@@ -140,9 +228,9 @@ class InkBridgeFolderModule(
     }
 
     @ReactMethod
-    fun getDocumentIdentity(filePath: String, promise: Promise) {
+    fun getDocumentIdentity(filePath: String, representationJson: String, promise: Promise) {
         onWorker(promise, "INKBRIDGE_DOCUMENT_IDENTITY_FAILED") {
-            val context = documentContext(filePath)
+            val context = documentContext(filePath, representationJson)
             JSONObject()
                 .put("status", "ready")
                 .put("documentId", context.documentId)
@@ -151,9 +239,9 @@ class InkBridgeFolderModule(
     }
 
     @ReactMethod
-    fun loadNextManifest(filePath: String, promise: Promise) {
+    fun loadNextManifest(filePath: String, representationJson: String, promise: Promise) {
         onWorker(promise, "INKBRIDGE_MANIFEST_LOAD_FAILED") {
-            val context = documentContext(filePath)
+            val context = documentContext(filePath, representationJson)
             conflictMessage(context)?.let { conflict ->
                 return@onWorker JSONObject()
                     .put("status", "conflict")
@@ -184,13 +272,14 @@ class InkBridgeFolderModule(
     fun validateDocumentIdentity(
         filePath: String,
         expectedDocumentId: String,
+        representationJson: String,
         promise: Promise,
     ) {
         onWorker(promise, "INKBRIDGE_DOCUMENT_REVALIDATION_FAILED") {
             require(expectedDocumentId.startsWith(DOCUMENT_ID_PREFIX)) {
                 "Invalid expected InkBridge document ID"
             }
-            val context = documentContext(filePath)
+            val context = documentContext(filePath, representationJson)
             require(context.documentId == expectedDocumentId) {
                 "The PDF bytes changed after this InkBridge update was loaded; reopen the intended document and retry"
             }
@@ -207,6 +296,7 @@ class InkBridgeFolderModule(
         deliveryId: String,
         manifestId: String,
         summaryJson: String,
+        representationJson: String,
         promise: Promise,
     ) {
         onWorker(promise, "INKBRIDGE_ACK_FAILED") {
@@ -214,7 +304,7 @@ class InkBridgeFolderModule(
             require(manifestId.isNotBlank() && manifestId.length <= 512) {
                 "Invalid manifestId"
             }
-            val context = documentContext(filePath)
+            val context = documentContext(filePath, representationJson)
             val ack = acknowledgementFile(context, deliveryId)
             if (ack.isFile) {
                 val existing = validAcknowledgement(context, deliveryId)
@@ -260,7 +350,7 @@ class InkBridgeFolderModule(
                 .put("schemaVersion", ACK_SCHEMA_VERSION)
                 .put("deliveryId", deliveryId)
                 .put("manifestId", manifestId)
-                .put("sourceFileName", context.pdf.name)
+                .put("sourceFileName", context.sourceFileName)
                 .put("documentId", context.documentId)
                 .put("appliedAt", Instant.now().toString())
                 .put("summary", summary)
@@ -305,11 +395,12 @@ class InkBridgeFolderModule(
         filePath: String,
         deliveryId: String,
         message: String,
+        representationJson: String,
         promise: Promise,
     ) {
         onWorker(promise, "INKBRIDGE_FAILURE_RECORD_FAILED") {
             requireDeliveryId(deliveryId)
-            val context = documentContext(filePath)
+            val context = documentContext(filePath, representationJson)
             recordNativeFailure(context, deliveryId, message)
             Log.e(LOG_TAG, "INKBRIDGE_FOLDER_APPLY_ERROR delivery=$deliveryId ${message.take(512)}")
             JSONObject()
@@ -321,9 +412,9 @@ class InkBridgeFolderModule(
     }
 
     @ReactMethod
-    fun getStatus(filePath: String, promise: Promise) {
+    fun getStatus(filePath: String, representationJson: String, promise: Promise) {
         onWorker(promise, "INKBRIDGE_STATUS_FAILED") {
-            statusJson(documentContext(filePath)).toString()
+            statusJson(documentContext(filePath, representationJson)).toString()
         }
     }
 
@@ -363,13 +454,8 @@ class InkBridgeFolderModule(
     private fun transportStatus(context: DocumentContext, outgoing: List<File>): JSONObject? {
         val value = readTransportCheckpoint(context) ?: return null
         if (value.optString("status") in setOf("conflict", "error")) return value
-        val accepted = value.optJSONArray("supernoteAcceptedContentSha256") ?: return null
-        val acceptedHashes = mutableSetOf<String>()
-        for (index in 0 until accepted.length()) {
-            accepted.optString(index)
-                .takeIf { it.matches(DELIVERY_ID) }
-                ?.let(acceptedHashes::add)
-        }
+        val acceptedHashes = checkpointHashes(value, "supernoteAcceptedContentSha256").toMutableSet()
+        acceptedHashes += checkpointHashes(value, "supernoteAcceptedSourceViewSha256")
         if (outgoing.any { file -> sha256(readBytes(file, MAX_EXPORT_BYTES)) !in acceptedHashes }) {
             return null
         }
@@ -585,9 +671,53 @@ class InkBridgeFolderModule(
         if (removed) syncDirectory(context.failures)
     }
 
+    private fun outgoingExportPages(file: File): Set<Int> {
+        SINGLE_PAGE_EXPORT.matchEntire(file.name)?.let { match ->
+            val page = match.groupValues[1].toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid native export name ${file.name}")
+            require(page > 0) { "Native export page number must be positive" }
+            return setOf(page - 1)
+        }
+        SPREAD_PAGE_EXPORT.matchEntire(file.name)?.let { match ->
+            val pages = match.groupValues[1].split('-').map { value ->
+                val page = value.toIntOrNull()
+                    ?: throw IllegalArgumentException("Invalid native export name ${file.name}")
+                require(page > 0) { "Native export page number must be positive" }
+                page - 1
+            }
+            require(pages.size == pages.toSet().size) {
+                "Native spread export ${file.name} repeats an original page"
+            }
+            return pages.toSet()
+        }
+        return emptySet()
+    }
+
+    private fun acceptedSupernoteSourceViewHashes(context: DocumentContext): Set<String> {
+        val checkpoint = readTransportCheckpoint(context) ?: return emptySet()
+        return buildSet {
+            // Schema-1 desktop checkpoints predate source-view hashes. Their
+            // accepted content hash is still safe for an exact-byte retry;
+            // rebased source-view bytes simply cannot match it.
+            addAll(checkpointHashes(checkpoint, "supernoteAcceptedContentSha256"))
+            addAll(checkpointHashes(checkpoint, "supernoteAcceptedSourceViewSha256"))
+        }
+    }
+
+    private fun checkpointHashes(checkpoint: JSONObject, key: String): Set<String> {
+        val accepted = checkpoint.optJSONArray(key) ?: return emptySet()
+        return buildSet {
+            for (index in 0 until accepted.length()) {
+                accepted.optString(index)
+                    .takeIf { it.matches(DELIVERY_ID) }
+                    ?.let(::add)
+            }
+        }
+    }
+
     private fun outgoingPageFiles(context: DocumentContext): List<File> =
         regularFiles(context.outgoing)
-            .filter { it.name.matches(Regex("^page-[0-9]+\\.json$")) }
+            .filter { outgoingExportPages(it).isNotEmpty() }
             .sortedBy { it.name }
 
     private fun recordNativeFailure(
@@ -617,9 +747,16 @@ class InkBridgeFolderModule(
         return "Edits from both devices were preserved; automatic sync is paused."
     }
 
-    private fun documentContext(filePath: String): DocumentContext {
+    private fun documentContext(
+        filePath: String,
+        representationJson: String,
+    ): DocumentContext {
         val pdf = requirePdf(filePath)
-        val documentId = stableDocumentId(pdf)
+        val representation = representationJson.trim().takeIf { it.isNotEmpty() }?.let {
+            validateRepresentation(pdf, it)
+        }
+        val documentId = representation?.documentId ?: stableDocumentId(pdf)
+        val sourceFileName = representation?.sourceFileName ?: pdf.name
         val root = File(Environment.getExternalStorageDirectory(), ROOT_DIRECTORY)
         requireDirectory(root)
         val directory = File(root, documentId)
@@ -631,12 +768,133 @@ class InkBridgeFolderModule(
         return DocumentContext(
             pdf,
             documentId,
+            sourceFileName,
+            representation?.sourcePageCount,
             directory,
             outgoing,
             incoming,
             acknowledged,
             failures,
         )
+    }
+
+    private fun validateRepresentation(
+        pdf: File,
+        representationJson: String,
+    ): RepresentationDescriptor {
+        require(representationJson.toByteArray(StandardCharsets.UTF_8).size <= 64 * 1024) {
+            "Virtual Spread representation descriptor is too large"
+        }
+        val value = JSONObject(representationJson)
+        require(value.optInt("schemaVersion", -1) == 1) {
+            "Unsupported Virtual Spread representation descriptor"
+        }
+        val descriptor = RepresentationDescriptor(
+            documentId = value.optString("documentId"),
+            viewId = value.optString("viewId"),
+            cacheBasename = value.optString("cacheBasename"),
+            generatedPdfSha256 = value.optString("generatedPdfSha256"),
+            sidecarSha256 = value.optString("sidecarSha256"),
+            mappingAuthoritySha256 = value.optString("mappingAuthoritySha256"),
+            sourceFileName = value.optString("sourceFileName"),
+            sourcePageCount = value.optInt("sourcePageCount", -1),
+        )
+        require(descriptor.documentId.matches(DOCUMENT_ID)) {
+            "Virtual Spread original document ID is invalid"
+        }
+        require(descriptor.viewId.matches(VIEW_ID)) {
+            "Virtual Spread view ID is invalid"
+        }
+        require(
+            descriptor.generatedPdfSha256.matches(DELIVERY_ID) &&
+                descriptor.sidecarSha256.matches(DELIVERY_ID) &&
+                descriptor.mappingAuthoritySha256.matches(DELIVERY_ID),
+        ) {
+            "Virtual Spread representation hashes are invalid"
+        }
+        require(
+            descriptor.sourceFileName.isNotBlank() &&
+                descriptor.sourceFileName.length <= 255 &&
+                descriptor.sourceFileName != "." &&
+                descriptor.sourceFileName != ".." &&
+                !descriptor.sourceFileName.contains('/') &&
+                !descriptor.sourceFileName.contains('\\') &&
+                descriptor.sourcePageCount > 0,
+        ) {
+            "Virtual Spread source filename is not a safe leaf name"
+        }
+        require(
+            descriptor.cacheBasename ==
+                "${descriptor.documentId}.${descriptor.viewId}.virtual-spread.pdf" &&
+                pdf.name == descriptor.cacheBasename,
+        ) {
+            "Open PDF does not match the authenticated Virtual Spread cache name"
+        }
+
+        val viewDirectory = pdf.parentFile?.canonicalFile
+            ?: throw IllegalArgumentException("Virtual Spread cache has no view directory")
+        val documentDirectory = viewDirectory.parentFile?.canonicalFile
+            ?: throw IllegalArgumentException("Virtual Spread cache has no document directory")
+        val versionDirectory = documentDirectory.parentFile?.canonicalFile
+            ?: throw IllegalArgumentException("Virtual Spread cache has no version directory")
+        val virtualSpreadDirectory = versionDirectory.parentFile?.canonicalFile
+            ?: throw IllegalArgumentException("Virtual Spread cache has no representation directory")
+        val inkBridgeDirectory = virtualSpreadDirectory.parentFile?.canonicalFile
+            ?: throw IllegalArgumentException("Virtual Spread cache has no InkBridge directory")
+        val sharedStorageRoot = Environment.getExternalStorageDirectory().canonicalFile
+        require(
+            viewDirectory.name == descriptor.viewId &&
+                documentDirectory.name == descriptor.documentId &&
+                versionDirectory.name == "v1" &&
+                virtualSpreadDirectory.name == "virtual-spread" &&
+                inkBridgeDirectory.name == ".inkbridge" &&
+                inkBridgeDirectory.parentFile?.canonicalFile == sharedStorageRoot,
+        ) {
+            "Open PDF is outside the authenticated Virtual Spread cache layout"
+        }
+
+        require(
+            FileInputStream(pdf).use { input -> sha256(input) } ==
+                descriptor.generatedPdfSha256,
+        ) {
+            "Virtual Spread PDF bytes changed after verification"
+        }
+        val sidecar = File(viewDirectory, "${pdf.name}.json")
+        val sidecarMetadata = Os.lstat(sidecar.absolutePath)
+        require(
+            sidecar.isFile &&
+                sidecar.length() <= MAX_REPRESENTATION_SIDECAR_BYTES.toLong() &&
+                OsConstants.S_ISREG(sidecarMetadata.st_mode) &&
+                !OsConstants.S_ISLNK(sidecarMetadata.st_mode) &&
+                sidecar.canonicalFile.parentFile == viewDirectory,
+        ) {
+            "Virtual Spread sidecar is not an authenticated regular sibling"
+        }
+        val sidecarBytes = readBytes(sidecar, MAX_REPRESENTATION_SIDECAR_BYTES)
+        require(sha256(sidecarBytes) == descriptor.sidecarSha256) {
+            "Virtual Spread sidecar bytes changed after verification"
+        }
+        val sidecarJson = JSONObject(String(sidecarBytes, StandardCharsets.UTF_8))
+        require(sidecarJson.optString("schema") == "techrebbe.supernote.virtual-spread/v3") {
+            "Virtual Spread sidecar schema is unsupported"
+        }
+        val source = sidecarJson.optJSONObject("source")
+            ?: throw IllegalArgumentException("Virtual Spread sidecar has no source authority")
+        val output = sidecarJson.optJSONObject("output")
+            ?: throw IllegalArgumentException("Virtual Spread sidecar has no output authority")
+        require(
+            source.optString("documentId") == descriptor.documentId &&
+                source.optString("sha256") == descriptor.documentId.removePrefix(DOCUMENT_ID_PREFIX) &&
+                source.optString("name") == descriptor.sourceFileName &&
+                source.optInt("pageCount", -1) == descriptor.sourcePageCount &&
+                output.optString("viewId") == descriptor.viewId &&
+                output.optString("cacheBasename") == descriptor.cacheBasename &&
+                output.optString("sha256") == descriptor.generatedPdfSha256 &&
+                output.optString("mappingAuthoritySha256") == descriptor.mappingAuthoritySha256,
+        ) {
+            "Virtual Spread sidecar authorities do not match the activated representation"
+        }
+        return descriptor
     }
 
     private fun requirePdf(filePath: String): File {
