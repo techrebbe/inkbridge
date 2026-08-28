@@ -17,11 +17,15 @@ pub use model::{
 };
 pub use virtual_spread::{
     parse_virtual_spread_manifest, stable_supernote_annotation_id,
-    verify_virtual_spread_golden_fixture, VirtualSpreadGoldenVerification, VirtualSpreadManifest,
-    VirtualSpreadMapping, VirtualSpreadSide, VIRTUAL_SPREAD_CONTRACT_TOLERANCE,
+    verify_virtual_spread_golden_fixture, verify_virtual_spread_page_143_production_fixture,
+    VirtualSpreadGoldenVerification, VirtualSpreadManifest, VirtualSpreadMapping,
+    VirtualSpreadProductionVerification, VirtualSpreadSide, VIRTUAL_SPREAD_CONTRACT_TOLERANCE,
     VIRTUAL_SPREAD_GENERATOR_VERSION, VIRTUAL_SPREAD_GOLDEN_SCHEMA, VIRTUAL_SPREAD_MAPPING_DOMAIN,
-    VIRTUAL_SPREAD_PAGE_143_FIXTURE_SHA256, VIRTUAL_SPREAD_PRODUCTION_ACTIVATION_ENABLED,
-    VIRTUAL_SPREAD_SCHEMA, VIRTUAL_SPREAD_VIEW_DOMAIN,
+    VIRTUAL_SPREAD_PAGE_143_ARTIFACT_DESCRIPTOR_SHA256, VIRTUAL_SPREAD_PAGE_143_FIXTURE_SHA256,
+    VIRTUAL_SPREAD_PAGE_143_GENERATED_PDF_SHA256, VIRTUAL_SPREAD_PAGE_143_PDF_TAIL_SHA256,
+    VIRTUAL_SPREAD_PAGE_143_SIDECAR_SHA256, VIRTUAL_SPREAD_PAGE_143_SOURCE_PDF_SHA256,
+    VIRTUAL_SPREAD_PRODUCTION_ACTIVATION_ENABLED, VIRTUAL_SPREAD_SCHEMA,
+    VIRTUAL_SPREAD_VIEW_DOMAIN,
 };
 
 use baseline::{index_baseline, load_baseline};
