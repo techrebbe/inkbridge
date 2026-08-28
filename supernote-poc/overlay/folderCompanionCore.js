@@ -99,6 +99,16 @@ export function describeFolderResult(result) {
     const counts = result.applied;
     return `Synced ${counts.operationCount} change(s): ${counts.added} added, ${counts.updated} updated, ${counts.deleted} deleted.`;
   }
+  const representedPageIndices = Array.isArray(result?.representedPageIndices)
+    ? result.representedPageIndices.filter(page => Number.isInteger(page) && page >= 0)
+    : [];
+  if (representedPageIndices.length > 1) {
+    const pageNumbers = representedPageIndices.map(page => page + 1).join(', ');
+    return `Pending sync: pages ${pageNumbers} were finalized together with ${result.strokeCount ?? 0} stroke(s).`;
+  }
+  if (result?.representedPageCount > 1) {
+    return `Pending sync: ${result.representedPageCount} pages were finalized together with ${result.strokeCount ?? 0} stroke(s).`;
+  }
   if (result?.pageIndex !== undefined) {
     return `Pending sync: page ${result.pageIndex + 1} was finalized with ${result.strokeCount ?? 0} stroke(s).`;
   }

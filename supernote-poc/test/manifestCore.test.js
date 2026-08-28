@@ -22,6 +22,43 @@ const samples = [
   [0.2, 0.3, 1100],
 ];
 
+test('exported identities survive a native Supernote UUID change', () => {
+  const tagged = JSON.stringify({
+    inkBridgeOrigin: 'inkbridge-supernote-native',
+    sourceUuid: 'first-native-uuid',
+    documentId: `inkbridge-doc-v1-${'a'.repeat(64)}`,
+  });
+  assert.equal(
+    exportedStrokeIdentity(
+      'changed-native-uuid',
+      tagged,
+      `inkbridge-doc-v1-${'a'.repeat(64)}`,
+    ),
+    'first-native-uuid',
+  );
+});
+
+test('document-bound identity is not trusted without matching document validation', () => {
+  const tagged = JSON.stringify({
+    inkBridgeOrigin: 'inkbridge-supernote-native',
+    sourceUuid: 'foreign-canonical-uuid',
+    documentId: `inkbridge-doc-v1-${'a'.repeat(64)}`,
+  });
+  assert.equal(
+    exportedStrokeIdentity('local-native-uuid', tagged),
+    'local-native-uuid',
+  );
+  assert.throws(
+    () =>
+      exportedStrokeIdentity(
+        'local-native-uuid',
+        tagged,
+        `inkbridge-doc-v1-${'b'.repeat(64)}`,
+      ),
+    /another document/,
+  );
+});
+
 test('geometry fingerprint is stable across Rust and JavaScript', () => {
   assert.equal(geometryFingerprint(style, samples), 'fnv1a32:c1d82be3');
   assert.notEqual(
@@ -46,6 +83,19 @@ test('folder exports preserve canonical IDs of broker-created strokes', () => {
     'native-supernote-uuid',
   );
   assert.equal(exportedStrokeIdentity('native-supernote-uuid', '{'), 'native-supernote-uuid');
+});
+
+test('malformed synchronized identity metadata fails closed', () => {
+  for (const sourceUuid of [undefined, null, '', '   ', 42]) {
+    assert.throws(
+      () =>
+        exportedStrokeIdentity(
+          'replacement-host-uuid',
+          JSON.stringify({inkBridgeOrigin: 'inkbridge-sync', sourceUuid}),
+        ),
+      /invalid InkBridge identity metadata/,
+    );
+  }
 });
 
 test('descriptor matching tolerates tiny native coordinate round trips', () => {

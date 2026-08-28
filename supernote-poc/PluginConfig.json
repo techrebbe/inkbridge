@@ -4,8 +4,8 @@
   "pluginID": "ibpoc20260724001",
   "iconPath": "assets/icon.png",
   "desc": "Editable handwriting sync for BOOX and Supernote",
-  "versionCode": "17",
-  "versionName": "0.2.0",
+  "versionCode": "18",
+  "versionName": "0.2.1",
   "jsMainPath": "index",
   "author": "InkBridge"
 }

@@ -144,3 +144,25 @@ test('status descriptions distinguish pending, conflict, error, and synced', () 
   assert.match(describeFolderResult({status: 'error', message: 'bad file'}), /bad file/);
   assert.match(describeFolderResult({status: 'synced'}), /is synced/);
 });
+
+test('spread export status reports every represented source page', () => {
+  assert.equal(
+    describeFolderResult({
+      status: 'pending',
+      pageIndex: 1,
+      representedPageCount: 2,
+      representedPageIndices: [1, 2],
+      strokeCount: 3,
+    }),
+    'Pending sync: pages 2, 3 were finalized together with 3 stroke(s).',
+  );
+  assert.equal(
+    describeFolderResult({
+      status: 'pending',
+      pageIndex: 1,
+      representedPageCount: 2,
+      strokeCount: 3,
+    }),
+    'Pending sync: 2 pages were finalized together with 3 stroke(s).',
+  );
+});
