@@ -6,6 +6,7 @@ import {
   buildVirtualSpreadSnapshot,
   canonicalPointToSpread,
   manifestToVirtualSpread,
+  nativeViewportForVirtualSpread,
   spreadPointToCanonical,
   validateVirtualSpreadRepresentation,
 } from '../overlay/virtualSpreadAdapterCore.js';
@@ -33,7 +34,36 @@ function close(left, right, tolerance = 1e-12) {
 }
 
 const style = {layerNum: 0, thickness: 400, penColor: 0, penType: 16};
-const nativePageSize = {width: 1404, height: 1872};
+const nativePageSize = {width: 1872, height: 1404};
+function nativeViewport(virtualPageIndex, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    authority: 'rtl-reader-native-viewport-v1',
+    documentId: PAGE_143_VIRTUAL_SPREAD_FIXTURE.documentId,
+    viewId: PAGE_143_VIRTUAL_SPREAD_FIXTURE.viewId,
+    virtualPageIndex,
+    nativePageSize: [nativePageSize.width, nativePageSize.height],
+    spreadToNative: [
+      (nativePageSize.width - 1) /
+        PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[0],
+      0,
+      0,
+      -(nativePageSize.height - 1) /
+        PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[1],
+      0,
+      nativePageSize.height - 1,
+    ],
+    ...overrides,
+  };
+}
+const nativeViewports = new Map([
+  [0, nativeViewport(0)],
+  [1, nativeViewport(1)],
+]);
+const nativePageSizes = new Map([
+  [0, nativePageSize],
+  [1, nativePageSize],
+]);
 
 test('embedded hardware-gate descriptor is pinned to the normative real fixture', () => {
   const fixture = validateVirtualSpreadRepresentation(
@@ -109,6 +139,7 @@ test('one native spread scan produces two complete original-page snapshots', () 
   const pages = buildVirtualSpreadSnapshot({
     representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
     virtualPageIndex: 1,
+    nativeViewport: nativeViewport(1),
     nativePageSize,
     strokes: [
       {
@@ -169,6 +200,8 @@ test('canonical upserts and tombstones target the correct native spread page and
       ],
     },
     PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    nativeViewports,
+    nativePageSizes,
   );
   assert.equal(transformed.coordinateTransform.pdfToSupernoteNormalizedYOffset, 0);
   assert.deepEqual(transformed.operations.map(operation => operation.pageIndex), [1, 1]);
@@ -226,6 +259,8 @@ test('a cross-half move does not delete its destination when both halves share o
       ],
     },
     PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    nativeViewports,
+    nativePageSizes,
   );
   assert.equal(transformed.operations.length, 1);
   assert.equal(transformed.operations[0].type, 'upsert_stroke');
@@ -264,6 +299,7 @@ test('strokes in the gutter or crossing source halves fail closed', () => {
       buildVirtualSpreadSnapshot({
         representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
         virtualPageIndex: 1,
+        nativeViewport: nativeViewport(1),
         nativePageSize,
         strokes: [{...base, samples: [[0.25, 0.05, 1000], [0.3, 0.06, 1000]]}],
       }),
@@ -274,6 +310,7 @@ test('strokes in the gutter or crossing source halves fail closed', () => {
       buildVirtualSpreadSnapshot({
         representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
         virtualPageIndex: 1,
+        nativeViewport: nativeViewport(1),
         nativePageSize,
         strokes: [{...base, samples: [[0.25, 0.5, 1000], [0.75, 0.5, 1000]]}],
       }),
@@ -301,6 +338,7 @@ test('native pixel drift at a source-page edge snaps back without changing halve
   const pages = buildVirtualSpreadSnapshot({
     representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
     virtualPageIndex: 1,
+    nativeViewport: nativeViewport(1),
     nativePageSize,
     strokes: [
       {
@@ -336,6 +374,7 @@ test('a stroke wholly on the shared seam remains ambiguous and fails closed', ()
       buildVirtualSpreadSnapshot({
         representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
         virtualPageIndex: 1,
+        nativeViewport: nativeViewport(1),
         nativePageSize,
         strokes: [
           {
@@ -348,5 +387,186 @@ test('a stroke wholly on the shared seam remains ambiguous and fails closed', ()
         ],
       }),
     /ambiguous/,
+  );
+});
+
+test('presentation fails closed without an authoritative PDF viewport', () => {
+  const base = {
+    sourceUuid: 'portrait-stroke',
+    sourceKey: 'portrait-stroke',
+    layerNum: 0,
+    thickness: 400,
+    penColor: 0,
+    penType: 16,
+    samples: [
+      [0.2, 0.4, 1000],
+      [0.3, 0.5, 1001],
+    ],
+  };
+  assert.throws(
+    () =>
+      buildVirtualSpreadSnapshot({
+        representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        virtualPageIndex: 1,
+        nativeViewport: null,
+        nativePageSize,
+        strokes: [base],
+      }),
+    /authoritative RTL Reader native viewport is required/,
+  );
+
+  const snapshot = {
+    sourceUuid: 'portrait-import',
+    origin: 'boox-neoreader',
+    pageIndex: 2,
+    nativeStyle: style,
+    samples: [
+      [0.1, 0.2, 1000],
+      [0.2, 0.3, 1001],
+    ],
+    geometryFingerprint: 'portrait-import',
+  };
+  assert.throws(
+    () =>
+      manifestToVirtualSpread(
+        {
+          schemaVersion: 1,
+          manifestId: 'portrait-import',
+          operations: [
+            {
+              type: 'upsert_stroke',
+              sourceUuid: snapshot.sourceUuid,
+              pageIndex: snapshot.pageIndex,
+              before: null,
+              after: snapshot,
+            },
+          ],
+        },
+        PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        new Map([[1, nativePageSize]]),
+        new Map([[1, nativePageSize]]),
+      ),
+    /authoritative RTL Reader native viewport is required/,
+  );
+});
+
+test('same-aspect native geometry is not accepted as viewport authority', () => {
+  assert.throws(
+    () =>
+      buildVirtualSpreadSnapshot({
+        representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        virtualPageIndex: 1,
+        nativeViewport: {
+          width: nativePageSize.width,
+          height: nativePageSize.height,
+        },
+        nativePageSize,
+        strokes: [
+          {
+            sourceUuid: 'same-aspect-stroke',
+            sourceKey: 'same-aspect-stroke',
+            layerNum: 0,
+            thickness: 400,
+            penColor: 0,
+            penType: 16,
+            samples: [
+              [0.1, 0.3, 1000],
+              [0.2, 0.4, 1001],
+            ],
+          },
+        ],
+      }),
+    /authoritative RTL Reader native viewport is required/,
+  );
+});
+
+test('viewport authority must match the current native page canvas', () => {
+  assert.throws(
+    () =>
+      nativeViewportForVirtualSpread(
+        PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        nativeViewport(1),
+        1,
+        {width: 1404, height: 1872},
+      ),
+    /does not match the current native page canvas/,
+  );
+});
+
+test('accepted viewport cannot place a spread edge outside the native canvas', () => {
+  assert.throws(
+    () =>
+      nativeViewportForVirtualSpread(
+        PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        nativeViewport(1, {
+          spreadToNative: [
+            (nativePageSize.width - 1) /
+              PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[0],
+            0,
+            0,
+            -(nativePageSize.height - 1) /
+              PAGE_143_VIRTUAL_SPREAD_FIXTURE.spreadSize[1],
+            -0.5,
+            nativePageSize.height - 1,
+          ],
+        }),
+        1,
+        nativePageSize,
+      ),
+    /lies outside the native page/,
+  );
+});
+
+test('viewport authority rejects an ill-conditioned affine matrix', () => {
+  assert.throws(
+    () =>
+      nativeViewportForVirtualSpread(
+        PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        nativeViewport(1, {
+          spreadToNative: [1, 0, 1, 1e-13, 0, 700],
+        }),
+        1,
+        nativePageSize,
+      ),
+    /numerically unstable/,
+  );
+});
+
+test('rotated viewport edge tolerance is measured in native pixels', () => {
+  const rotatedViewport = nativeViewport(1, {
+    spreadToNative: [0.75, 0.75, -0.75, 0.75, 486, 100],
+  });
+  const spreadSamples = [
+    [-1.8, 149.4, 1000],
+    [-1.7, 149.5, 1001],
+  ];
+  const nativeSamples = spreadSamples.map(([x, y, pressure]) => {
+    const [a, b, c, d, e, f] = rotatedViewport.spreadToNative;
+    return [
+      (a * x + c * y + e) / (nativePageSize.width - 1),
+      (b * x + d * y + f) / (nativePageSize.height - 1),
+      pressure,
+    ];
+  });
+  assert.throws(
+    () =>
+      buildVirtualSpreadSnapshot({
+        representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+        virtualPageIndex: 1,
+        nativeViewport: rotatedViewport,
+        nativePageSize,
+        strokes: [
+          {
+            sourceUuid: 'rotated-margin-stroke',
+            sourceKey: 'rotated-margin-stroke',
+            layerNum: 0,
+            thickness: 400,
+            penColor: 0,
+            penType: 16,
+            samples: nativeSamples,
+          },
+        ],
+      }),
+    /margin/,
   );
 });

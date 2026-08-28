@@ -434,11 +434,43 @@ export async function applyVirtualSpreadManifest(
   inputManifest,
   representation,
   expectedFilePath = null,
+  nativeViewports = null,
 ) {
   const canonical = validateManifest(inputManifest);
+  const filePath = expectedFilePath ?? await requireResult(
+    PluginCommAPI.getCurrentFilePath(),
+    'getCurrentFilePath before Virtual Spread transform',
+  );
+  const targetPages = new Set();
+  for (const operation of canonical.operations) {
+    const mapping = representation.mappings.find(
+      candidate => candidate.sourcePageIndex === operation.pageIndex,
+    );
+    if (!mapping) {
+      throw new Error(
+        `No Virtual Spread mapping exists for source page ${operation.pageIndex + 1}.`,
+      );
+    }
+    targetPages.add(mapping.virtualPageIndex);
+  }
+  const nativePageSizes = new Map();
+  for (const pageIndex of targetPages) {
+    nativePageSizes.set(
+      pageIndex,
+      await requireResult(
+        PluginFileAPI.getPageSize(filePath, pageIndex),
+        `getPageSize page ${pageIndex + 1} before Virtual Spread transform`,
+      ),
+    );
+  }
   return applyManifest(
-    manifestToVirtualSpread(canonical, representation),
-    expectedFilePath,
+    manifestToVirtualSpread(
+      canonical,
+      representation,
+      nativeViewports,
+      nativePageSizes,
+    ),
+    filePath,
     true,
   );
 }

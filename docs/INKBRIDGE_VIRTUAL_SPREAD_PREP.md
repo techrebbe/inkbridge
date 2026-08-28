@@ -134,6 +134,15 @@ derived inverse. Incoming canonical operations use the authoritative forward map
 correct physical page and half. Canonical identity is persisted into untagged native strokes on
 their first export so reopen/move/delete tests do not depend on a host UUID remaining stable.
 
+Native element samples are not assumed to occupy the PDF merely because they are normalized to the
+Supernote page canvas. Aspect ratio also cannot prove that the reader has not rotated or inset the
+PDF. Export and import therefore require an explicit native viewport descriptor bound to the
+authenticated document ID, view ID, and virtual page. The descriptor supplies the native canvas
+size and spread-to-native affine transform; it must come from the RTL Reader presentation owner.
+The current folder action has no such provider and fails closed rather than guessing. Supporting
+the hardware gate and portrait focus requires connecting that verified signal from the Nomad
+companion.
+
 This adapter is not a general production activation path. Its embedded representation is pinned to
 the normative fixture and production activation remains false.
 
@@ -149,7 +158,8 @@ proves native hydration, idempotent reimport, versioned cache regeneration, and 
 
 ## First integrated acceptance gate
 
-1. Generate and verify the `page-143` Virtual Spread cache.
+1. Generate and verify the `page-143` Virtual Spread cache, open it through RTL Reader, and provide
+   InkBridge the verified native viewport descriptor for the active spread.
 2. Write a stable-ID stroke on original page 143 through Supernote's native reader.
 3. Export the two represented original-page snapshots atomically.
 4. Confirm the stroke appears editable at the same location on BOOX page 143.

@@ -9,7 +9,10 @@ import {BOOX_NATIVE_STROKE_FIXTURE} from './booxFixture';
 import {BOOX_RETURN_FIXTURE} from './booxReturnFixture';
 import {requireSameDocumentPath} from './folderCompanionCore';
 import {exportedStrokeIdentity} from './manifestCore';
-import {buildVirtualSpreadSnapshot} from './virtualSpreadAdapterCore';
+import {
+  buildVirtualSpreadSnapshot,
+  nativeViewportForVirtualSpread,
+} from './virtualSpreadAdapterCore';
 
 const OFFSET_X_PX = 80;
 const OFFSET_Y_PX = 50;
@@ -420,9 +423,16 @@ export async function collectCurrentVirtualSpread(
   representation,
   expectedFilePath = null,
   revalidateDocumentIdentity = null,
+  nativeViewport = null,
 ) {
   const {filePath, page, pageSize} = await currentDocumentContext();
   requireSameDocumentPath(expectedFilePath, filePath);
+  nativeViewportForVirtualSpread(
+    representation,
+    nativeViewport,
+    page,
+    pageSize,
+  );
   const elements = await requireResult(
     PluginFileAPI.getElements(page, filePath),
     'getElements',
@@ -509,6 +519,7 @@ export async function collectCurrentVirtualSpread(
   const pages = buildVirtualSpreadSnapshot({
     representation,
     virtualPageIndex: page,
+    nativeViewport,
     nativePageSize: pageSize,
     strokes,
   });

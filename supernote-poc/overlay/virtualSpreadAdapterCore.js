@@ -3,6 +3,7 @@ import {geometryFingerprint} from './manifestCore.js';
 const EDGE_TOLERANCE = 1e-9;
 const NATIVE_PIXEL_TOLERANCE = 1.5;
 const ROUND_TRIP_TOLERANCE = 1e-12;
+const SINGULARITY_EPSILON = 1e-12;
 
 function finite(value, label) {
   if (!Number.isFinite(value)) throw new Error(`${label} is not finite.`);
@@ -201,66 +202,237 @@ export function spreadPointToCanonical(mapping, spread) {
   return boundedCanonical;
 }
 
-function nativeSpreadTolerance(representation, nativePageSize) {
-  const width = finite(nativePageSize?.width, 'native page width');
-  const height = finite(nativePageSize?.height, 'native page height');
+export function nativeViewportForVirtualSpread(
+  representation,
+  nativeViewport,
+  virtualPageIndex,
+  actualNativePageSize,
+) {
+  validateVirtualSpreadRepresentation(representation);
+  if (
+    !nativeViewport ||
+    nativeViewport.schemaVersion !== 1 ||
+    nativeViewport.authority !== 'rtl-reader-native-viewport-v1' ||
+    nativeViewport.documentId !== representation.documentId ||
+    nativeViewport.viewId !== representation.viewId ||
+    nativeViewport.virtualPageIndex !== virtualPageIndex
+  ) {
+    throw new Error(
+      'An authoritative RTL Reader native viewport is required for this Virtual Spread page.',
+    );
+  }
+  const allowedKeys = new Set([
+    'schemaVersion',
+    'authority',
+    'documentId',
+    'viewId',
+    'virtualPageIndex',
+    'nativePageSize',
+    'spreadToNative',
+  ]);
+  if (Object.keys(nativeViewport).some(key => !allowedKeys.has(key))) {
+    throw new Error('The authoritative native viewport contains unknown fields.');
+  }
+  const [width, height] = requireTuple(
+    nativeViewport.nativePageSize,
+    2,
+    'nativePageSize',
+  );
   if (width <= 1 || height <= 1) {
     throw new Error('Native Virtual Spread page dimensions are invalid.');
   }
-  return [
-    (NATIVE_PIXEL_TOLERANCE * representation.spreadSize[0]) / (width - 1),
-    (NATIVE_PIXEL_TOLERANCE * representation.spreadSize[1]) / (height - 1),
-  ];
-}
-
-function pointInsideDestination(mapping, [x, y], [xTolerance, yTolerance]) {
-  const [left, top, right, bottom] = mapping.destination;
-  return (
-    x >= left - xTolerance &&
-    x <= right + xTolerance &&
-    y >= top - yTolerance &&
-    y <= bottom + yTolerance
+  const actualWidth = finite(
+    actualNativePageSize?.width,
+    'actual native page width',
   );
+  const actualHeight = finite(
+    actualNativePageSize?.height,
+    'actual native page height',
+  );
+  if (width !== actualWidth || height !== actualHeight) {
+    throw new Error(
+      'The authoritative native viewport does not match the current native page canvas.',
+    );
+  }
+  const spreadToNative = requireTuple(
+    nativeViewport.spreadToNative,
+    6,
+    'spreadToNative',
+  );
+  const nativeToSpread = invertStableAffine(
+    spreadToNative,
+    'The authoritative native viewport',
+  );
+  const [spreadWidth, spreadHeight] = representation.spreadSize;
+  const corners = [
+    [0, 0],
+    [spreadWidth, 0],
+    [0, spreadHeight],
+    [spreadWidth, spreadHeight],
+  ].map(point => applyTransform(spreadToNative, point));
+  if (
+    corners.some(([x, y]) =>
+      x < -(width - 1) * EDGE_TOLERANCE ||
+      x > (width - 1) * (1 + EDGE_TOLERANCE) ||
+      y < -(height - 1) * EDGE_TOLERANCE ||
+      y > (height - 1) * (1 + EDGE_TOLERANCE),
+    )
+  ) {
+    throw new Error('The authoritative native viewport lies outside the native page.');
+  }
+  return {width, height, spreadToNative, nativeToSpread};
 }
 
-function snapToDestination(mapping, [x, y], [xTolerance, yTolerance]) {
-  const [left, top, right, bottom] = mapping.destination;
-  const snap = (value, first, second, tolerance) => {
-    const firstDistance = Math.abs(value - first);
-    const secondDistance = Math.abs(value - second);
-    if (firstDistance <= tolerance && firstDistance <= secondDistance) return first;
-    if (secondDistance <= tolerance) return second;
-    return value;
-  };
-  return [
-    snap(x, left, right, xTolerance),
-    snap(y, top, bottom, yTolerance),
+function invertStableAffine(transform, label) {
+  const [a, b, c, d, e, f] = transform;
+  const linearScale = Math.max(
+    Math.abs(a),
+    Math.abs(b),
+    Math.abs(c),
+    Math.abs(d),
+  );
+  if (!Number.isFinite(linearScale) || linearScale === 0) {
+    throw new Error(`${label} is singular.`);
+  }
+  const normalized = [a, b, c, d].map(value => value / linearScale);
+  const determinant =
+    normalized[0] * normalized[3] - normalized[1] * normalized[2];
+  if (
+    !Number.isFinite(determinant) ||
+    Math.abs(determinant) <= SINGULARITY_EPSILON
+  ) {
+    throw new Error(`${label} is numerically unstable.`);
+  }
+  const factor = (1 / linearScale) / determinant;
+  const inverse = [
+    normalized[3] * factor,
+    -normalized[1] * factor,
+    -normalized[2] * factor,
+    normalized[0] * factor,
   ];
+  inverse.push(
+    -(inverse[0] * e + inverse[2] * f),
+    -(inverse[1] * e + inverse[3] * f),
+  );
+  if (!inverse.every(Number.isFinite)) {
+    throw new Error(`${label} has a non-finite inverse.`);
+  }
+  return inverse;
+}
+
+function nativePointToSpread(viewport, point) {
+  return applyTransform(viewport.nativeToSpread, point);
+}
+
+function spreadPointToNative(viewport, point) {
+  return applyTransform(viewport.spreadToNative, point);
+}
+
+function nativeDestinationPolygon(mapping, viewport) {
+  const [left, top, right, bottom] = mapping.destination;
+  return [
+    [left, top],
+    [right, top],
+    [right, bottom],
+    [left, bottom],
+  ].map(point => spreadPointToNative(viewport, point));
+}
+
+function pointInsideConvexPolygon([x, y], polygon) {
+  let hasPositive = false;
+  let hasNegative = false;
+  for (let index = 0; index < polygon.length; index += 1) {
+    const [x1, y1] = polygon[index];
+    const [x2, y2] = polygon[(index + 1) % polygon.length];
+    const cross = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1);
+    hasPositive ||= cross > 0;
+    hasNegative ||= cross < 0;
+    if (hasPositive && hasNegative) return false;
+  }
+  return true;
+}
+
+function closestPointOnSegment([x, y], [x1, y1], [x2, y2]) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared === 0) return [x1, y1];
+  const position = Math.max(
+    0,
+    Math.min(1, ((x - x1) * dx + (y - y1) * dy) / lengthSquared),
+  );
+  return [x1 + position * dx, y1 + position * dy];
+}
+
+function classifyNativePoint(mapping, viewport, point) {
+  const polygon = nativeDestinationPolygon(mapping, viewport);
+  if (pointInsideConvexPolygon(point, polygon)) {
+    return {accepted: true, snapped: point};
+  }
+  let closest = null;
+  let closestDistanceSquared = Infinity;
+  for (let index = 0; index < polygon.length; index += 1) {
+    const candidate = closestPointOnSegment(
+      point,
+      polygon[index],
+      polygon[(index + 1) % polygon.length],
+    );
+    const dx = point[0] - candidate[0];
+    const dy = point[1] - candidate[1];
+    const distanceSquared = dx * dx + dy * dy;
+    if (distanceSquared < closestDistanceSquared) {
+      closest = candidate;
+      closestDistanceSquared = distanceSquared;
+    }
+  }
+  return {
+    accepted:
+      closestDistanceSquared <= NATIVE_PIXEL_TOLERANCE * NATIVE_PIXEL_TOLERANCE,
+    snapped: closest,
+  };
 }
 
 export function exportVirtualSpreadStroke(
   stroke,
   representation,
   virtualPageIndex,
+  nativeViewport,
   nativePageSize,
 ) {
   const mappings = mappingsForVirtualPage(representation, virtualPageIndex);
-  const spreadTolerance = nativeSpreadTolerance(representation, nativePageSize);
+  const viewport = nativeViewportForVirtualSpread(
+    representation,
+    nativeViewport,
+    virtualPageIndex,
+    nativePageSize,
+  );
   if (!Array.isArray(stroke?.samples) || stroke.samples.length < 2) {
     throw new Error('Native Virtual Spread stroke has fewer than two samples.');
   }
-  const spreadSamples = stroke.samples.map(([x, y, pressure], index) => [
-    bounded(x, 0, 1, `native sample ${index} x`) * representation.spreadSize[0],
-    // Supernote's Android/EMR boundary is top-left with Y increasing down,
-    // while the authenticated PDF transform is bottom-left with Y increasing
-    // up.  Keep that convention change at this single native boundary.
-    (1 - bounded(y, 0, 1, `native sample ${index} y`)) *
-      representation.spreadSize[1],
-    bounded(pressure, 0, 4096, `native sample ${index} pressure`, 0),
-  ]);
+  const convertedSamples = stroke.samples.map(([x, y, pressure], index) => {
+    const native = [
+      bounded(x, 0, 1, `native sample ${index} x`) * (viewport.width - 1),
+      bounded(y, 0, 1, `native sample ${index} y`) * (viewport.height - 1),
+    ];
+    const spread = nativePointToSpread(viewport, native);
+    return {
+      native,
+      spread: [
+        finite(spread[0], `spread sample ${index} x`),
+        finite(spread[1], `spread sample ${index} y`),
+      ],
+      pressure: bounded(
+        pressure,
+        0,
+        4096,
+        `native sample ${index} pressure`,
+        0,
+      ),
+    };
+  });
   const candidates = mappings.filter(mapping =>
-    spreadSamples.every(sample =>
-      pointInsideDestination(mapping, sample, spreadTolerance),
+    convertedSamples.every(sample =>
+      classifyNativePoint(mapping, viewport, sample.native).accepted,
     ),
   );
   if (candidates.length !== 1) {
@@ -275,17 +447,14 @@ export function exportVirtualSpreadStroke(
     pageIndex: mapping.sourcePageIndex,
     stroke: {
       ...stroke,
-      samples: spreadSamples.map(([x, y, pressure]) => {
+      samples: convertedSamples.map(({native, pressure}) => {
         // Native EMR <-> Android conversion can move an edge sample by about
-        // one device pixel. Classification uses a page-resolution-derived
-        // tolerance, then snaps only those accepted edge samples back onto the
-        // authenticated destination before applying the strict inverse.
-        const snapped = snapToDestination(
-          mapping,
-          [x, y],
-          spreadTolerance,
-        );
-        const [canonicalX, canonicalY] = spreadPointToCanonical(mapping, snapped);
+        // one device pixel. Classification and snapping are both performed in
+        // the actual native canvas, which remains exact for rotated or skewed
+        // viewports. Only then do we invert into authenticated spread space.
+        const classified = classifyNativePoint(mapping, viewport, native);
+        const spread = nativePointToSpread(viewport, classified.snapped);
+        const [canonicalX, canonicalY] = spreadPointToCanonical(mapping, spread);
         return [canonicalX, canonicalY, pressure];
       }),
     },
@@ -295,6 +464,7 @@ export function exportVirtualSpreadStroke(
 export function buildVirtualSpreadSnapshot({
   representation,
   virtualPageIndex,
+  nativeViewport,
   nativePageSize,
   strokes,
 }) {
@@ -310,6 +480,7 @@ export function buildVirtualSpreadSnapshot({
       stroke,
       representation,
       virtualPageIndex,
+      nativeViewport,
       nativePageSize,
     );
     const identity = exported.stroke.sourceUuid || exported.stroke.sourceKey;
@@ -332,19 +503,56 @@ function mappingForSourcePage(representation, sourcePageIndex) {
   return mapping;
 }
 
-function snapshotToVirtual(snapshot, representation) {
+function nativeViewportForMapping(nativeViewports, mapping) {
+  if (!(nativeViewports instanceof Map)) {
+    throw new Error('Authoritative native Virtual Spread viewports are unavailable.');
+  }
+  const viewport = nativeViewports.get(mapping.virtualPageIndex);
+  if (!viewport) {
+    throw new Error(
+      `Authoritative native Virtual Spread viewport ${mapping.virtualPageIndex + 1} is unavailable.`,
+    );
+  }
+  return viewport;
+}
+
+function nativePageSizeForMapping(nativePageSizes, mapping) {
+  if (!(nativePageSizes instanceof Map)) {
+    throw new Error('Current native Virtual Spread page sizes are unavailable.');
+  }
+  const pageSize = nativePageSizes.get(mapping.virtualPageIndex);
+  if (!pageSize) {
+    throw new Error(
+      `Current native Virtual Spread page ${mapping.virtualPageIndex + 1} size is unavailable.`,
+    );
+  }
+  return pageSize;
+}
+
+function snapshotToVirtual(
+  snapshot,
+  representation,
+  nativeViewports,
+  nativePageSizes,
+) {
   if (!snapshot) return null;
   const mapping = mappingForSourcePage(representation, snapshot.pageIndex);
-  const [spreadWidth, spreadHeight] = representation.spreadSize;
+  const viewport = nativeViewportForVirtualSpread(
+    representation,
+    nativeViewportForMapping(nativeViewports, mapping),
+    mapping.virtualPageIndex,
+    nativePageSizeForMapping(nativePageSizes, mapping),
+  );
   if (!Array.isArray(snapshot.samples) || snapshot.samples.length < 2) {
     throw new Error('Canonical stroke has fewer than two samples.');
   }
   const samples = snapshot.samples.map(([x, y, pressure], index) => {
     requireTuple([x, y, pressure], 3, `canonical sample ${index}`);
     const spread = canonicalPointToSpread(mapping, [x, y]);
+    const native = spreadPointToNative(viewport, spread);
     return [
-      bounded(spread[0] / spreadWidth, 0, 1, 'virtual sample x'),
-      bounded((spreadHeight - spread[1]) / spreadHeight, 0, 1, 'virtual sample y'),
+      bounded(native[0] / (viewport.width - 1), 0, 1, 'virtual sample x'),
+      bounded(native[1] / (viewport.height - 1), 0, 1, 'virtual sample y'),
       bounded(pressure, 0, 4096, 'virtual sample pressure', 0),
     ];
   });
@@ -360,7 +568,12 @@ function snapshotToVirtual(snapshot, representation) {
   return transformed;
 }
 
-export function manifestToVirtualSpread(inputManifest, representation) {
+export function manifestToVirtualSpread(
+  inputManifest,
+  representation,
+  nativeViewports,
+  nativePageSizes,
+) {
   validateVirtualSpreadRepresentation(representation);
   if (!inputManifest || !Array.isArray(inputManifest.operations)) {
     throw new Error('InkBridge manifest has no operations to transform.');
@@ -371,8 +584,18 @@ export function manifestToVirtualSpread(inputManifest, representation) {
       originalPageIndex: operation.pageIndex,
       ...operation,
       pageIndex: mapping.virtualPageIndex,
-      before: snapshotToVirtual(operation.before, representation),
-      after: snapshotToVirtual(operation.after, representation),
+      before: snapshotToVirtual(
+        operation.before,
+        representation,
+        nativeViewports,
+        nativePageSizes,
+      ),
+      after: snapshotToVirtual(
+        operation.after,
+        representation,
+        nativeViewports,
+        nativePageSizes,
+      ),
     };
   });
   const upserts = new Map(

@@ -11,7 +11,10 @@ The normal package also contains a deliberately fixture-scoped Virtual Spread ga
 authenticated page-143 cache is open, Export scans both source-page halves atomically in original
 PDF coordinates and Apply maps canonical operations back to the correct native half. All other
 documents continue through the ordinary-PDF path. Generic Virtual Spread activation is not yet
-enabled.
+enabled. Coordinate conversion now requires an explicit, document- and view-bound native viewport
+descriptor from RTL Reader; page dimensions or aspect ratio are never treated as proof of the
+reader's rotation, inset, or PDF placement. The current folder action fails closed until that
+verified presentation signal is connected.
 
 The earlier hardware proofs and repair-build notes are retained below as the evidence behind the
 current converter and native manifest application.
