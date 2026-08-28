@@ -1,8 +1,10 @@
 # Virtual Spread integration preparation
 
-Status: RTL Reader v0.0.25's frozen schema-v3 mapping contract and synthetic page-143 golden
-vectors are imported from merged commit `025d870bd73f1133664aa37b8443feb7ce10d12d`.
-Production activation remains gated on RTL Reader's separately reviewed real-PDF fixture bundle.
+Status: RTL Reader v0.0.25's frozen schema-v3 mapping contract, synthetic page-143 vectors, and
+normative real-PDF fixture bundle are imported. The representation contract came from commit
+`025d870bd73f1133664aa37b8443feb7ce10d12d`; the byte-level production bundle came from commit
+`ebdb7d1108aa4159a02ea0cdcfdfaab82d69e25b` (PR #18). Production activation remains gated on the
+shared native-annotation hydration and rollback hardware test, not on missing representation data.
 
 ## Boundary
 
@@ -82,13 +84,28 @@ mapping-authority mismatches, and internally inconsistent view/cache identities.
 
 Only the authenticated forward matrix is retained. InkBridge derives the inverse locally and
 validates source-normalized-to-spread round trips at the contract tolerance. Canonical points use
-displayed-CropBox `[0,1]` coordinates with a top-left origin. Production cache activation is
-explicitly disabled until the separate real-PDF/PDF-tail fixture gate lands.
+displayed-CropBox `[0,1]` coordinates with a top-left origin.
 
 The exact merged `page-143-contract-v1.json` fixture now pins canonical mapping and view bytes,
 lowercase SHA-256 identities, zero-based int32 indices, binary64 field order, signed-zero
 preservation, positive-orientation quarter-turn transforms, and point/stroke forward/inverse
 round trips at an absolute `1e-12`. Contract drift fails closed.
+
+The real fixture gate additionally pins the immutable source PDF, generated PDF, sidecar,
+descriptor, and PDF-tail bytes. InkBridge opens both PDFs, recomputes the strict schema-v3 mapping
+and view identities, checks the authenticated authority block immediately before `startxref`, and
+reproduces the exact page-143 point/stroke vectors. The verified pair can be materialized beneath
+`.inkbridge/virtual-spread/v1/<document-id>/<view-id>/` under the authenticated basename and exact
+`.json` sibling. Publication is create-only and idempotent; a different directory already
+occupying a versioned path fails closed. On Linux/Android, a per-view process lock protects one
+deterministic staging directory. The PDF, sidecar, and `.nomedia` marker are individually synced,
+then their complete directory is published in one no-replace rename and the parent is synced. A
+crash before that rename exposes no partial final view; a later run reclaims the abandoned staging
+directory, including a full-size PDF, before retrying. Other hosts fail closed and must pass the
+verified bytes to the Nomad-side installer instead. The materializer takes ownership of the
+already-generated PDF and sidecar buffers and returns those same private buffers as the immutable
+activation handoff. This neither rereads mutable shared storage nor creates a second 300–500 MB
+in-memory PDF copy; the published paths remain locators, not activation authority.
 
 The annotation identity helper preserves a retained `sourceUuid`. If Supernote `userData` loses it,
 the adapter derives a document-bound ID from a nonempty native element key. It fails closed rather
@@ -103,23 +120,21 @@ every represented source page from one canonical revision, match its generated P
 mapping authority, and new `.mark` evidence, and retain rollback evidence before activation can be
 committed. No transaction field or transition copies an old `.mark` onto a different PDF.
 
-The cache transaction tests use the frozen synthetic view identity to exercise dirty checkpoint,
-two-page hydration from one canonical revision, verification, activation evidence, persistence,
-and rollback. They do not represent a real generated PDF or native `.mark`.
+The cache transaction tests now bind the real candidate view to dirty checkpoint, two-page
+hydration from one canonical revision, verification, rollback evidence, persistence, and rollback.
+The `.mark` itself is still represented by content-hash evidence; production native hydration is
+the next shared hardware gate.
 
-## Deliberately deferred until the real-PDF fixture bundle merges
+## Remaining shared-gate work
 
-- importing the original source PDF, generated Virtual Spread PDF and sidecar, stable artifact
-  hashes, exact real-PDF vectors, and descriptor-verified PDF-tail evidence;
-- binding the hardware-proven hidden cache directory into Nomad publication code;
-- enabling production transform acceptance and cache activation;
 - transforming real native Supernote element samples into original-page snapshots;
 - importing complete canonical state into a replacement `.mark`; and
 - automatic dirty-cache checkpoint, regeneration, activation, and rollback.
 
-The parser and transaction APIs are intentionally representation plumbing rather than activation
-authority. The production switch begins only after RTL Reader's fixture-only pull request freezes
-and merges the real PDF pair, sidecar, hashes, PDF-tail evidence, and exact real-PDF vectors.
+The host-side page-143 harness now covers create, BOOX move, Supernote tombstone, duplicate event
+delivery, and rebuilding the BOOX view from the immutable source. It prepares rather than replaces
+the real-device gate. `VIRTUAL_SPREAD_PRODUCTION_ACTIVATION_ENABLED` remains false until the Nomad
+proves native hydration, idempotent reimport, versioned cache regeneration, and rollback.
 
 ## First integrated acceptance gate
 

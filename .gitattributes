@@ -1,1 +1,2 @@
 inkbridge-convert/tests/fixtures/virtual-spread/page-143-contract-v1.json text eol=lf
+inkbridge-convert/tests/fixtures/virtual-spread/page-143-v1/* -text

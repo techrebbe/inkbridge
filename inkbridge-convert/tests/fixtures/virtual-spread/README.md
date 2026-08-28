@@ -9,9 +9,16 @@ Its exact file SHA-256 is
 pins that digest so even a different self-consistent vector set is rejected.
 
 It is normative for schema-v3 canonical mapping/view bytes, binary64 and signed-zero behavior,
-synthetic point/stroke vectors, document identity, view identity, and cache naming. It does not
-contain a real generated PDF, sidecar hash, or PDF-tail authority and cannot enable production cache
-activation.
+synthetic point/stroke vectors, document identity, view identity, and cache naming.
 
-RTL Reader is preparing those real-PDF artifacts in a separate fixture-only pull request. Import
-them only after that exact head is reviewed and merged.
+`page-143-v1/` is the exact byte-level real-PDF bundle merged in RTL Reader commit
+`ebdb7d1108aa4159a02ea0cdcfdfaab82d69e25b` (PR #18). It contains the immutable source PDF,
+generated Virtual Spread PDF, exact schema-v3 sidecar, artifact descriptor, and PDF-tail evidence.
+The production-fixture verifier pins all artifact hashes, opens both PDFs, strictly validates the
+sidecar, derives the inverse locally, and matches the PDF-tail authorities at their frozen offsets.
+
+The generated files are intentionally tracked under short names for Windows checkout portability.
+Materialization must publish the PDF under the authenticated `cacheBasename` and publish its exact
+`<cacheBasename>.json` sibling. Passing this fixture gate does not assert that native `.mark`
+hydration or rollback is hardware-proven; production activation remains disabled until the shared
+page-143 annotation and regeneration gate completes.

@@ -7,10 +7,17 @@ use std::collections::BTreeSet;
 use std::fmt::Formatter;
 
 mod golden;
+mod production;
 
 pub use golden::{
     verify_virtual_spread_golden_fixture, VirtualSpreadGoldenVerification,
     VIRTUAL_SPREAD_PAGE_143_FIXTURE_SHA256,
+};
+pub use production::{
+    verify_virtual_spread_page_143_production_fixture, VirtualSpreadProductionVerification,
+    VIRTUAL_SPREAD_PAGE_143_ARTIFACT_DESCRIPTOR_SHA256,
+    VIRTUAL_SPREAD_PAGE_143_GENERATED_PDF_SHA256, VIRTUAL_SPREAD_PAGE_143_PDF_TAIL_SHA256,
+    VIRTUAL_SPREAD_PAGE_143_SIDECAR_SHA256, VIRTUAL_SPREAD_PAGE_143_SOURCE_PDF_SHA256,
 };
 
 pub const VIRTUAL_SPREAD_SCHEMA: &str = "techrebbe.supernote.virtual-spread/v3";
@@ -65,6 +72,8 @@ pub struct VirtualSpreadManifest {
     pub spread_size: [f64; 2],
     pub gutter: f64,
     pub cover_separate: bool,
+    pub layout_authority_sha256: String,
+    pub link_authority_sha256: String,
     pub mapping_authority_sha256: String,
     pub view_id: String,
     pub cache_basename: String,
@@ -203,8 +212,8 @@ struct MappingWire {
 /// Parse and validate the schema-v3 sidecar against the immutable original.
 ///
 /// The returned mappings are safe for fixture conversion and hydration planning,
-/// but production cache activation remains deliberately disabled until the final
-/// v0.0.25 PDF-tail and cache-location gate is merged and imported.
+/// but production cache activation remains deliberately disabled until the shared
+/// native hydration, rollback, and idempotent-reimport hardware gate passes.
 pub fn parse_virtual_spread_manifest(
     bytes: &[u8],
     expected_original_pdf_sha256: &str,
@@ -348,6 +357,8 @@ fn validate_wire(
         spread_size: wire.output.spread_size,
         gutter: wire.output.gutter,
         cover_separate: wire.cover_separate,
+        layout_authority_sha256: wire.output.layout_authority_sha256,
+        link_authority_sha256: wire.output.link_authority_sha256,
         mapping_authority_sha256,
         view_id,
         cache_basename,
