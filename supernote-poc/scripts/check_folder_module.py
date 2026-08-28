@@ -104,6 +104,8 @@ def main() -> None:
         "inkBridgeDirectory.parentFile?.canonicalFile == sharedStorageRoot",
         'sidecarJson.optString("schema") == "techrebbe.supernote.virtual-spread/v3"',
         'File(context.outgoing, "spread-pages-$suffix.json")',
+        '"page-%04d.json".format(Locale.ROOT, representedPages.single() + 1)',
+        '"%04d".format(Locale.ROOT, it + 1)',
         "acceptedSupernoteSourceViewHashes(context)",
         'checkpointHashes(checkpoint, "supernoteAcceptedContentSha256")',
         'checkpointHashes(value, "supernoteAcceptedSourceViewSha256")',
