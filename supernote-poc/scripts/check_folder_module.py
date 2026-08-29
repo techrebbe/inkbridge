@@ -27,6 +27,9 @@ def main() -> None:
     native_viewport = (
         root / "native" / "InkBridgeNativeViewport.kt.template"
     ).read_text(encoding="utf-8")
+    manifest_progress = (
+        root / "native" / "InkBridgeManifestProgress.kt.template"
+    ).read_text(encoding="utf-8")
     viewport_core = (
         root / "overlay" / "nativeViewportProviderCore.js"
     ).read_text(encoding="utf-8")
@@ -125,6 +128,8 @@ def main() -> None:
         "Could not retire superseded native export",
         "fun getNativeViewport(",
         "nativeViewportReader.read(",
+        "fun recordVirtualSpreadStepApplied(",
+        "manifestProgress.record(",
     ):
         if required not in module:
             fail(f"native module is missing required invariant: {required}")
@@ -148,11 +153,13 @@ def main() -> None:
     for required in (
         "collectCurrentVirtualSpread(",
         "validateDocumentIdentity before identity persistence",
-        "return applyVirtualSpreadManifest(",
+        "const applied = await applyVirtualSpreadManifest(",
         "fixtureNativeDescriptor(representation)",
         "await currentNativeViewport(",
         "requireSameNativeViewport(",
         "nativeViewportMap(nativeViewport)",
+        "planVirtualSpreadDelivery(",
+        "recordVirtualSpreadStepApplied(",
     ):
         if required not in companion:
             fail(f"Virtual Spread folder integration is missing: {required}")
@@ -175,6 +182,16 @@ def main() -> None:
         ],
         "Virtual Spread identity persistence document revalidation",
     )
+    ordered(
+        companion[companion.find(": await collectCurrentSupernotePage(identity.documentId)") :],
+        [
+            ": await collectCurrentSupernotePage(identity.documentId)",
+            "if (representation)",
+            "requireSameNativeViewport(",
+            "await native.publishPageExport(",
+        ],
+        "unconditional post-collection viewport revalidation",
+    )
     for required in (
         '"com.techrebbe.supernote.virtualspread.viewport"',
         '"com.techrebbe.supernote.virtualspread"',
@@ -193,6 +210,7 @@ def main() -> None:
             fail(f"native viewport consumer is missing required invariant: {required}")
     for required in (
         "InkBridgeNativeViewport.kt.template",
+        "InkBridgeManifestProgress.kt.template",
         "com.techrebbe.supernote.virtualspread.viewport",
     ):
         if required not in installer:
@@ -203,9 +221,19 @@ def main() -> None:
         "nativeViewportForVirtualSpread(",
         "expected.pageLoadGeneration !== current.pageLoadGeneration",
         "expected.snapshotId !== current.snapshotId",
+        "requireVirtualSpreadProgress",
+        "completedVirtualSpreadDelivery",
     ):
         if required not in viewport_core:
             fail(f"native viewport JavaScript boundary is incomplete: {required}")
+    for required in (
+        "completedStepIds",
+        "Virtual Spread step progress changed after it was committed",
+        "Os.rename(",
+        "output.fd.sync()",
+    ):
+        if required not in manifest_progress:
+            fail(f"Virtual Spread manifest progress is incomplete: {required}")
     print("InkBridge native folder invariants passed")
 
 

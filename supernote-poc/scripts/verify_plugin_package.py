@@ -15,6 +15,7 @@ EXPECTED_REACT_PACKAGES = ["com.inkbridgepoc.InkBridgeFolderPackage"]
 EXPECTED_NATIVE_CLASSES = (
     b"InkBridgeFolderModule",
     b"InkBridgeFolderPackage",
+    b"InkBridgeManifestProgress",
     b"InkBridgeNativeViewport",
 )
 MINIMUM_NATIVE_APK_SIZE = 1_000_000
@@ -105,6 +106,7 @@ def verify(package_path: Path, root: Path) -> None:
                 b"INKBRIDGE_FOLDER_DONE",
                 b"publishPageExport",
                 b"getNativeViewport",
+                b"recordVirtualSpreadStepApplied",
                 b"rtl-reader-native-viewport-v1",
             ):
                 if marker not in bundle:

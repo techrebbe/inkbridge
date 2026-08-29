@@ -1,0 +1,256 @@
+package __PACKAGE__
+
+import android.system.Os
+import android.system.OsConstants
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.charset.StandardCharsets
+import java.util.UUID
+
+/**
+ * Durable phase/page progress for one Virtual Spread manifest delivery.
+ *
+ * RTL Reader intentionally exposes presentation authority only for the page
+ * that is currently open. A manifest may target several physical spread
+ * pages, so InkBridge applies one authorized page at a time, completes all
+ * destination upserts before explicit deletions, and acknowledges the
+ * delivery only after every step has been recorded here.
+ */
+class InkBridgeManifestProgress {
+    companion object {
+        private const val SCHEMA_VERSION = 1
+        private const val MAX_PROGRESS_BYTES = 256 * 1024
+        private val KEYS = setOf(
+            "schemaVersion",
+            "documentId",
+            "documentPath",
+            "deliveryId",
+            "manifestId",
+            "steps",
+        )
+        private val STEP_KEYS = setOf("stepId", "summary")
+        private val STEP_ID = Regex("^(upsert|delete):(0|[1-9][0-9]*)$")
+        private val SUMMARY_KEYS = setOf(
+            "operationCount",
+            "added",
+            "updated",
+            "deleted",
+            "skipped",
+        )
+    }
+
+    data class Summary(
+        val operationCount: Int,
+        val added: Int,
+        val updated: Int,
+        val deleted: Int,
+        val skipped: Int,
+    ) {
+        fun toJson(): JSONObject = JSONObject()
+            .put("operationCount", operationCount)
+            .put("added", added)
+            .put("updated", updated)
+            .put("deleted", deleted)
+            .put("skipped", skipped)
+
+        operator fun plus(other: Summary): Summary = Summary(
+            Math.addExact(operationCount, other.operationCount),
+            Math.addExact(added, other.added),
+            Math.addExact(updated, other.updated),
+            Math.addExact(deleted, other.deleted),
+            Math.addExact(skipped, other.skipped),
+        )
+    }
+
+    data class Progress(val steps: Map<String, Summary>) {
+        fun completedSteps(): List<String> = steps.keys.sorted()
+
+        fun aggregate(): Summary = steps.values.fold(
+            Summary(0, 0, 0, 0, 0),
+        ) { total, summary -> total + summary }
+
+        fun toResponseJson(): JSONObject = JSONObject()
+            .put("completedStepIds", JSONArray(completedSteps()))
+            .put("summary", aggregate().toJson())
+    }
+
+    fun load(
+        directory: File,
+        documentId: String,
+        documentPath: String,
+        deliveryId: String,
+        manifestId: String,
+    ): Progress {
+        val file = progressFile(directory, deliveryId)
+        if (!file.isFile) return Progress(emptyMap())
+        require(file.canonicalFile.parentFile == directory.canonicalFile) {
+            "Virtual Spread progress escaped its acknowledgement directory"
+        }
+        require(file.length() in 1L..MAX_PROGRESS_BYTES.toLong()) {
+            "Virtual Spread progress is empty or too large"
+        }
+        val bytes = FileInputStream(file).use { it.readBytes() }
+        require(bytes.size <= MAX_PROGRESS_BYTES) {
+            "Virtual Spread progress changed while it was read"
+        }
+        val value = JSONObject(String(bytes, StandardCharsets.UTF_8))
+        require(value.keySet() == KEYS) {
+            "Virtual Spread progress contains missing or unexpected fields"
+        }
+        require(value.get("schemaVersion") is Int && value.getInt("schemaVersion") == SCHEMA_VERSION) {
+            "Virtual Spread progress has an unsupported schema"
+        }
+        require(value.optString("documentId") == documentId) {
+            "Virtual Spread progress belongs to another document"
+        }
+        require(value.optString("documentPath") == documentPath) {
+            "Virtual Spread progress belongs to another cache path"
+        }
+        require(value.optString("deliveryId") == deliveryId) {
+            "Virtual Spread progress belongs to another delivery"
+        }
+        require(value.optString("manifestId") == manifestId) {
+            "Virtual Spread progress belongs to another manifest"
+        }
+        val steps = value.getJSONArray("steps")
+        val parsed = linkedMapOf<String, Summary>()
+        for (index in 0 until steps.length()) {
+            val step = steps.getJSONObject(index)
+            require(step.keySet() == STEP_KEYS) {
+                "Virtual Spread step progress contains unexpected fields"
+            }
+            require(step.get("stepId") is String) {
+                "Virtual Spread step identity has the wrong type"
+            }
+            val stepId = requireStepId(step.getString("stepId"))
+            require(stepId !in parsed) {
+                "Virtual Spread step progress is duplicated"
+            }
+            parsed[stepId] = parseSummary(step.getJSONObject("summary"))
+        }
+        require(parsed.keys.toList() == parsed.keys.sorted()) {
+            "Virtual Spread step progress is not canonical"
+        }
+        return Progress(parsed)
+    }
+
+    fun record(
+        directory: File,
+        documentId: String,
+        documentPath: String,
+        deliveryId: String,
+        manifestId: String,
+        stepId: String,
+        summaryJson: String,
+    ): Progress {
+        requireStepId(stepId)
+        val summaryValue = JSONObject(summaryJson)
+        val summary = parseSummary(summaryValue)
+        val current = load(directory, documentId, documentPath, deliveryId, manifestId)
+        current.steps[stepId]?.let { existing ->
+            require(existing == summary) {
+                "Virtual Spread step progress changed after it was committed"
+            }
+            return current
+        }
+        val steps = current.steps.toMutableMap().apply {
+            put(stepId, summary)
+        }.toSortedMap()
+        val value = JSONObject()
+            .put("schemaVersion", SCHEMA_VERSION)
+            .put("documentId", documentId)
+            .put("documentPath", documentPath)
+            .put("deliveryId", deliveryId)
+            .put("manifestId", manifestId)
+            .put(
+                "steps",
+                JSONArray().also { array ->
+                    for ((recordedStepId, stepSummary) in steps) {
+                        array.put(
+                            JSONObject()
+                                .put("stepId", recordedStepId)
+                                .put("summary", stepSummary.toJson()),
+                        )
+                    }
+                },
+            )
+        atomicWrite(
+            progressFile(directory, deliveryId),
+            (value.toString() + "\n").toByteArray(StandardCharsets.UTF_8),
+        )
+        return Progress(steps)
+    }
+
+    fun retire(directory: File, deliveryId: String) {
+        val file = progressFile(directory, deliveryId)
+        if (!file.exists()) return
+        check(file.delete()) { "Could not retire Virtual Spread delivery progress" }
+        syncDirectory(directory)
+    }
+
+    private fun parseSummary(value: JSONObject): Summary {
+        require(value.keySet() == SUMMARY_KEYS) {
+            "Virtual Spread page summary contains missing or unexpected fields"
+        }
+        fun count(key: String): Int {
+            require(value.get(key) is Int) {
+                "Virtual Spread page summary $key has the wrong type"
+            }
+            return value.getInt(key).also {
+                require(it >= 0) { "Virtual Spread page summary $key is invalid" }
+            }
+        }
+        return Summary(
+            operationCount = count("operationCount"),
+            added = count("added"),
+            updated = count("updated"),
+            deleted = count("deleted"),
+            skipped = count("skipped"),
+        )
+    }
+
+    private fun progressFile(directory: File, deliveryId: String): File =
+        File(directory, "$deliveryId.progress.json")
+
+    private fun requireStepId(value: String): String {
+        require(value.matches(STEP_ID)) { "Virtual Spread step identity is invalid" }
+        require(value.substringAfter(':').toIntOrNull() != null) {
+            "Virtual Spread step page index is outside int32"
+        }
+        return value
+    }
+
+    private fun atomicWrite(destination: File, bytes: ByteArray) {
+        val temporary = File(
+            destination.parentFile,
+            ".${destination.name}.${UUID.randomUUID()}.part",
+        )
+        try {
+            FileOutputStream(temporary).use { output ->
+                output.write(bytes)
+                output.flush()
+                output.fd.sync()
+            }
+            Os.rename(temporary.absolutePath, destination.absolutePath)
+            syncDirectory(destination.parentFile!!)
+        } finally {
+            temporary.delete()
+        }
+    }
+
+    private fun syncDirectory(directory: File) {
+        var descriptor: java.io.FileDescriptor? = null
+        try {
+            descriptor = Os.open(directory.absolutePath, OsConstants.O_RDONLY, 0)
+            Os.fsync(descriptor)
+        } catch (_: Throwable) {
+            // Shared storage may reject directory fsync after the file itself
+            // has been synced. Match the folder module's best-effort policy.
+        } finally {
+            descriptor?.let { runCatching { Os.close(it) } }
+        }
+    }
+}

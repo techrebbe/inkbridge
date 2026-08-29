@@ -37,6 +37,12 @@ native bridge accepts only the expected provider package and release certificate
 the exact canonical descriptor and activation evidence. It never persists the descriptor or
 reconstructs it from dimensions; a page-load, restart, or cache mismatch leaves the action
 unavailable until RTL Reader publishes a fresh record.
+If one incoming manifest touches more than one physical Virtual Spread page, Apply stages the
+authorized current page and records durable progress without acknowledging the delivery. The
+status tells the user which spread page to open next; the delivery is acknowledged only after all
+target pages have been applied. All destination upsert steps precede explicit source deletions,
+including moves across different spreads. Progress is bound to the exact cache path and delivery;
+a retry after interruption is idempotent and cannot reuse progress from a replacement cache.
 
 Configure `inkbridge-folder-transport` to use that document directory's `outgoing` and `incoming`
 paths after the whole document directory, including `acknowledged`, is mirrored to the machine

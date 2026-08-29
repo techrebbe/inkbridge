@@ -97,6 +97,7 @@ class InkBridgeFolderModule(
     private val worker = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "InkBridgeFolderWorker").apply { isDaemon = true }
     }
+    private val manifestProgress = InkBridgeManifestProgress()
     private val nativeViewportReader = InkBridgeNativeViewport(reactContext)
     override fun getName(): String = MODULE_NAME
 
@@ -289,14 +290,62 @@ class InkBridgeFolderModule(
                 return@onWorker statusJson(context).toString()
             }
             val next = pending.first()
-            JSONObject()
+            val response = JSONObject()
                 .put("status", "pending")
                 .put("documentId", context.documentId)
                 .put("deliveryId", next.deliveryId)
                 .put("fileName", next.file.name)
                 .put("pendingCount", pending.size)
                 .put("manifest", next.manifest)
-                .toString()
+            val manifestId = next.manifest.getString("manifestId")
+            val progress = manifestProgress.load(
+                context.acknowledged,
+                context.documentId,
+                context.pdf.absolutePath,
+                next.deliveryId,
+                manifestId,
+            )
+            response.put("virtualSpreadProgress", progress.toResponseJson())
+            response.toString()
+        }
+    }
+
+    @ReactMethod
+    fun recordVirtualSpreadStepApplied(
+        filePath: String,
+        deliveryId: String,
+        manifestId: String,
+        stepId: String,
+        summaryJson: String,
+        representationJson: String,
+        promise: Promise,
+    ) {
+        onWorker(promise, "INKBRIDGE_VIRTUAL_PAGE_PROGRESS_FAILED") {
+            require(representationJson.isNotBlank()) {
+                "Virtual Spread progress requires an authenticated representation"
+            }
+            requireDeliveryId(deliveryId)
+            require(manifestId.isNotBlank() && manifestId.length <= 512) {
+                "Invalid manifestId"
+            }
+            val context = documentContext(filePath, representationJson)
+            val pending = pendingManifests(context)
+                .firstOrNull { it.deliveryId == deliveryId }
+                ?: throw IllegalStateException(
+                    "Incoming manifest $deliveryId is no longer present",
+                )
+            require(pending.manifest.optString("manifestId") == manifestId) {
+                "Manifest identity changed before Virtual Spread progress was recorded"
+            }
+            manifestProgress.record(
+                context.acknowledged,
+                context.documentId,
+                context.pdf.absolutePath,
+                deliveryId,
+                manifestId,
+                stepId,
+                summaryJson,
+            ).toResponseJson().toString()
         }
     }
 
@@ -356,6 +405,11 @@ class InkBridgeFolderModule(
                     .onFailure { error ->
                         Log.w(LOG_TAG, "Could not retire stale failure for $deliveryId", error)
                     }
+                runCatching {
+                    manifestProgress.retire(context.acknowledged, deliveryId)
+                }.onFailure { error ->
+                    Log.w(LOG_TAG, "Could not retire progress for $deliveryId", error)
+                }
                 return@onWorker JSONObject()
                     .put("status", "synced")
                     .put("documentId", context.documentId)
@@ -401,6 +455,13 @@ class InkBridgeFolderModule(
                 ack,
                 appendNewline(acknowledgement.toString().toByteArray(StandardCharsets.UTF_8)),
             )
+            runCatching {
+                manifestProgress.retire(context.acknowledged, deliveryId)
+            }.onFailure { error ->
+                // The acknowledgement is already committed. Stale progress is
+                // ignored while that acknowledgement remains valid.
+                Log.w(LOG_TAG, "Could not retire progress for $deliveryId", error)
+            }
             runCatching {
                 val priorFailure = failureFile(context, deliveryId)
                 if (priorFailure.exists()) {

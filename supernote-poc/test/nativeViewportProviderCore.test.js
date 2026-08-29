@@ -3,7 +3,9 @@ import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
 import {
+  completedVirtualSpreadDelivery,
   nativeViewportMap,
+  planVirtualSpreadDelivery,
   requireNativeViewportResult,
   requireSameNativeViewport,
 } from '../overlay/nativeViewportProviderCore.js';
@@ -120,4 +122,162 @@ test('rejects unsafe generation and publication evidence', () => {
       /invalid/,
     );
   }
+});
+
+const emptyProgress = Object.freeze({
+  completedStepIds: [],
+  summary: {
+    operationCount: 0,
+    added: 0,
+    updated: 0,
+    deleted: 0,
+    skipped: 0,
+  },
+});
+
+const multiSpreadManifest = Object.freeze({
+  schemaVersion: 1,
+  manifestId: 'multi-spread',
+  operations: [
+    {type: 'upsert_stroke', sourceUuid: 'cover', pageIndex: 0},
+    {type: 'upsert_stroke', sourceUuid: 'right', pageIndex: 1},
+    {type: 'delete_stroke', sourceUuid: 'left', pageIndex: 2},
+  ],
+});
+
+test('stages a multi-spread manifest against only the currently authorized page', () => {
+  const first = planVirtualSpreadDelivery(
+    multiSpreadManifest,
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    1,
+    emptyProgress,
+  );
+  assert.deepEqual(first.steps.map(step => step.id), ['upsert:0', 'upsert:1', 'delete:1']);
+  assert.deepEqual(
+    first.manifest.operations.map(operation => operation.sourceUuid),
+    ['right'],
+  );
+
+  const afterFirst = {
+    completedStepIds: ['upsert:1'],
+    summary: {
+      operationCount: 1,
+      added: 1,
+      updated: 0,
+      deleted: 0,
+      skipped: 0,
+    },
+  };
+  const waiting = planVirtualSpreadDelivery(
+    multiSpreadManifest,
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    1,
+    afterFirst,
+  );
+  assert.equal(waiting.manifest, null);
+  assert.equal(waiting.nextPage, 0);
+
+  const second = planVirtualSpreadDelivery(
+    multiSpreadManifest,
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    0,
+    afterFirst,
+  );
+  assert.deepEqual(
+    second.manifest.operations.map(operation => operation.sourceUuid),
+    ['cover'],
+  );
+});
+
+test('completes and aggregates a page-staged manifest only after every operation', () => {
+  const progress = {
+    completedStepIds: ['delete:1', 'upsert:0', 'upsert:1'],
+    summary: {
+      operationCount: 3,
+      added: 2,
+      updated: 0,
+      deleted: 1,
+      skipped: 0,
+    },
+  };
+  const plan = planVirtualSpreadDelivery(
+    multiSpreadManifest,
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    1,
+    progress,
+  );
+  assert.equal(plan.complete, true);
+  assert.deepEqual(
+    completedVirtualSpreadDelivery(
+      multiSpreadManifest,
+      plan.steps,
+      progress,
+    ),
+    {
+      complete: true,
+      manifestId: 'multi-spread',
+      operationCount: 3,
+      added: 2,
+      updated: 0,
+      deleted: 1,
+      skipped: 0,
+    },
+  );
+  assert.throws(
+    () => planVirtualSpreadDelivery(
+      multiSpreadManifest,
+      PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+      1,
+      {...progress, summary: {...progress.summary, operationCount: 2}},
+    ),
+    /does not cover every operation/,
+  );
+});
+
+test('cross-spread move inserts the destination before allowing source deletion', () => {
+  const manifest = {
+    manifestId: 'move',
+    operations: [
+      {type: 'delete_stroke', sourceUuid: 'move-me', pageIndex: 0},
+      {type: 'upsert_stroke', sourceUuid: 'move-me', pageIndex: 2},
+    ],
+  };
+  const sourceFirst = planVirtualSpreadDelivery(
+    manifest,
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    0,
+    emptyProgress,
+  );
+  assert.equal(sourceFirst.manifest, null);
+  assert.equal(sourceFirst.nextPage, 1);
+  const afterDestination = {
+    completedStepIds: ['upsert:1'],
+    summary: {operationCount: 1, added: 1, updated: 0, deleted: 0, skipped: 0},
+  };
+  const sourceAfter = planVirtualSpreadDelivery(
+    manifest,
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    0,
+    afterDestination,
+  );
+  assert.equal(sourceAfter.stepId, 'delete:0');
+  assert.equal(sourceAfter.manifest.operations[0].type, 'delete_stroke');
+});
+
+test('same-spread cross-half move remains one indivisible transformation step', () => {
+  const manifest = {
+    manifestId: 'cross-half',
+    operations: [
+      {type: 'delete_stroke', sourceUuid: 'move-me', pageIndex: 1},
+      {type: 'upsert_stroke', sourceUuid: 'move-me', pageIndex: 2},
+    ],
+  };
+  const plan = planVirtualSpreadDelivery(
+    manifest,
+    PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    1,
+    emptyProgress,
+  );
+  assert.deepEqual(plan.steps.map(step => step.id), ['upsert:1']);
+  assert.equal(plan.manifest.operations.length, 2);
 });

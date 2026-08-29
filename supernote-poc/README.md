@@ -17,6 +17,10 @@ certificate, the authenticated representation request, response envelope, canoni
 bytes, and activation evidence before JavaScript derives the inverse. Page dimensions or aspect
 ratio are never treated as proof of the reader's rotation, inset, or PDF placement. An unavailable
 or stale provider record fails closed and leaves the folder delivery retryable.
+Manifests spanning several physical spreads are applied one currently authorized spread at a
+time, with destination insertions completed before explicit deletions. Durable cache-path-bound
+progress survives reloads and power loss, and the original manifest is not acknowledged until all
+of its operations have been applied.
 
 The earlier hardware proofs and repair-build notes are retained below as the evidence behind the
 current converter and native manifest application.

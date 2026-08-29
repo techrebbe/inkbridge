@@ -35,6 +35,7 @@ def main() -> None:
     for source_name in (
         "InkBridgeFolderModule.kt.template",
         "InkBridgeFolderPackage.kt.template",
+        "InkBridgeManifestProgress.kt.template",
         "InkBridgeNativeViewport.kt.template",
     ):
         source = repo_root / "native" / source_name

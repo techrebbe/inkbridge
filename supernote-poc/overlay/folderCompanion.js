@@ -15,7 +15,9 @@ import {
   requireSameDocumentPath,
 } from './folderCompanionCore';
 import {
+  completedVirtualSpreadDelivery,
   nativeViewportMap,
+  planVirtualSpreadDelivery,
   requireNativeViewportResult,
   requireSameNativeViewport,
 } from './nativeViewportProviderCore';
@@ -124,6 +126,17 @@ export async function publishCurrentPageExport() {
         nativeViewport.descriptor,
       )
     : await collectCurrentSupernotePage(identity.documentId);
+  if (representation) {
+    requireSameNativeViewport(
+      nativeViewport,
+      await currentNativeViewport(
+        native,
+        filePath,
+        representation,
+        nativeDescriptor,
+      ),
+    );
+  }
   await revalidateCollectedDocument(filePath, async () => collected.filePath);
   await revalidateCollectedDocument(collected.filePath, currentFilePath);
   const result = parseNativeJson(
@@ -169,18 +182,77 @@ export async function applyNextFolderManifest() {
     },
     apply: async manifest => {
       if (!representation) return applyManifest(manifest, filePath, true);
+      const currentVirtualPageIndex = requirePluginResult(
+        await PluginCommAPI.getCurrentPageNum(),
+        'getCurrentPageNum before Virtual Spread delivery staging',
+      );
+      const plan = planVirtualSpreadDelivery(
+        manifest,
+        representation,
+        currentVirtualPageIndex,
+        delivery.virtualSpreadProgress,
+      );
+      if (plan.complete) {
+        return completedVirtualSpreadDelivery(
+          manifest,
+          plan.steps,
+          plan.progress,
+        );
+      }
+      if (!plan.manifest) {
+        return {
+          status: 'pending',
+          acknowledge: false,
+          message:
+            `Open Virtual Spread page ${plan.nextPage + 1}, then tap Apply InkBridge Sync again.`,
+        };
+      }
       const nativeViewport = await currentNativeViewport(
         native,
         filePath,
         representation,
         nativeDescriptor,
       );
-      return applyVirtualSpreadManifest(
-        manifest,
+      const applied = await applyVirtualSpreadManifest(
+        plan.manifest,
         representation,
         filePath,
         nativeViewportMap(nativeViewport),
       );
+      const progress = parseNativeJson(
+        await native.recordVirtualSpreadStepApplied(
+          filePath,
+          delivery.deliveryId,
+          manifest.manifestId,
+          plan.stepId,
+          JSON.stringify({
+            operationCount: plan.manifest.operations.length,
+            added: applied.added,
+            updated: applied.updated,
+            deleted: applied.deleted,
+            skipped: applied.skipped,
+          }),
+          nativeDescriptor,
+        ),
+        'recordVirtualSpreadStepApplied',
+      );
+      const completed = completedVirtualSpreadDelivery(
+        manifest,
+        plan.steps,
+        progress,
+      );
+      if (!completed.complete) {
+        const nextPage = plan.steps.find(
+          step => !progress.completedStepIds.includes(step.id),
+        ).page;
+        return {
+          status: 'pending',
+          acknowledge: false,
+          message:
+            `Applied this spread. Open Virtual Spread page ${nextPage + 1}, then tap Apply InkBridge Sync again.`,
+        };
+      }
+      return completed;
     },
     acknowledge: async ({deliveryId, manifestId, applied}) =>
       parseNativeJson(
