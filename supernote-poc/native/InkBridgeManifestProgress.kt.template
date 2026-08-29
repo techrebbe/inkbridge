@@ -97,7 +97,7 @@ class InkBridgeManifestProgress {
             "Virtual Spread progress changed while it was read"
         }
         val value = JSONObject(String(bytes, StandardCharsets.UTF_8))
-        require(value.keySet() == KEYS) {
+        require(value.keys().asSequence().toSet() == KEYS) {
             "Virtual Spread progress contains missing or unexpected fields"
         }
         require(value.get("schemaVersion") is Int && value.getInt("schemaVersion") == SCHEMA_VERSION) {
@@ -119,7 +119,7 @@ class InkBridgeManifestProgress {
         val parsed = linkedMapOf<String, Summary>()
         for (index in 0 until steps.length()) {
             val step = steps.getJSONObject(index)
-            require(step.keySet() == STEP_KEYS) {
+            require(step.keys().asSequence().toSet() == STEP_KEYS) {
                 "Virtual Spread step progress contains unexpected fields"
             }
             require(step.get("stepId") is String) {
@@ -192,7 +192,7 @@ class InkBridgeManifestProgress {
     }
 
     private fun parseSummary(value: JSONObject): Summary {
-        require(value.keySet() == SUMMARY_KEYS) {
+        require(value.keys().asSequence().toSet() == SUMMARY_KEYS) {
             "Virtual Spread page summary contains missing or unexpected fields"
         }
         fun count(key: String): Int {
