@@ -202,6 +202,15 @@ def main() -> None:
         ],
         "post-apply viewport fence before durable progress and redraw",
     )
+    ordered(
+        companion[companion.find("if (plan.complete)") :],
+        [
+            "if (plan.complete)",
+            "await PluginCommAPI.reloadFile()",
+            "return completedVirtualSpreadDelivery(",
+        ],
+        "completed-delivery redraw retry before acknowledgement",
+    )
     for required in (
         '"com.techrebbe.supernote.virtualspread.viewport"',
         '"com.techrebbe.supernote.virtualspread"',

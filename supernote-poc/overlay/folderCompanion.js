@@ -194,6 +194,12 @@ export async function applyNextFolderManifest() {
         delivery.virtualSpreadProgress,
       );
       if (plan.complete) {
+        // A previous attempt may have committed its final step but failed to
+        // redraw. Retry the redraw before the whole delivery is acknowledged.
+        requirePluginResult(
+          await PluginCommAPI.reloadFile(),
+          'reloadFile before acknowledging completed Virtual Spread delivery',
+        );
         return completedVirtualSpreadDelivery(
           manifest,
           plan.steps,
