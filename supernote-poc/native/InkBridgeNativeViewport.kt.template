@@ -1,0 +1,406 @@
+package __PACKAGE__
+
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import com.facebook.react.bridge.ReactApplicationContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.Locale
+
+/**
+ * Security and wire boundary for RTL Reader's memory-only viewport authority.
+ *
+ * The provider owns live presentation state. InkBridge independently verifies
+ * the provider package/signature, the request evidence, the exact response
+ * envelope, and the canonical descriptor before JavaScript may use it.
+ */
+class InkBridgeNativeViewport(
+    private val reactContext: ReactApplicationContext,
+) {
+    companion object {
+        private const val PROVIDER_AUTHORITY =
+            "com.techrebbe.supernote.virtualspread.viewport"
+        private val PROVIDER_URI = Uri.parse(
+            "content://$PROVIDER_AUTHORITY/v1/current",
+        )
+        private const val PROVIDER_METHOD = "get_v1"
+        private const val PROVIDER_PACKAGE =
+            "com.techrebbe.supernote.virtualspread"
+        private const val PROVIDER_CERTIFICATE_SHA256 =
+            "a5a8551131de84d41660a3cf22d224f320f7a2f05a380282f76f6fe731807c67"
+        private const val DESCRIPTOR_AUTHORITY =
+            "rtl-reader-native-viewport-v1"
+        private const val DOCUMENT_ID_PREFIX = "inkbridge-doc-v1-"
+        private const val VIEW_ID_PREFIX = "inkbridge-view-v1-"
+        private const val SINGULARITY_EPSILON = 1.0e-12
+        private val SHA256 = Regex("^[0-9a-f]{64}$")
+        private val RESPONSE_KEYS = setOf(
+            "protocolVersion",
+            "status",
+            "descriptorJson",
+            "descriptorSha256",
+            "documentPath",
+            "sidecarPath",
+            "generatedPdfSha256",
+            "sidecarSha256",
+            "mappingAuthoritySha256",
+            "snapshotId",
+            "pdfIdentity",
+            "sidecarIdentity",
+            "verificationGeneration",
+            "pageLoadGeneration",
+            "publishedAtElapsedRealtime",
+        )
+        private val UNAVAILABLE_KEYS = setOf("protocolVersion", "status")
+    }
+
+    private data class Descriptor(
+        val documentId: String,
+        val viewId: String,
+        val virtualPageIndex: Int,
+        val nativeWidth: Int,
+        val nativeHeight: Int,
+        val spreadToNative: DoubleArray,
+    ) {
+        fun canonicalJson(): String = buildString(512) {
+            append('{')
+            append("\"schemaVersion\":1,")
+            append("\"authority\":\"")
+            append(DESCRIPTOR_AUTHORITY)
+            append("\",")
+            append("\"documentId\":\"")
+            append(documentId)
+            append("\",")
+            append("\"viewId\":\"")
+            append(viewId)
+            append("\",")
+            append("\"virtualPageIndex\":")
+            append(virtualPageIndex)
+            append(',')
+            append("\"nativePageSize\":[")
+            append(nativeWidth)
+            append(',')
+            append(nativeHeight)
+            append("],")
+            append("\"spreadToNative\":[")
+            spreadToNative.forEachIndexed { index, value ->
+                if (index > 0) append(',')
+                append(
+                    java.lang.Double.toString(
+                        if (value == 0.0) 0.0 else value,
+                    ),
+                )
+            }
+            append("]}")
+        }
+    }
+
+    fun read(
+        documentPath: String,
+        documentId: String,
+        viewId: String,
+        virtualPageIndex: Int,
+        nativeWidth: Int,
+        nativeHeight: Int,
+        generatedPdfSha256: String,
+        sidecarSha256: String,
+        mappingAuthoritySha256: String,
+    ): JSONObject {
+        verifyProviderPackage()
+        requireIdentity(documentId, DOCUMENT_ID_PREFIX, "documentId")
+        requireIdentity(viewId, VIEW_ID_PREFIX, "viewId")
+        require(virtualPageIndex >= 0) { "virtualPageIndex is invalid" }
+        require(nativeWidth > 1 && nativeHeight > 1) {
+            "native page dimensions are invalid"
+        }
+        require(documentPath.isNotBlank()) { "documentPath is required" }
+        requireSha256(generatedPdfSha256, "generatedPdfSha256")
+        requireSha256(sidecarSha256, "sidecarSha256")
+        requireSha256(mappingAuthoritySha256, "mappingAuthoritySha256")
+
+        val request = Bundle().apply {
+            putString("documentId", documentId)
+            putString("viewId", viewId)
+            putInt("virtualPageIndex", virtualPageIndex)
+            putInt("nativeWidth", nativeWidth)
+            putInt("nativeHeight", nativeHeight)
+            putString("documentPath", documentPath)
+            putString("generatedPdfSha256", generatedPdfSha256)
+            putString("sidecarSha256", sidecarSha256)
+            putString("mappingAuthoritySha256", mappingAuthoritySha256)
+        }
+        val response = reactContext.contentResolver.call(
+            PROVIDER_URI,
+            PROVIDER_METHOD,
+            null,
+            request,
+        ) ?: throw IllegalStateException("RTL Reader viewport provider returned no response")
+
+        requireExactInt(response, "protocolVersion", 1)
+        val status = requireString(response, "status")
+        if (status == "unavailable") {
+            require(response.keySet() == UNAVAILABLE_KEYS) {
+                "RTL Reader unavailable response contains unexpected fields"
+            }
+            return JSONObject()
+                .put("protocolVersion", 1)
+                .put("status", "unavailable")
+        }
+        require(status == "ok") { "RTL Reader viewport response status is invalid" }
+        require(response.keySet() == RESPONSE_KEYS) {
+            "RTL Reader viewport response contains missing or unexpected fields"
+        }
+
+        val descriptorJson = requireString(response, "descriptorJson")
+        val descriptorSha256 = requireSha256(
+            requireString(response, "descriptorSha256"),
+            "descriptorSha256",
+        )
+        require(sha256(descriptorJson) == descriptorSha256) {
+            "RTL Reader viewport descriptor hash does not match its bytes"
+        }
+        val descriptor = parseCanonicalDescriptor(descriptorJson)
+        require(
+            descriptor.documentId == documentId &&
+                descriptor.viewId == viewId &&
+                descriptor.virtualPageIndex == virtualPageIndex &&
+                descriptor.nativeWidth == nativeWidth &&
+                descriptor.nativeHeight == nativeHeight,
+        ) {
+            "RTL Reader viewport descriptor does not match the active document page"
+        }
+
+        require(requireString(response, "documentPath") == documentPath) {
+            "RTL Reader viewport document path changed"
+        }
+        require(requireString(response, "sidecarPath") == "$documentPath.json") {
+            "RTL Reader viewport sidecar path is not the authenticated sibling"
+        }
+        require(
+            requireString(response, "generatedPdfSha256") == generatedPdfSha256 &&
+                requireString(response, "sidecarSha256") == sidecarSha256 &&
+                requireString(response, "mappingAuthoritySha256") == mappingAuthoritySha256,
+        ) {
+            "RTL Reader viewport representation hashes changed"
+        }
+        val pdfIdentity = requireString(response, "pdfIdentity")
+        val sidecarIdentity = requireString(response, "sidecarIdentity")
+        val snapshotId = requireString(response, "snapshotId")
+        require(snapshotId == "$pdfIdentity:$sidecarIdentity") {
+            "RTL Reader viewport snapshot does not bind both activated files"
+        }
+        val verificationGeneration = requireNonNegativeLong(
+            response,
+            "verificationGeneration",
+        )
+        val pageLoadGeneration = requireNonNegativeLong(
+            response,
+            "pageLoadGeneration",
+        )
+        val publishedAt = requireNonNegativeLong(
+            response,
+            "publishedAtElapsedRealtime",
+        )
+
+        return JSONObject()
+            .put("protocolVersion", 1)
+            .put("status", "ok")
+            .put("descriptor", JSONObject(descriptorJson))
+            .put("descriptorSha256", descriptorSha256)
+            .put("snapshotId", snapshotId)
+            .put("verificationGeneration", verificationGeneration)
+            .put("pageLoadGeneration", pageLoadGeneration)
+            .put("publishedAtElapsedRealtime", publishedAt)
+    }
+
+    private fun verifyProviderPackage() {
+        val packageManager = reactContext.packageManager
+        val provider = packageManager.resolveContentProvider(
+            PROVIDER_AUTHORITY,
+            PackageManager.MATCH_DISABLED_COMPONENTS,
+        ) ?: throw SecurityException("RTL Reader viewport provider is not installed")
+        require(
+            provider.packageName == PROVIDER_PACKAGE &&
+                provider.authority == PROVIDER_AUTHORITY &&
+                provider.exported &&
+                provider.enabled,
+        ) {
+            "RTL Reader viewport provider ownership is invalid"
+        }
+
+        @Suppress("DEPRECATION")
+        val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageManager.getPackageInfo(
+                PROVIDER_PACKAGE,
+                PackageManager.GET_SIGNING_CERTIFICATES,
+            )
+        } else {
+            packageManager.getPackageInfo(
+                PROVIDER_PACKAGE,
+                PackageManager.GET_SIGNATURES,
+            )
+        }
+        @Suppress("DEPRECATION")
+        val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageInfo.signingInfo?.apkContentsSigners
+        } else {
+            packageInfo.signatures
+        }
+        require(signatures != null && signatures.size == 1) {
+            "RTL Reader viewport provider signer set is invalid"
+        }
+        require(sha256(signatures.single().toByteArray()) == PROVIDER_CERTIFICATE_SHA256) {
+            "RTL Reader viewport provider signature is not trusted"
+        }
+    }
+
+    private fun parseCanonicalDescriptor(descriptorJson: String): Descriptor {
+        require(descriptorJson.toByteArray(StandardCharsets.UTF_8).size <= 4096) {
+            "RTL Reader viewport descriptor is too large"
+        }
+        val value = JSONObject(descriptorJson)
+        requireExactJsonInt(value, "schemaVersion", 1)
+        require(value.get("authority") is String) {
+            "RTL Reader viewport authority has the wrong type"
+        }
+        require(value.getString("authority") == DESCRIPTOR_AUTHORITY) {
+            "RTL Reader viewport authority is invalid"
+        }
+        val documentId = requireJsonString(value, "documentId")
+        val viewId = requireJsonString(value, "viewId")
+        requireIdentity(documentId, DOCUMENT_ID_PREFIX, "documentId")
+        requireIdentity(viewId, VIEW_ID_PREFIX, "viewId")
+        val virtualPageIndex = requireJsonInt(value, "virtualPageIndex")
+        require(virtualPageIndex >= 0) { "virtualPageIndex is invalid" }
+        val nativePageSize = requireJsonArray(value, "nativePageSize", 2)
+        val nativeWidth = requireArrayInt(nativePageSize, 0, "nativePageSize[0]")
+        val nativeHeight = requireArrayInt(nativePageSize, 1, "nativePageSize[1]")
+        require(nativeWidth > 1 && nativeHeight > 1) {
+            "nativePageSize is invalid"
+        }
+        val affineJson = requireJsonArray(value, "spreadToNative", 6)
+        val affine = DoubleArray(6) { index ->
+            val raw = affineJson.get(index)
+            require(raw is Number && raw !is Int && raw !is Long) {
+                "spreadToNative[$index] must be binary64"
+            }
+            positiveZero(raw.toDouble()).also { coefficient ->
+                require(coefficient.isFinite()) {
+                    "spreadToNative[$index] is not finite"
+                }
+            }
+        }
+        requireStable(affine)
+        val descriptor = Descriptor(
+            documentId,
+            viewId,
+            virtualPageIndex,
+            nativeWidth,
+            nativeHeight,
+            affine,
+        )
+        // Equality with the provider's frozen canonical wire rejects duplicate
+        // keys, unknown keys, alternate JSON types, reordered fields, signed
+        // zero, and noncanonical numeric spellings in one fail-closed check.
+        require(descriptorJson == descriptor.canonicalJson()) {
+            "RTL Reader viewport descriptor is not canonical"
+        }
+        return descriptor
+    }
+
+    private fun requireStable(transform: DoubleArray) {
+        val scale = maxOf(
+            kotlin.math.abs(transform[0]),
+            kotlin.math.abs(transform[1]),
+            kotlin.math.abs(transform[2]),
+            kotlin.math.abs(transform[3]),
+        )
+        require(scale > 0.0 && scale.isFinite()) {
+            "RTL Reader viewport transform is singular"
+        }
+        val determinant =
+            (transform[0] / scale) * (transform[3] / scale) -
+                (transform[1] / scale) * (transform[2] / scale)
+        require(determinant.isFinite() && kotlin.math.abs(determinant) > SINGULARITY_EPSILON) {
+            "RTL Reader viewport transform is numerically unstable"
+        }
+    }
+
+    private fun requireIdentity(value: String, prefix: String, label: String) {
+        require(
+            value.startsWith(prefix) &&
+                value.length == prefix.length + 64 &&
+                value.removePrefix(prefix).matches(SHA256),
+        ) { "$label is invalid" }
+    }
+
+    private fun requireSha256(value: String, label: String): String {
+        require(value.matches(SHA256)) { "$label is invalid" }
+        return value
+    }
+
+    private fun requireString(bundle: Bundle, key: String): String {
+        require(bundle.containsKey(key) && bundle.get(key) is String) {
+            "$key is missing or has the wrong type"
+        }
+        return bundle.getString(key)?.takeIf { it.isNotEmpty() }
+            ?: throw IllegalArgumentException("$key is empty")
+    }
+
+    private fun requireExactInt(bundle: Bundle, key: String, expected: Int) {
+        require(bundle.containsKey(key) && bundle.get(key) is Int) {
+            "$key is missing or has the wrong type"
+        }
+        require(bundle.getInt(key) == expected) { "$key is unsupported" }
+    }
+
+    private fun requireNonNegativeLong(bundle: Bundle, key: String): Long {
+        require(bundle.containsKey(key) && bundle.get(key) is Long) {
+            "$key is missing or has the wrong type"
+        }
+        return bundle.getLong(key).also { value ->
+            require(value >= 0L) { "$key is invalid" }
+        }
+    }
+
+    private fun requireJsonString(value: JSONObject, key: String): String {
+        require(value.get(key) is String) { "$key has the wrong JSON type" }
+        return value.getString(key).takeIf { it.isNotEmpty() }
+            ?: throw IllegalArgumentException("$key is empty")
+    }
+
+    private fun requireJsonInt(value: JSONObject, key: String): Int {
+        require(value.get(key) is Int) { "$key has the wrong JSON type" }
+        return value.getInt(key)
+    }
+
+    private fun requireExactJsonInt(value: JSONObject, key: String, expected: Int) {
+        require(requireJsonInt(value, key) == expected) { "$key is unsupported" }
+    }
+
+    private fun requireJsonArray(value: JSONObject, key: String, size: Int): JSONArray {
+        require(value.get(key) is JSONArray) { "$key has the wrong JSON type" }
+        return value.getJSONArray(key).also { array ->
+            require(array.length() == size) { "$key has the wrong length" }
+        }
+    }
+
+    private fun requireArrayInt(value: JSONArray, index: Int, label: String): Int {
+        require(value.get(index) is Int) { "$label has the wrong JSON type" }
+        return value.getInt(index)
+    }
+
+    private fun positiveZero(value: Double): Double = if (value == 0.0) 0.0 else value
+
+    private fun sha256(value: String): String =
+        sha256(value.toByteArray(StandardCharsets.UTF_8))
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") {
+            "%02x".format(Locale.ROOT, it.toInt() and 0xff)
+        }
+}

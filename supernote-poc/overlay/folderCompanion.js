@@ -1,5 +1,5 @@
 import {NativeModules} from 'react-native';
-import {NativeUIUtils, PluginCommAPI} from 'sn-plugin-lib';
+import {NativeUIUtils, PluginCommAPI, PluginFileAPI} from 'sn-plugin-lib';
 import {
   collectCurrentSupernotePage,
   collectCurrentVirtualSpread,
@@ -12,7 +12,13 @@ import {
   revalidateCollectedDocument,
   requirePluginResult,
   requireSameDocumentId,
+  requireSameDocumentPath,
 } from './folderCompanionCore';
+import {
+  nativeViewportMap,
+  requireNativeViewportResult,
+  requireSameNativeViewport,
+} from './nativeViewportProviderCore';
 import {
   fixtureForOpenPath,
   fixtureNativeDescriptor,
@@ -36,6 +42,42 @@ async function currentFilePath() {
   );
 }
 
+async function currentNativeViewport(
+  native,
+  filePath,
+  representation,
+  nativeDescriptor,
+) {
+  const pathBefore = await currentFilePath();
+  requireSameDocumentPath(filePath, pathBefore);
+  const virtualPageIndex = requirePluginResult(
+    await PluginCommAPI.getCurrentPageNum(),
+    'getCurrentPageNum before native viewport request',
+  );
+  const nativePageSize = requirePluginResult(
+    await PluginFileAPI.getPageSize(filePath, virtualPageIndex),
+    'getPageSize before native viewport request',
+  );
+  const result = requireNativeViewportResult(
+    parseNativeJson(
+      await native.getNativeViewport(
+        filePath,
+        nativeDescriptor,
+        virtualPageIndex,
+        nativePageSize.width,
+        nativePageSize.height,
+      ),
+      'getNativeViewport',
+    ),
+    representation,
+    virtualPageIndex,
+    nativePageSize,
+  );
+  const pathAfter = await currentFilePath();
+  requireSameDocumentPath(filePath, pathAfter);
+  return result;
+}
+
 export async function publishCurrentPageExport() {
   const native = requireNativeModule();
   const filePath = await currentFilePath();
@@ -47,6 +89,14 @@ export async function publishCurrentPageExport() {
     await native.getDocumentIdentity(filePath, nativeDescriptor),
     'getDocumentIdentity',
   );
+  const nativeViewport = representation
+    ? await currentNativeViewport(
+        native,
+        filePath,
+        representation,
+        nativeDescriptor,
+      )
+    : null;
   const collected = representation
     ? await collectCurrentVirtualSpread(
         representation,
@@ -61,7 +111,17 @@ export async function publishCurrentPageExport() {
             'validateDocumentIdentity before identity persistence',
           );
           requireSameDocumentId(identity.documentId, revalidated.documentId);
+          requireSameNativeViewport(
+            nativeViewport,
+            await currentNativeViewport(
+              native,
+              filePath,
+              representation,
+              nativeDescriptor,
+            ),
+          );
         },
+        nativeViewport.descriptor,
       )
     : await collectCurrentSupernotePage(identity.documentId);
   await revalidateCollectedDocument(filePath, async () => collected.filePath);
@@ -107,10 +167,21 @@ export async function applyNextFolderManifest() {
       );
       requireSameDocumentId(currentDelivery.documentId, revalidated.documentId);
     },
-    apply: manifest =>
-      representation
-        ? applyVirtualSpreadManifest(manifest, representation, filePath)
-        : applyManifest(manifest, filePath, true),
+    apply: async manifest => {
+      if (!representation) return applyManifest(manifest, filePath, true);
+      const nativeViewport = await currentNativeViewport(
+        native,
+        filePath,
+        representation,
+        nativeDescriptor,
+      );
+      return applyVirtualSpreadManifest(
+        manifest,
+        representation,
+        filePath,
+        nativeViewportMap(nativeViewport),
+      );
+    },
     acknowledge: async ({deliveryId, manifestId, applied}) =>
       parseNativeJson(
         await native.acknowledgeManifest(

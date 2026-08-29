@@ -97,6 +97,7 @@ class InkBridgeFolderModule(
     private val worker = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "InkBridgeFolderWorker").apply { isDaemon = true }
     }
+    private val nativeViewportReader = InkBridgeNativeViewport(reactContext)
     override fun getName(): String = MODULE_NAME
 
     override fun invalidate() {
@@ -240,6 +241,32 @@ class InkBridgeFolderModule(
                 .put("status", "ready")
                 .put("documentId", context.documentId)
                 .toString()
+        }
+    }
+
+    @ReactMethod
+    fun getNativeViewport(
+        filePath: String,
+        representationJson: String,
+        virtualPageIndex: Int,
+        nativeWidth: Int,
+        nativeHeight: Int,
+        promise: Promise,
+    ) {
+        onWorker(promise, "INKBRIDGE_NATIVE_VIEWPORT_FAILED") {
+            val pdf = requirePdf(filePath)
+            val representation = validateRepresentation(pdf, representationJson)
+            nativeViewportReader.read(
+                documentPath = pdf.absolutePath,
+                documentId = representation.documentId,
+                viewId = representation.viewId,
+                virtualPageIndex = virtualPageIndex,
+                nativeWidth = nativeWidth,
+                nativeHeight = nativeHeight,
+                generatedPdfSha256 = representation.generatedPdfSha256,
+                sidecarSha256 = representation.sidecarSha256,
+                mappingAuthoritySha256 = representation.mappingAuthoritySha256,
+            ).toString()
         }
     }
 

@@ -1,6 +1,6 @@
 # InkBridge Supernote folder companion
 
-InkBridge 0.2.1 moves the proven native-stroke export and manifest importer onto the finalized
+InkBridge 0.2.2 moves the proven native-stroke export and manifest importer onto the finalized
 folder contract. The `.snplg` contains its own small native Android bridge; it does not require a
 second companion application, logcat capture, a document-specific plugin package, or changes to the
 actively developed RTL Reader project.
@@ -31,6 +31,12 @@ fixture cache basename. It verifies the generated PDF and sidecar bytes, their m
 the hidden versioned cache path, and the immutable original document ID before any folder action.
 The original PDF identity and filename—not the derived spread hash or cache name—select the folder.
 This is deliberately fixture-scoped; generic production cache activation remains disabled.
+For export and import, the plugin calls RTL Reader v0.0.26's live viewport provider with the exact
+document, view, virtual-page, native-canvas, file-path, and representation-hash evidence. The
+native bridge accepts only the expected provider package and release certificate, then validates
+the exact canonical descriptor and activation evidence. It never persists the descriptor or
+reconstructs it from dimensions; a page-load, restart, or cache mismatch leaves the action
+unavailable until RTL Reader publishes a fresh record.
 
 Configure `inkbridge-folder-transport` to use that document directory's `outgoing` and `incoming`
 paths after the whole document directory, including `acknowledged`, is mirrored to the machine

@@ -24,6 +24,15 @@ def main() -> None:
     module = (root / "native" / "InkBridgeFolderModule.kt.template").read_text(
         encoding="utf-8"
     )
+    native_viewport = (
+        root / "native" / "InkBridgeNativeViewport.kt.template"
+    ).read_text(encoding="utf-8")
+    viewport_core = (
+        root / "overlay" / "nativeViewportProviderCore.js"
+    ).read_text(encoding="utf-8")
+    installer = (root / "scripts" / "install_native.py").read_text(
+        encoding="utf-8"
+    )
     javascript = (root / "overlay" / "folderCompanionCore.js").read_text(
         encoding="utf-8"
     )
@@ -114,6 +123,8 @@ def main() -> None:
         "existingHash != sourceViewHash",
         "allow it to finish before switching document representations",
         "Could not retire superseded native export",
+        "fun getNativeViewport(",
+        "nativeViewportReader.read(",
     ):
         if required not in module:
             fail(f"native module is missing required invariant: {required}")
@@ -137,13 +148,17 @@ def main() -> None:
     for required in (
         "collectCurrentVirtualSpread(",
         "validateDocumentIdentity before identity persistence",
-        "applyVirtualSpreadManifest(manifest, representation, filePath)",
+        "return applyVirtualSpreadManifest(",
         "fixtureNativeDescriptor(representation)",
+        "await currentNativeViewport(",
+        "requireSameNativeViewport(",
+        "nativeViewportMap(nativeViewport)",
     ):
         if required not in companion:
             fail(f"Virtual Spread folder integration is missing: {required}")
     for required in (
         'cp "$ROOT/overlay/virtualSpreadAdapterCore.js"',
+        'cp "$ROOT/overlay/nativeViewportProviderCore.js"',
         'cp "$ROOT/overlay/virtualSpreadFixture.js"',
     ):
         if required not in build_script:
@@ -160,6 +175,37 @@ def main() -> None:
         ],
         "Virtual Spread identity persistence document revalidation",
     )
+    for required in (
+        '"com.techrebbe.supernote.virtualspread.viewport"',
+        '"com.techrebbe.supernote.virtualspread"',
+        '"a5a8551131de84d41660a3cf22d224f320f7a2f05a380282f76f6fe731807c67"',
+        "resolveContentProvider(",
+        "PackageManager.GET_SIGNING_CERTIFICATES",
+        "signingInfo?.apkContentsSigners",
+        "response.keySet() == RESPONSE_KEYS",
+        "descriptorJson == descriptor.canonicalJson()",
+        "sha256(descriptorJson) == descriptorSha256",
+        'requireString(response, "documentPath") == documentPath',
+        'requireString(response, "sidecarPath") == "$documentPath.json"',
+        "requireStable(affine)",
+    ):
+        if required not in native_viewport:
+            fail(f"native viewport consumer is missing required invariant: {required}")
+    for required in (
+        "InkBridgeNativeViewport.kt.template",
+        "com.techrebbe.supernote.virtualspread.viewport",
+    ):
+        if required not in installer:
+            fail(f"native viewport packaging is missing required input: {required}")
+    for required in (
+        "requireNativeViewportResult",
+        "requireSameNativeViewport",
+        "nativeViewportForVirtualSpread(",
+        "expected.pageLoadGeneration !== current.pageLoadGeneration",
+        "expected.snapshotId !== current.snapshotId",
+    ):
+        if required not in viewport_core:
+            fail(f"native viewport JavaScript boundary is incomplete: {required}")
     print("InkBridge native folder invariants passed")
 
 
