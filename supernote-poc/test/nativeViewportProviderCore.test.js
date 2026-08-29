@@ -4,6 +4,7 @@ import {readFileSync} from 'node:fs';
 import test from 'node:test';
 import {
   completedVirtualSpreadDelivery,
+  finishVirtualSpreadStep,
   nativeViewportMap,
   planVirtualSpreadDelivery,
   requireNativeViewportResult,
@@ -104,6 +105,38 @@ test('rejects a page-load or activated-snapshot change during collection', () =>
     /changed while InkBridge was collecting/,
   );
   assert.equal(requireSameNativeViewport(result(), result()).status, 'ok');
+});
+
+test('an apply-time viewport change cannot commit progress or trigger a redraw', async () => {
+  const calls = [];
+  await assert.rejects(
+    finishVirtualSpreadStep({
+      expectedViewport: result(),
+      readCurrentViewport: async () => result({pageLoadGeneration: 10}),
+      recordProgress: async () => calls.push('record'),
+      reload: async () => calls.push('reload'),
+    }),
+    /changed while InkBridge was collecting/,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test('the post-apply fence and progress commit precede the plugin redraw', async () => {
+  const calls = [];
+  const progress = await finishVirtualSpreadStep({
+    expectedViewport: result(),
+    readCurrentViewport: async () => {
+      calls.push('fence');
+      return result();
+    },
+    recordProgress: async () => {
+      calls.push('record');
+      return {completed: true};
+    },
+    reload: async () => calls.push('reload'),
+  });
+  assert.deepEqual(calls, ['fence', 'record', 'reload']);
+  assert.deepEqual(progress, {completed: true});
 });
 
 test('rejects unsafe generation and publication evidence', () => {

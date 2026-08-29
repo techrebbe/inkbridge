@@ -192,6 +192,16 @@ def main() -> None:
         ],
         "unconditional post-collection viewport revalidation",
     )
+    ordered(
+        companion[companion.find("const applied = await applyVirtualSpreadManifest(") :],
+        [
+            "const applied = await applyVirtualSpreadManifest(",
+            "await finishVirtualSpreadStep(",
+            "await native.recordVirtualSpreadStepApplied(",
+            "await PluginCommAPI.reloadFile()",
+        ],
+        "post-apply viewport fence before durable progress and redraw",
+    )
     for required in (
         '"com.techrebbe.supernote.virtualspread.viewport"',
         '"com.techrebbe.supernote.virtualspread"',
@@ -223,6 +233,7 @@ def main() -> None:
         "expected.snapshotId !== current.snapshotId",
         "requireVirtualSpreadProgress",
         "completedVirtualSpreadDelivery",
+        "requireSameNativeViewport(expectedViewport, await readCurrentViewport())",
     ):
         if required not in viewport_core:
             fail(f"native viewport JavaScript boundary is incomplete: {required}")

@@ -16,6 +16,7 @@ import {
 } from './folderCompanionCore';
 import {
   completedVirtualSpreadDelivery,
+  finishVirtualSpreadStep,
   nativeViewportMap,
   planVirtualSpreadDelivery,
   requireNativeViewportResult,
@@ -218,24 +219,41 @@ export async function applyNextFolderManifest() {
         representation,
         filePath,
         nativeViewportMap(nativeViewport),
+        false,
       );
-      const progress = parseNativeJson(
-        await native.recordVirtualSpreadStepApplied(
+      // Do not let our own redraw invalidate the generation fence. Native
+      // writes finish first; only a still-matching viewport may commit the
+      // durable step. A failed fence leaves an idempotent retry, not a skip.
+      const progress = await finishVirtualSpreadStep({
+        expectedViewport: nativeViewport,
+        readCurrentViewport: () => currentNativeViewport(
+          native,
           filePath,
-          delivery.deliveryId,
-          manifest.manifestId,
-          plan.stepId,
-          JSON.stringify({
-            operationCount: plan.manifest.operations.length,
-            added: applied.added,
-            updated: applied.updated,
-            deleted: applied.deleted,
-            skipped: applied.skipped,
-          }),
+          representation,
           nativeDescriptor,
         ),
-        'recordVirtualSpreadStepApplied',
-      );
+        recordProgress: async () => parseNativeJson(
+          await native.recordVirtualSpreadStepApplied(
+            filePath,
+            delivery.deliveryId,
+            manifest.manifestId,
+            plan.stepId,
+            JSON.stringify({
+              operationCount: plan.manifest.operations.length,
+              added: applied.added,
+              updated: applied.updated,
+              deleted: applied.deleted,
+              skipped: applied.skipped,
+            }),
+            nativeDescriptor,
+          ),
+          'recordVirtualSpreadStepApplied',
+        ),
+        reload: async () => requirePluginResult(
+          await PluginCommAPI.reloadFile(),
+          'reloadFile after Virtual Spread progress commit',
+        ),
+      });
       const completed = completedVirtualSpreadDelivery(
         manifest,
         plan.steps,

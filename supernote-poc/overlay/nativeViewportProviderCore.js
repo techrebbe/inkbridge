@@ -104,6 +104,18 @@ export function nativeViewportMap(result) {
   ]);
 }
 
+export async function finishVirtualSpreadStep({
+  expectedViewport,
+  readCurrentViewport,
+  recordProgress,
+  reload,
+}) {
+  requireSameNativeViewport(expectedViewport, await readCurrentViewport());
+  const progress = await recordProgress();
+  await reload();
+  return progress;
+}
+
 function requireSummary(value) {
   if (
     !value ||

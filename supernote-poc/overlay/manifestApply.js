@@ -378,6 +378,7 @@ export async function applyManifest(
   inputManifest,
   expectedFilePath = null,
   stableIdentityValidated = false,
+  reloadAfterApply = true,
 ) {
   const manifest = validateManifest(inputManifest);
   const filePath = await requireResult(
@@ -418,7 +419,9 @@ export async function applyManifest(
     'getCurrentFilePath before reload',
   );
   requireSameDocumentPath(filePath, currentBeforeReload);
-  await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
+  if (reloadAfterApply) {
+    await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
+  }
   return {
     manifestId: manifest.manifestId,
     operationCount: manifest.operations.length,
@@ -435,6 +438,7 @@ export async function applyVirtualSpreadManifest(
   representation,
   expectedFilePath = null,
   nativeViewports = null,
+  reloadAfterApply = true,
 ) {
   const canonical = validateManifest(inputManifest);
   const filePath = expectedFilePath ?? await requireResult(
@@ -472,5 +476,6 @@ export async function applyVirtualSpreadManifest(
     ),
     filePath,
     true,
+    reloadAfterApply,
   );
 }
