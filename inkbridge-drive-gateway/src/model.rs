@@ -396,6 +396,7 @@ pub struct PreparedDeviceArtifactBinding {
     pub document_id: String,
     pub source: DeviceSide,
     pub based_on: RevisionPair,
+    pub canonical_frontier: RevisionPair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

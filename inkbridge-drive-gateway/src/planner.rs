@@ -516,6 +516,7 @@ pub fn prepare_device_artifact_binding(
     change: &DriveChange,
     bytes: &[u8],
     approval: &DeviceArtifactBindingApproval,
+    frontier: CanonicalFrontier,
 ) -> Result<DeviceArtifactBindingDecision, String> {
     config.validate()?;
     checkpoint.validate()?;
@@ -595,6 +596,13 @@ pub fn prepare_device_artifact_binding(
             reason: "device artifact lacks approval for this exact Drive revision".to_owned(),
         });
     }
+    if approval.based_on.boox > frontier.revisions.boox
+        || approval.based_on.supernote > frontier.revisions.supernote
+    {
+        return Ok(DeviceArtifactBindingDecision::Ignore {
+            reason: "device artifact causal base is ahead of the broker frontier".to_owned(),
+        });
+    }
     Ok(DeviceArtifactBindingDecision::Bind(
         PreparedDeviceArtifactBinding {
             drive_file_id: change.file.file_id.clone(),
@@ -603,6 +611,7 @@ pub fn prepare_device_artifact_binding(
             document_id: approval.document_id.clone(),
             source: approval.source,
             based_on: approval.based_on,
+            canonical_frontier: frontier.revisions,
         },
     ))
 }
@@ -612,6 +621,11 @@ pub fn commit_device_artifact_binding(
     artifact: &PreparedDeviceArtifactBinding,
 ) -> Result<(), String> {
     checkpoint.validate()?;
+    if artifact.based_on.boox > artifact.canonical_frontier.boox
+        || artifact.based_on.supernote > artifact.canonical_frontier.supernote
+    {
+        return Err("device artifact causal base is ahead of its broker frontier".to_owned());
+    }
     if let Some(existing) = checkpoint.binding_for_file(&artifact.drive_file_id) {
         if existing.document_id == artifact.document_id
             && existing.side_for_file(&artifact.drive_file_id) == Some(artifact.source)
@@ -1186,10 +1200,16 @@ mod tests {
             &artifact_change,
             bytes,
             &approval,
+            CanonicalFrontier {
+                revisions: RevisionPair::default(),
+            },
         )
         .unwrap() else {
             panic!("expected explicit device artifact binding")
         };
+        let mut forged = prepared.clone();
+        forged.based_on.boox = 1;
+        assert!(commit_device_artifact_binding(&mut checkpoint, &forged).is_err());
         commit_device_artifact_binding(&mut checkpoint, &prepared).unwrap();
         let DriveInputDecision::Upload(input) = prepare_drive_input(
             &config,
@@ -1206,6 +1226,44 @@ mod tests {
         assert_eq!(input.document_id, document_id());
         assert_eq!(input.source, DeviceSide::Supernote);
         assert_eq!(input.drive_file_id, "supernote-native-export");
+    }
+
+    #[test]
+    fn device_artifact_binding_rejects_a_causal_base_ahead_of_broker() {
+        let config = config();
+        let bytes = b"native page export";
+        let checkpoint = checkpoint();
+        let artifact_change = change("supernote-native-export", "application/json");
+        let approval = DeviceArtifactBindingApproval {
+            drive_file_id: artifact_change.file.file_id.clone(),
+            drive_file_version: artifact_change.file.version,
+            content_sha256: sha256_hex(bytes),
+            document_id: document_id(),
+            source: DeviceSide::Supernote,
+            based_on: RevisionPair {
+                boox: 4,
+                supernote: 8,
+            },
+        };
+
+        assert!(matches!(
+            prepare_device_artifact_binding(
+                &config,
+                &checkpoint,
+                &artifact_change,
+                bytes,
+                &approval,
+                CanonicalFrontier {
+                    revisions: RevisionPair {
+                        boox: 3,
+                        supernote: 8,
+                    }
+                },
+            )
+            .unwrap(),
+            DeviceArtifactBindingDecision::Ignore { reason }
+                if reason.contains("ahead of the broker frontier")
+        ));
     }
 
     #[test]

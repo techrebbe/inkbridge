@@ -46,8 +46,10 @@ The first companion-created BOOX manifest or Supernote native export has a new
 Drive file ID, so it uses an authenticated association action that names the
 existing document and device side and approves the exact file ID, Drive
 version, SHA-256, and causal base revisions. The gateway checks the expected
-folder and payload type, persists that binding and frontier, and then processes
-the same revision normally. It never associates a device artifact by filename.
+folder and payload type and rejects either causal component if it is ahead of
+the broker's current frontier. It then persists the binding and frontier and
+processes the same revision normally. It never associates a device artifact by
+filename.
 
 For every bound file revision it:
 
