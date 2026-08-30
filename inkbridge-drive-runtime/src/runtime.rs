@@ -229,9 +229,11 @@ impl GatewayJob {
             )
         };
 
+        let mut simulated_frontiers = BTreeMap::new();
         for change in self.order_changes(changes, &stored.value)? {
             report.changes_seen += 1;
-            stored = self.process_change(stored, change, mode, &mut report)?;
+            stored =
+                self.process_change(stored, change, mode, &mut simulated_frontiers, &mut report)?;
         }
 
         if mode == RunMode::DryRun {
@@ -274,6 +276,7 @@ impl GatewayJob {
         mut stored: VersionedCheckpoint,
         change: DriveChange,
         mode: RunMode,
+        simulated_frontiers: &mut BTreeMap<String, RevisionPair>,
         report: &mut RunReport,
     ) -> Result<VersionedCheckpoint, String> {
         if stored
@@ -310,6 +313,14 @@ impl GatewayJob {
                             )? {
                                 RegistrationDecision::Register(registration) => {
                                     if mode == RunMode::DryRun {
+                                        commit_original_registration(
+                                            &mut stored.value,
+                                            &registration,
+                                        )?;
+                                        simulated_frontiers.insert(
+                                            registration.document_id.clone(),
+                                            RevisionPair::default(),
+                                        );
                                         report.dry_run_actions.push(format!(
                                             "register approved original {} as {}",
                                             registration.drive_file_id, registration.document_id
@@ -352,7 +363,8 @@ impl GatewayJob {
                             }
                         }
                         OnboardingApproval::DeviceArtifact { approval } => {
-                            let frontier = self.broker.frontier(&approval.document_id)?;
+                            let frontier =
+                                self.frontier(&approval.document_id, simulated_frontiers)?;
                             match prepare_device_artifact_binding(
                                 &self.config,
                                 &stored.value,
@@ -387,7 +399,14 @@ impl GatewayJob {
                             }
                         }
                     }
-                    return self.process_bound_change(stored, change, bytes, mode, report);
+                    return self.process_bound_change(
+                        stored,
+                        change,
+                        bytes,
+                        mode,
+                        simulated_frontiers,
+                        report,
+                    );
                 }
                 other => {
                     return Err(format!(
@@ -402,7 +421,19 @@ impl GatewayJob {
         } else {
             self.download_verified(&change.file)?
         };
-        self.process_bound_change(stored, change, bytes, mode, report)
+        self.process_bound_change(stored, change, bytes, mode, simulated_frontiers, report)
+    }
+
+    fn frontier(
+        &self,
+        document_id: &str,
+        simulated_frontiers: &BTreeMap<String, RevisionPair>,
+    ) -> Result<RevisionPair, String> {
+        simulated_frontiers
+            .get(document_id)
+            .copied()
+            .map(Ok)
+            .unwrap_or_else(|| self.broker.frontier(document_id))
     }
 
     fn process_bound_change(
@@ -411,13 +442,14 @@ impl GatewayJob {
         change: DriveChange,
         bytes: Vec<u8>,
         mode: RunMode,
+        simulated_frontiers: &BTreeMap<String, RevisionPair>,
         report: &mut RunReport,
     ) -> Result<VersionedCheckpoint, String> {
         let binding = stored
             .value
             .binding_for_file(&change.file.file_id)
             .ok_or_else(|| "Drive binding disappeared".to_owned())?;
-        let frontier = self.broker.frontier(&binding.document_id)?;
+        let frontier = self.frontier(&binding.document_id, simulated_frontiers)?;
         match prepare_drive_input(
             &self.config,
             &stored.value,
@@ -1807,6 +1839,90 @@ mod tests {
             .supernote_file_ids
             .contains("a-artifact"));
         assert_eq!(checkpoint.next_page_token.as_deref(), Some("initial"));
+    }
+
+    #[test]
+    fn bootstrap_dry_run_simulates_original_before_validating_dependent_artifact() {
+        let original_bytes = b"%PDF-1.7 clean original";
+        let artifact_bytes = br#"{"schemaVersion":1,"operations":[]}"#;
+        let original = initial_pdf("z-original", "boox-folder-123", original_bytes);
+        let artifact = DriveFileRevision {
+            file_id: "a-artifact".to_owned(),
+            name: "native-export.json".to_owned(),
+            version: 1,
+            mime_type: "application/json".to_owned(),
+            parents: vec!["supernote-folder-123".to_owned()],
+            size: artifact_bytes.len() as u64,
+            trashed: false,
+            app_properties: BTreeMap::new(),
+        };
+        let document_id = inkbridge_broker::stable_document_id(original_bytes);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![artifact.clone(), original.clone()];
+        drive.downloads.lock().unwrap().extend([
+            (artifact.file_id.clone(), artifact_bytes.to_vec()),
+            (original.file_id.clone(), original_bytes.to_vec()),
+        ]);
+        let approvals = Arc::new(FakeApprovals::default());
+        approvals.values.lock().unwrap().extend([
+            (
+                original.file_id.clone(),
+                OnboardingApproval::Original {
+                    approval: OriginalRegistrationApproval {
+                        drive_file_id: original.file_id.clone(),
+                        drive_file_version: original.version,
+                        content_sha256: sha256_hex(original_bytes),
+                    },
+                },
+            ),
+            (
+                artifact.file_id.clone(),
+                OnboardingApproval::DeviceArtifact {
+                    approval: DeviceArtifactBindingApproval {
+                        drive_file_id: artifact.file_id.clone(),
+                        drive_file_version: artifact.version,
+                        content_sha256: sha256_hex(artifact_bytes),
+                        document_id: document_id.clone(),
+                        source: inkbridge_broker::DeviceSide::Supernote,
+                        based_on: RevisionPair::default(),
+                    },
+                },
+            ),
+        ]);
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let evidence = Arc::new(FakeEvidence::default());
+        let broker = Arc::new(OrderingBroker {
+            registered: Mutex::new(BTreeSet::new()),
+        });
+        let job = GatewayJob::new(
+            config(),
+            drive,
+            checkpoints.clone(),
+            evidence.clone(),
+            broker.clone(),
+            approvals,
+        )
+        .unwrap();
+
+        let report = job.run_once(RunMode::DryRun).unwrap();
+
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("register approved original")));
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("bind approved device artifact")));
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("upload drive-v1-")));
+        assert!(broker.registered.lock().unwrap().is_empty());
+        assert!(evidence.objects.lock().unwrap().is_empty());
+        let checkpoint = checkpoints.value();
+        assert!(checkpoint.documents.is_empty());
+        assert!(checkpoint.next_page_token.is_none());
     }
 
     #[test]

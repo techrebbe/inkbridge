@@ -42,8 +42,11 @@ Drive changes.list
 The job defaults to dry-run. Production mutation requires the explicit
 `--apply` argument. A first dry-run enumerates the current device folders; later
 dry-runs inspect the next change page. Both download and validate relevant
-files, but never upload evidence, call the broker, create a Drive file, or
-advance the page token.
+files. When an approved original and dependent artifact share the page, dry-run
+simulates their binding and zero revision frontier in memory so it can validate
+the complete onboarding sequence. It never persists that simulation, uploads
+evidence, invokes a mutating broker path, creates a Drive file, or advances the
+page token.
 
 ## Required configuration
 
