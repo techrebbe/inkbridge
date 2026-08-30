@@ -106,7 +106,7 @@ pub struct DriveGatewayCheckpoint {
     #[serde(default)]
     pub accepted_file_content_sha256: BTreeMap<String, String>,
     #[serde(default)]
-    pub reserved_document_frontiers: BTreeMap<String, RevisionPair>,
+    pub file_observed_frontiers: BTreeMap<String, RevisionPair>,
     #[serde(default)]
     pub delivered_broker_outputs: BTreeMap<String, DeliveredDriveOutput>,
 }
@@ -198,10 +198,17 @@ impl DriveGatewayCheckpoint {
                 ));
             }
         }
-        for document_id in self.reserved_document_frontiers.keys() {
-            if !self.documents.contains_key(document_id) {
+        for file_id in &all_file_ids {
+            if !self.file_observed_frontiers.contains_key(file_id) {
                 return Err(format!(
-                    "reserved Drive frontier references unbound document {document_id}"
+                    "bound Drive file {file_id} lacks an observed revision frontier"
+                ));
+            }
+        }
+        for file_id in self.file_observed_frontiers.keys() {
+            if !all_file_ids.contains(file_id) {
+                return Err(format!(
+                    "observed revision frontier references unbound Drive file {file_id}"
                 ));
             }
         }
@@ -267,6 +274,7 @@ pub struct DeviceArtifactBindingApproval {
     pub content_sha256: String,
     pub document_id: String,
     pub source: DeviceSide,
+    pub based_on: RevisionPair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -276,6 +284,7 @@ pub struct PreparedDeviceArtifactBinding {
     pub content_sha256: String,
     pub document_id: String,
     pub source: DeviceSide,
+    pub based_on: RevisionPair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,6 +319,7 @@ pub struct PreparedDriveOutput {
     pub document_id: String,
     pub target: DeviceSide,
     pub content_sha256: String,
+    pub source_revisions: RevisionPair,
     pub parent_folder_id: String,
     pub file_name: String,
     pub app_properties: BTreeMap<String, String>,
@@ -324,6 +334,7 @@ pub struct DeliveredDriveOutput {
     pub document_id: String,
     pub target: DeviceSide,
     pub content_sha256: String,
+    pub source_revisions: RevisionPair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

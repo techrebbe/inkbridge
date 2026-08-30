@@ -30,7 +30,7 @@ pub fn prepare_drive_input(
     checkpoint: &DriveGatewayCheckpoint,
     change: &DriveChange,
     bytes: &[u8],
-    frontier: CanonicalFrontier,
+    _frontier: CanonicalFrontier,
 ) -> Result<DriveInputDecision, String> {
     config.validate()?;
     checkpoint.validate()?;
@@ -104,13 +104,11 @@ pub fn prepare_drive_input(
             ),
         });
     };
-    let mut based_on = frontier.revisions;
-    let reserved_source_revision = checkpoint
-        .reserved_document_frontiers
-        .get(&binding.document_id)
-        .map(|reserved| reserved.get(source))
-        .unwrap_or_default();
-    based_on.set(source, based_on.get(source).max(reserved_source_revision));
+    let based_on = checkpoint
+        .file_observed_frontiers
+        .get(&change.file.file_id)
+        .copied()
+        .ok_or_else(|| "bound Drive file lacks an observed revision frontier".to_owned())?;
     let source_revision = based_on
         .get(source)
         .checked_add(1)
@@ -235,19 +233,19 @@ pub fn commit_drive_input(
     {
         return Err("prepared Drive input has an invalid source revision".to_owned());
     }
-    let current_reservation = checkpoint
-        .reserved_document_frontiers
-        .get(&input.document_id)
+    let current_file_frontier = checkpoint
+        .file_observed_frontiers
+        .get(&input.drive_file_id)
         .copied()
-        .unwrap_or_default();
-    if current_reservation.get(input.source) > input.based_on.get(input.source) {
-        return Err("prepared Drive input is stale against the reserved frontier".to_owned());
+        .ok_or_else(|| "Drive input file lost its observed frontier".to_owned())?;
+    if current_file_frontier != input.based_on {
+        return Err("prepared Drive input is stale against its file frontier".to_owned());
     }
-    let mut reserved = current_reservation;
-    reserved.set(input.source, input.source_revision);
+    let mut next_file_frontier = input.based_on;
+    next_file_frontier.set(input.source, input.source_revision);
     checkpoint
-        .reserved_document_frontiers
-        .insert(input.document_id.clone(), reserved);
+        .file_observed_frontiers
+        .insert(input.drive_file_id.clone(), next_file_frontier);
     checkpoint
         .processed_drive_events
         .insert(input.drive_event_id.clone());
@@ -386,6 +384,9 @@ pub fn commit_original_registration(
         registration.drive_file_id.clone(),
         registration.original_pdf_sha256.clone(),
     );
+    checkpoint
+        .file_observed_frontiers
+        .insert(registration.drive_file_id.clone(), RevisionPair::default());
     match checkpoint.documents.entry(registration.document_id.clone()) {
         Entry::Vacant(entry) => {
             let mut boox_file_ids = BTreeSet::new();
@@ -510,6 +511,7 @@ pub fn prepare_device_artifact_binding(
             content_sha256,
             document_id: approval.document_id.clone(),
             source: approval.source,
+            based_on: approval.based_on,
         },
     ))
 }
@@ -540,6 +542,9 @@ pub fn commit_device_artifact_binding(
             .supernote_file_ids
             .insert(artifact.drive_file_id.clone()),
     };
+    checkpoint
+        .file_observed_frontiers
+        .insert(artifact.drive_file_id.clone(), artifact.based_on);
     checkpoint.validate()
 }
 
@@ -616,6 +621,7 @@ pub fn prepare_drive_output(
         document_id: output.document_id.clone(),
         target: output.target,
         content_sha256: output.content_sha256.clone(),
+        source_revisions: output.source_revisions,
         parent_folder_id: config.folder_id(output.target).to_owned(),
         file_name,
         app_properties,
@@ -648,6 +654,7 @@ pub fn commit_drive_output(
         document_id: output.document_id.clone(),
         target: output.target,
         content_sha256: output.content_sha256.clone(),
+        source_revisions: output.source_revisions,
     };
     if let Some(existing) = checkpoint.delivered_broker_outputs.get(&output.delivery_id) {
         if existing == &delivered {
@@ -685,6 +692,9 @@ pub fn commit_drive_output(
     checkpoint
         .accepted_file_content_sha256
         .insert(drive_file_id.clone(), output.content_sha256.clone());
+    checkpoint
+        .file_observed_frontiers
+        .insert(drive_file_id.clone(), output.source_revisions);
     checkpoint
         .delivered_broker_outputs
         .insert(output.delivery_id.clone(), delivered);
@@ -726,7 +736,22 @@ mod tests {
             )]),
             processed_drive_events: BTreeSet::new(),
             accepted_file_content_sha256: BTreeMap::new(),
-            reserved_document_frontiers: BTreeMap::new(),
+            file_observed_frontiers: BTreeMap::from([
+                (
+                    "boox-file".to_owned(),
+                    RevisionPair {
+                        boox: 3,
+                        supernote: 5,
+                    },
+                ),
+                (
+                    "supernote-file".to_owned(),
+                    RevisionPair {
+                        boox: 2,
+                        supernote: 8,
+                    },
+                ),
+            ]),
             delivered_broker_outputs: BTreeMap::new(),
         }
     }
@@ -888,6 +913,7 @@ mod tests {
             content_sha256: sha256_hex(bytes),
             document_id: document_id(),
             source: DeviceSide::Supernote,
+            based_on: RevisionPair::default(),
         };
         let DeviceArtifactBindingDecision::Bind(prepared) = prepare_device_artifact_binding(
             &config,
@@ -929,6 +955,9 @@ mod tests {
                 supernote: 2,
             },
         };
+        checkpoint
+            .file_observed_frontiers
+            .insert("boox-file".to_owned(), frontier.revisions);
         let DriveInputDecision::Upload(input) = prepare_drive_input(
             &config,
             &checkpoint,
@@ -951,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_upload_reserves_the_next_source_revision() {
+    fn pending_upload_advances_the_file_frontier() {
         let config = config();
         let mut checkpoint = checkpoint();
         let frontier = CanonicalFrontier {
@@ -960,6 +989,9 @@ mod tests {
                 supernote: 2,
             },
         };
+        checkpoint
+            .file_observed_frontiers
+            .insert("boox-file".to_owned(), frontier.revisions);
         let first_change = change("boox-file", "application/pdf");
         let DriveInputDecision::Upload(first) = prepare_drive_input(
             &config,
@@ -988,10 +1020,7 @@ mod tests {
         assert_eq!(second.based_on.supernote, 2);
         assert_eq!(second.source_revision, 6);
         commit_drive_input(&mut checkpoint, &second).unwrap();
-        assert_eq!(
-            checkpoint.reserved_document_frontiers[&document_id()].boox,
-            6
-        );
+        assert_eq!(checkpoint.file_observed_frontiers["boox-file"].boox, 6);
     }
 
     #[test]
@@ -1004,6 +1033,12 @@ mod tests {
                 supernote: 2,
             },
         };
+        checkpoint
+            .file_observed_frontiers
+            .insert("boox-file".to_owned(), frontier.revisions);
+        checkpoint
+            .file_observed_frontiers
+            .insert("supernote-file".to_owned(), frontier.revisions);
         let DriveInputDecision::Upload(boox) = prepare_drive_input(
             &config,
             &checkpoint,
@@ -1098,7 +1133,10 @@ mod tests {
             &generated_change,
             edited_bytes,
             CanonicalFrontier {
-                revisions: output.source_revisions,
+                revisions: RevisionPair {
+                    boox: 20,
+                    supernote: 30,
+                },
             },
         )
         .unwrap() else {
@@ -1106,6 +1144,8 @@ mod tests {
         };
         assert_eq!(user_edit.source, DeviceSide::Boox);
         assert_eq!(user_edit.document_id, document_id());
+        assert_eq!(user_edit.based_on, output.source_revisions);
+        assert_eq!(user_edit.source_revision, output.source_revisions.boox + 1);
     }
 
     #[test]

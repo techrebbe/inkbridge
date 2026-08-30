@@ -45,9 +45,9 @@ The scheduled gateway reads the Drive change feed from its durable page token.
 The first companion-created BOOX manifest or Supernote native export has a new
 Drive file ID, so it uses an authenticated association action that names the
 existing document and device side and approves the exact file ID, Drive
-version, and SHA-256. The gateway checks the expected folder and payload type,
-persists that binding, and then processes the same revision normally. It never
-associates a device artifact by filename.
+version, SHA-256, and causal base revisions. The gateway checks the expected
+folder and payload type, persists that binding and frontier, and then processes
+the same revision normally. It never associates a device artifact by filename.
 
 For every bound file revision it:
 
@@ -59,10 +59,10 @@ For every bound file revision it:
 - derives an event ID from file ID, Drive version, and SHA-256 for real content
   revisions;
 - reads the broker's current revision frontier;
-- merges the source side with its durable locally reserved revision, so
-  multiple same-side changes uploaded before Eventarc catches up still receive
-  sequential revisions; the other side remains the broker frontier so a truly
-  concurrent device edit is not mislabeled as already observed;
+- uses the bound file's durable observed revision frontier rather than the
+  broker's newest state, so an edit to an older delivery remains visibly stale;
+  after each accepted edit that file frontier advances on its source side, so
+  repeated edits uploaded before Eventarc catches up still chain sequentially;
 - creates an immutable object under `BOOX_Folder/` or `Supernote_Folder/` with
   the same metadata contract used by Eventarc;
 - records the event only after the Cloud Storage create succeeds;
@@ -150,8 +150,8 @@ cargo test -p inkbridge-drive-gateway
 Tests cover stable identity across rename, matching clean originals from both
 folders, duplicate Drive events, metadata-only version suppression,
 authenticated first-device-artifact association, generated-output loop
-suppression, pending-upload revision reservation, refusal to guess an unbound
-file from its name, create-only broker delivery, and explicit page-token
-commit. The outbound lifecycle test also proves that the exact created revision
-is suppressed while a subsequent device edit of the same Drive file is
-accepted under the original stable document identity.
+suppression, per-file causal-frontier preservation, pending-upload sequencing,
+refusal to guess an unbound file from its name, create-only broker delivery,
+and explicit page-token commit. The outbound lifecycle test also proves that
+the exact created revision is suppressed while a subsequent device edit of the
+same Drive file is accepted under the original stable document identity.
