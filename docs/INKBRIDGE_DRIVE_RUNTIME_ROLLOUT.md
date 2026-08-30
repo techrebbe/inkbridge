@@ -10,9 +10,16 @@ OAuth refresh token, or billable polling workload.
 change page, performs all required downstream durability steps, and advances
 the Drive page token only after the complete page is safe.
 
+On a fresh checkpoint it first captures a Drive start token and then enumerates
+both configured device folders. This initial snapshot is processed before the
+token is persisted. Changes racing with the snapshot are therefore covered by
+the captured change-feed cursor, while existing files are never skipped. An
+unbound ordinary file without an exact onboarding approval blocks cursor
+advancement instead of disappearing from the feed.
+
 ```text
 Drive changes.list
-  -> exact file-version download and size/hash verification
+  -> exact file-version download and post-download metadata recheck
   -> immutable create-only Cloud Storage evidence
   -> Firestore pending checkpoint (compare-and-swap)
   -> existing private broker processing
@@ -25,9 +32,10 @@ Drive changes.list
 ```
 
 The job defaults to dry-run. Production mutation requires the explicit
-`--apply` argument. Dry-run downloads and validates a change page but never
-uploads evidence, calls the broker, creates a Drive file, or advances the page
-token.
+`--apply` argument. A first dry-run enumerates the current device folders; later
+dry-runs inspect the next change page. Both download and validate relevant
+files, but never upload evidence, call the broker, create a Drive file, or
+advance the page token.
 
 ## Required configuration
 
@@ -53,6 +61,18 @@ The job stores one opaque checkpoint document at:
 ```text
 inkbridgeDriveGateways/<checkpoint-id>
 ```
+
+Explicit onboarding approvals are read from:
+
+```text
+inkbridgeDriveApprovals/<drive-file-id>
+```
+
+Each document contains one base64 JSON `approval` payload. The payload names
+the exact Drive file ID, version, content SHA-256, device side and—when binding
+a device artifact—the existing document ID and causal frontier. The runtime is
+read-only for this collection: approval creation remains a deliberate setup/UI
+operation and cannot be inferred from a filename.
 
 Every update uses the exact Firestore `updateTime` as a precondition. A second
 poller, a stale retry, or an operator edit therefore fails closed instead of
@@ -95,6 +115,11 @@ separate explicit approval.
 - If more than one Drive file claims the delivery ID, the job stops for repair.
 - If Firestore `updateTime` changes, the stale job stops without advancing the
   Drive token.
+- If Drive reports a different file revision after a media download, the job
+  discards those bytes and retains the page token for a clean retry.
+- If an existing or newly observed file has not been explicitly approved for
+  original registration or artifact association, the job retains the page
+  token and stops rather than silently skipping it.
 - If the broker permanently rejects an event, the pending input is cleared but
   its file frontier/hash is not advanced; a corrected new Drive revision keeps
   the true causal base.

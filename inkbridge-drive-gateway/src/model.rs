@@ -392,7 +392,8 @@ pub struct PendingDriveInput {
     pub proposed_frontier: RevisionPair,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OriginalRegistrationApproval {
     pub drive_file_id: String,
     pub drive_file_version: u64,
@@ -410,7 +411,8 @@ pub struct PreparedOriginalRegistration {
     pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeviceArtifactBindingApproval {
     pub drive_file_id: String,
     pub drive_file_version: u64,

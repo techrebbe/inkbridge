@@ -35,6 +35,12 @@ remain hidden device-local cache artifacts. They are not uploaded to Drive.
 5. Only after registration succeeds does the gateway persist each Drive file
    ID as the BOOX or Supernote representation of that document.
 
+The runtime captures its first Drive change cursor before enumerating both
+device folders, then processes that initial snapshot before saving the cursor.
+An exact approval is read from `inkbridgeDriveApprovals/<drive-file-id>` and is
+verified by the existing registration/association planner. An unapproved
+ordinary file blocks cursor advancement; it is never silently consumed.
+
 An already-annotated unbound PDF is not safe to auto-register because its byte
 hash no longer identifies the clean original. It requires explicit recovery or
 manual binding.
@@ -54,6 +60,9 @@ filename.
 For every bound file revision it:
 
 - rejects incomplete downloads by comparing received bytes with Drive's size;
+- refetches the full Drive file metadata after each download and rejects the
+  bytes if version, size, parent, MIME type, deletion state or private
+  properties changed during transfer;
 - requires a bound file to remain directly in the configured folder for its
   device side;
 - suppresses metadata-only Drive versions when that file's downloaded SHA-256

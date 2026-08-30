@@ -4,7 +4,7 @@ use inkbridge_cloud_runtime::{
 use inkbridge_drive_gateway::{DriveGatewayConfig, DRIVE_GATEWAY_SCHEMA_VERSION};
 use inkbridge_drive_runtime::{
     CloudBrokerPort, CloudEvidenceStore, DriveOAuthTokenProvider, FirestoreGatewayCheckpointStore,
-    GatewayJob, GoogleDriveApi, GoogleSecretManager, RunMode,
+    FirestoreOnboardingApprovalStore, GatewayJob, GoogleDriveApi, GoogleSecretManager, RunMode,
 };
 use std::env;
 use std::sync::Arc;
@@ -59,6 +59,12 @@ fn run() -> Result<(), String> {
         &project_id,
         &database,
         checkpoint_id,
+        transport.clone(),
+        gcp_tokens.clone(),
+    ));
+    let approvals = Arc::new(FirestoreOnboardingApprovalStore::new(
+        &project_id,
+        &database,
         transport,
         gcp_tokens,
     ));
@@ -74,6 +80,7 @@ fn run() -> Result<(), String> {
         checkpoints,
         evidence,
         broker,
+        approvals,
     )?;
     let report = job.run_once(mode)?;
     println!(

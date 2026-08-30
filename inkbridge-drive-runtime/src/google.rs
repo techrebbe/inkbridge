@@ -1,4 +1,7 @@
-use crate::{CheckpointStore, DriveApi, DriveChangePage, VersionedCheckpoint};
+use crate::{
+    CheckpointStore, DriveApi, DriveChangePage, OnboardingApproval, OnboardingApprovalStore,
+    VersionedCheckpoint,
+};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use inkbridge_cloud_runtime::{
@@ -297,6 +300,8 @@ struct DriveChangeWire {
 struct DriveFilesWire {
     #[serde(default)]
     files: Vec<DriveFileWire>,
+    #[serde(default)]
+    next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -350,6 +355,55 @@ impl DriveApi for GoogleDriveApi {
         let token: StartPageToken =
             serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
         Ok(token.start_page_token)
+    }
+
+    fn list_initial_files(&self, folder_ids: &[String]) -> Result<Vec<DriveFileRevision>, String> {
+        let mut by_id = BTreeMap::new();
+        for folder_id in folder_ids {
+            if !folder_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            }) {
+                return Err("Drive folder ID is invalid".to_owned());
+            }
+            let query = format!("'{folder_id}' in parents and trashed=false");
+            let fields = format!("nextPageToken,files({})", Self::file_fields());
+            let mut page_token = None;
+            loop {
+                let page = page_token
+                    .as_ref()
+                    .map(|token: &String| format!("&pageToken={}", encode(token)))
+                    .unwrap_or_default();
+                let response = self.transport.execute(HttpRequest {
+                    method: "GET".to_owned(),
+                    url: format!(
+                        "{}/files?q={}&spaces=drive&pageSize=1000&fields={}{}",
+                        self.api_base,
+                        encode(&query),
+                        encode(&fields),
+                        page
+                    ),
+                    headers: self.headers()?,
+                    body: HttpBody::empty(),
+                })?;
+                if response.status != 200 {
+                    return Err(format!(
+                        "Drive initial files.list returned HTTP {}",
+                        response.status
+                    ));
+                }
+                let wire: DriveFilesWire =
+                    serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
+                for file in wire.files {
+                    let revision = file.into_revision()?;
+                    by_id.insert(revision.file_id.clone(), revision);
+                }
+                page_token = wire.next_page_token;
+                if page_token.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(by_id.into_values().collect())
     }
 
     fn list_changes(&self, page_token: &str) -> Result<DriveChangePage, String> {
@@ -418,6 +472,29 @@ impl DriveApi for GoogleDriveApi {
             ));
         }
         Ok(response.body)
+    }
+
+    fn file_revision(&self, file_id: &str) -> Result<DriveFileRevision, String> {
+        let response = self.transport.execute(HttpRequest {
+            method: "GET".to_owned(),
+            url: format!(
+                "{}/files/{}?fields={}",
+                self.api_base,
+                encode(file_id),
+                encode(Self::file_fields())
+            ),
+            headers: self.headers()?,
+            body: HttpBody::empty(),
+        })?;
+        if response.status != 200 {
+            return Err(format!(
+                "Drive files.get for {file_id} returned HTTP {}",
+                response.status
+            ));
+        }
+        let file: DriveFileWire =
+            serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
+        file.into_revision()
     }
 
     fn find_delivery(&self, delivery_id: &str) -> Result<Vec<DriveFileRevision>, String> {
@@ -689,6 +766,94 @@ impl CheckpointStore for FirestoreGatewayCheckpointStore {
     }
 }
 
+#[derive(Clone)]
+pub struct FirestoreOnboardingApprovalStore {
+    project_id: String,
+    database_id: String,
+    api_base: String,
+    transport: Arc<dyn HttpTransport>,
+    tokens: Arc<dyn TokenProvider>,
+}
+
+impl FirestoreOnboardingApprovalStore {
+    pub fn new(
+        project_id: impl Into<String>,
+        database_id: impl Into<String>,
+        transport: Arc<dyn HttpTransport>,
+        tokens: Arc<dyn TokenProvider>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            database_id: database_id.into(),
+            api_base: "https://firestore.googleapis.com/v1".to_owned(),
+            transport,
+            tokens,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_api_base(mut self, api_base: &str) -> Self {
+        self.api_base = api_base.to_owned();
+        self
+    }
+
+    fn root(&self) -> String {
+        format!(
+            "{}/projects/{}/databases/{}/documents",
+            self.api_base,
+            encode(&self.project_id),
+            encode(&self.database_id)
+        )
+    }
+
+    fn headers(&self) -> Result<BTreeMap<String, String>, String> {
+        Ok(bearer_headers(&self.tokens.access_token()?))
+    }
+}
+
+impl OnboardingApprovalStore for FirestoreOnboardingApprovalStore {
+    fn load(&self, drive_file_id: &str) -> Result<Option<OnboardingApproval>, String> {
+        let response = self.transport.execute(HttpRequest {
+            method: "GET".to_owned(),
+            url: format!(
+                "{}/inkbridgeDriveApprovals/{}",
+                self.root(),
+                encode(drive_file_id)
+            ),
+            headers: self.headers()?,
+            body: HttpBody::empty(),
+        })?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if response.status != 200 {
+            return Err(format!(
+                "Firestore Drive approval read returned HTTP {}",
+                response.status
+            ));
+        }
+        let value: Value =
+            serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
+        let encoded = value
+            .pointer("/fields/approval/bytesValue")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Firestore Drive approval has no payload".to_owned())?;
+        let bytes = BASE64.decode(encoded).map_err(|error| error.to_string())?;
+        let approval: OnboardingApproval =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let approved_file_id = match &approval {
+            OnboardingApproval::Original { approval } => &approval.drive_file_id,
+            OnboardingApproval::DeviceArtifact { approval } => &approval.drive_file_id,
+        };
+        if approved_file_id != drive_file_id {
+            return Err(format!(
+                "Firestore Drive approval document {drive_file_id} names a different file"
+            ));
+        }
+        Ok(Some(approval))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +969,65 @@ mod tests {
     }
 
     #[test]
+    fn drive_initial_snapshot_paginates_both_device_folders() {
+        let transport = Arc::new(RecordingTransport::default());
+        transport.push(
+            200,
+            br#"{
+              "nextPageToken":"boox-next",
+              "files":[{"id":"boox-1","name":"book.pdf","version":"1",
+                "mimeType":"application/pdf","parents":["boox-folder"],
+                "size":"12","trashed":false,"appProperties":{}}]
+            }"#,
+        );
+        transport.push(
+            200,
+            br#"{"files":[{"id":"boox-2","name":"notes.json","version":"2",
+              "mimeType":"application/json","parents":["boox-folder"],
+              "size":"8","trashed":false,"appProperties":{}}]}"#,
+        );
+        transport.push(200, br#"{"files":[]}"#);
+        let api = GoogleDriveApi::new(
+            transport.clone(),
+            Arc::new(StaticTokenProvider("drive-token".to_owned())),
+        )
+        .with_endpoints("https://drive.example/v3", "https://upload.example/v3");
+
+        let files = api
+            .list_initial_files(&["boox-folder".to_owned(), "supernote-folder".to_owned()])
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].url.contains("boox%2Dfolder"));
+        assert!(requests[1].url.contains("pageToken=boox%2Dnext"));
+        assert!(requests[2].url.contains("supernote%2Dfolder"));
+    }
+
+    #[test]
+    fn drive_file_revision_refetches_exact_metadata_after_download() {
+        let transport = Arc::new(RecordingTransport::default());
+        transport.push(
+            200,
+            br#"{"id":"file-1","name":"book.pdf","version":"8",
+              "mimeType":"application/pdf","parents":["boox-folder"],
+              "size":"123","trashed":false,"appProperties":{}}"#,
+        );
+        let api = GoogleDriveApi::new(
+            transport.clone(),
+            Arc::new(StaticTokenProvider("drive-token".to_owned())),
+        )
+        .with_endpoints("https://drive.example/v3", "https://upload.example/v3");
+
+        let revision = api.file_revision("file-1").unwrap();
+        assert_eq!(revision.version, 8);
+        assert_eq!(revision.size, 123);
+        let requests = transport.requests.lock().unwrap();
+        assert!(requests[0].url.contains("/files/file%2D1?fields="));
+        assert!(!requests[0].url.contains("alt=media"));
+    }
+
+    #[test]
     fn drive_create_uses_resumable_upload_and_private_delivery_properties() {
         let transport = Arc::new(RecordingTransport::default());
         transport.push_with_headers(
@@ -903,5 +1127,40 @@ mod tests {
             .compare_and_swap(Some("old"), &DriveGatewayCheckpoint::empty())
             .unwrap_err();
         assert!(error.contains("generation changed"));
+    }
+
+    #[test]
+    fn firestore_onboarding_approval_is_exact_and_file_bound() {
+        let transport = Arc::new(RecordingTransport::default());
+        let approval = OnboardingApproval::Original {
+            approval: inkbridge_drive_gateway::OriginalRegistrationApproval {
+                drive_file_id: "boox-file".to_owned(),
+                drive_file_version: 7,
+                content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+            },
+        };
+        let encoded = BASE64.encode(serde_json::to_vec(&approval).unwrap());
+        transport.push(
+            200,
+            serde_json::to_vec(&json!({
+                "fields": {"approval": {"bytesValue": encoded}}
+            }))
+            .unwrap()
+            .as_slice(),
+        );
+        let store = FirestoreOnboardingApprovalStore::new(
+            "project",
+            "(default)",
+            transport.clone(),
+            Arc::new(StaticTokenProvider("gcp-token".to_owned())),
+        )
+        .with_api_base("https://firestore.example/v1");
+
+        assert_eq!(store.load("boox-file").unwrap(), Some(approval));
+        let requests = transport.requests.lock().unwrap();
+        assert!(requests[0]
+            .url
+            .ends_with("/inkbridgeDriveApprovals/boox%2Dfile"));
     }
 }

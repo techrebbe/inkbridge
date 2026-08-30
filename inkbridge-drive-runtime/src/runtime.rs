@@ -4,11 +4,14 @@ use inkbridge_broker::{
 };
 use inkbridge_cloud_runtime::{CanonicalStateStore, ObjectStore, RuntimeOutcome, RuntimeService};
 use inkbridge_drive_gateway::{
-    accept_drive_input, commit_drive_input, commit_drive_output, commit_page_token,
-    prepare_drive_input, prepare_drive_output, reconcile_drive_output, reject_drive_input,
-    reserve_drive_output, BrokerDriveOutput, CanonicalFrontier, DriveChange, DriveFileRevision,
-    DriveGatewayCheckpoint, DriveGatewayConfig, DriveInputDecision, DriveOutputDecision,
-    PendingDriveInput, PreparedDriveOutput,
+    accept_drive_input, commit_device_artifact_binding, commit_drive_input, commit_drive_output,
+    commit_original_registration, commit_page_token, prepare_device_artifact_binding,
+    prepare_drive_input, prepare_drive_output, prepare_original_registration,
+    reconcile_drive_output, reject_drive_input, reserve_drive_output, BrokerDriveOutput,
+    CanonicalFrontier, DeviceArtifactBindingApproval, DeviceArtifactBindingDecision, DriveChange,
+    DriveFileRevision, DriveGatewayCheckpoint, DriveGatewayConfig, DriveInputDecision,
+    DriveOutputDecision, OriginalRegistrationApproval, PendingDriveInput, PreparedDriveOutput,
+    RegistrationDecision,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -49,14 +52,33 @@ impl DriveChangePage {
 
 pub trait DriveApi: Send + Sync {
     fn start_page_token(&self) -> Result<String, String>;
+    fn list_initial_files(&self, folder_ids: &[String]) -> Result<Vec<DriveFileRevision>, String>;
     fn list_changes(&self, page_token: &str) -> Result<DriveChangePage, String>;
     fn download(&self, file_id: &str) -> Result<Vec<u8>, String>;
+    fn file_revision(&self, file_id: &str) -> Result<DriveFileRevision, String>;
     fn find_delivery(&self, delivery_id: &str) -> Result<Vec<DriveFileRevision>, String>;
     fn create_delivery(
         &self,
         output: &PreparedDriveOutput,
         bytes: &[u8],
     ) -> Result<DriveFileRevision, String>;
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum OnboardingApproval {
+    Original {
+        #[serde(flatten)]
+        approval: OriginalRegistrationApproval,
+    },
+    DeviceArtifact {
+        #[serde(flatten)]
+        approval: DeviceArtifactBindingApproval,
+    },
+}
+
+pub trait OnboardingApprovalStore: Send + Sync {
+    fn load(&self, drive_file_id: &str) -> Result<Option<OnboardingApproval>, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +144,7 @@ pub struct GatewayJob {
     checkpoints: Arc<dyn CheckpointStore>,
     evidence: Arc<dyn EvidenceStore>,
     broker: Arc<dyn BrokerPort>,
+    approvals: Arc<dyn OnboardingApprovalStore>,
 }
 
 impl GatewayJob {
@@ -131,6 +154,7 @@ impl GatewayJob {
         checkpoints: Arc<dyn CheckpointStore>,
         evidence: Arc<dyn EvidenceStore>,
         broker: Arc<dyn BrokerPort>,
+        approvals: Arc<dyn OnboardingApprovalStore>,
     ) -> Result<Self, String> {
         config.validate()?;
         Ok(Self {
@@ -139,6 +163,7 @@ impl GatewayJob {
             checkpoints,
             evidence,
             broker,
+            approvals,
         })
     }
 
@@ -146,24 +171,6 @@ impl GatewayJob {
         let mut report = RunReport::default();
         let mut stored = self.checkpoints.load()?;
         stored.value.validate()?;
-
-        if stored.value.next_page_token.is_none() {
-            let token = self.drive.start_page_token()?;
-            if token.trim().is_empty() {
-                return Err("Drive returned an empty start page token".to_owned());
-            }
-            if mode == RunMode::DryRun {
-                report
-                    .dry_run_actions
-                    .push("initialize Drive change cursor".to_owned());
-            } else {
-                commit_page_token(&mut stored.value, token);
-                stored = self.persist(stored)?;
-            }
-            report.initialized_page_token = true;
-            let _ = stored;
-            return Ok(report);
-        }
 
         if mode == RunMode::Apply {
             stored = self.recover_pending_inputs(stored, &mut report)?;
@@ -181,104 +188,308 @@ impl GatewayJob {
             }
         }
 
-        let page_token = stored
-            .value
-            .next_page_token
-            .clone()
-            .ok_or_else(|| "Drive page token disappeared".to_owned())?;
-        let page = self.drive.list_changes(&page_token)?;
-        let successor = page.durable_successor()?.to_owned();
-        report.pages_processed = 1;
-
-        for change in page.changes {
-            report.changes_seen += 1;
-            let file_id = change.file.file_id.clone();
-            let is_bound = stored.value.binding_for_file(&file_id).is_some();
-            if !is_bound {
-                match prepare_drive_input(
-                    &self.config,
-                    &stored.value,
-                    &change,
-                    &[],
-                    CanonicalFrontier {
-                        revisions: RevisionPair::default(),
-                    },
-                )? {
-                    DriveInputDecision::Ignore { .. } => report.ignored += 1,
-                    DriveInputDecision::Unbound { file_id } => report.unbound.push(file_id),
-                    other => {
-                        return Err(format!(
-                            "unbound Drive file produced an invalid decision: {other:?}"
-                        ));
-                    }
-                }
-                continue;
+        let (changes, successor, cursor_description) = if let Some(page_token) =
+            stored.value.next_page_token.clone()
+        {
+            let page = self.drive.list_changes(&page_token)?;
+            let successor = page.durable_successor()?.to_owned();
+            report.pages_processed = 1;
+            (page.changes, successor, format!("page token {page_token}"))
+        } else {
+            // Capture the change-feed cursor before enumerating the current folders. Any
+            // revision that races with this bootstrap is therefore present either in the
+            // initial snapshot or in the later change feed (and may safely appear in both).
+            let start_token = self.drive.start_page_token()?;
+            if start_token.trim().is_empty() {
+                return Err("Drive returned an empty start page token".to_owned());
             }
-            let bytes = if change.file.trashed {
-                Vec::new()
-            } else {
-                self.drive.download(&change.file.file_id)?
-            };
-            let binding = stored
-                .value
-                .binding_for_file(&change.file.file_id)
-                .ok_or_else(|| "Drive binding disappeared".to_owned())?;
-            let frontier = self.broker.frontier(&binding.document_id)?;
-            match prepare_drive_input(
-                &self.config,
-                &stored.value,
-                &change,
-                &bytes,
-                CanonicalFrontier {
-                    revisions: frontier,
-                },
-            )? {
-                DriveInputDecision::Ignore { .. } => report.ignored += 1,
-                DriveInputDecision::Duplicate { .. } => report.duplicates += 1,
-                DriveInputDecision::Unbound { file_id } => report.unbound.push(file_id),
-                DriveInputDecision::Deferred {
-                    pending_drive_event_id,
-                    ..
-                } => {
-                    return Err(format!(
-                        "Drive input is still blocked by pending event {pending_drive_event_id}"
+            let files = self.drive.list_initial_files(&[
+                self.config.boox_folder_id.clone(),
+                self.config.supernote_folder_id.clone(),
+            ])?;
+            report.initialized_page_token = true;
+            report.pages_processed = 1;
+            if mode == RunMode::DryRun {
+                report.dry_run_actions.push(format!(
+                        "inspect {} existing device-folder files before initializing Drive change cursor",
+                        files.len()
                     ));
-                }
-                DriveInputDecision::Upload(input) => {
-                    if mode == RunMode::DryRun {
-                        report.dry_run_actions.push(format!(
-                            "upload {} as immutable evidence {}",
-                            input.drive_event_id, input.gcs_object_path
-                        ));
-                        continue;
-                    }
-                    let object = self.evidence.put_immutable(
-                        &input.gcs_object_path,
-                        &bytes,
-                        &input.metadata,
-                    )?;
-                    commit_drive_input(&mut stored.value, &input, object.generation)?;
-                    stored = self.persist(stored)?;
-                    let pending = stored
-                        .value
-                        .pending_drive_inputs
-                        .get(&input.drive_event_id)
-                        .cloned()
-                        .ok_or_else(|| "committed Drive input disappeared".to_owned())?;
-                    stored = self.finish_pending_input(stored, &pending, &mut report)?;
-                }
             }
+            (
+                files.into_iter().map(|file| DriveChange { file }).collect(),
+                start_token,
+                "initial folder snapshot".to_owned(),
+            )
+        };
+
+        for change in changes {
+            report.changes_seen += 1;
+            stored = self.process_change(stored, change, mode, &mut report)?;
         }
 
         if mode == RunMode::DryRun {
             report.dry_run_actions.push(format!(
-                "retain page token {page_token}; dry-run never checkpoints"
+                "retain {cursor_description}; dry-run never checkpoints"
             ));
         } else {
             commit_page_token(&mut stored.value, successor);
             let _ = self.persist(stored)?;
         }
         Ok(report)
+    }
+
+    fn process_change(
+        &self,
+        mut stored: VersionedCheckpoint,
+        change: DriveChange,
+        mode: RunMode,
+        report: &mut RunReport,
+    ) -> Result<VersionedCheckpoint, String> {
+        if stored
+            .value
+            .binding_for_file(&change.file.file_id)
+            .is_none()
+        {
+            match prepare_drive_input(
+                &self.config,
+                &stored.value,
+                &change,
+                &[],
+                CanonicalFrontier {
+                    revisions: RevisionPair::default(),
+                },
+            )? {
+                DriveInputDecision::Ignore { .. } => {
+                    report.ignored += 1;
+                    return Ok(stored);
+                }
+                DriveInputDecision::Unbound { .. } => {
+                    let bytes = self.download_verified(&change.file)?;
+                    let Some(approval) = self.approvals.load(&change.file.file_id)? else {
+                        return self.block_unapproved(stored, &change.file.file_id, mode, report);
+                    };
+                    match approval {
+                        OnboardingApproval::Original { approval } => {
+                            match prepare_original_registration(
+                                &self.config,
+                                &stored.value,
+                                &change,
+                                &bytes,
+                                &approval,
+                            )? {
+                                RegistrationDecision::Register(registration) => {
+                                    if mode == RunMode::DryRun {
+                                        report.dry_run_actions.push(format!(
+                                            "register approved original {} as {}",
+                                            registration.drive_file_id, registration.document_id
+                                        ));
+                                    } else {
+                                        let object = self.evidence.put_immutable(
+                                            &registration.gcs_object_path,
+                                            &bytes,
+                                            &registration.metadata,
+                                        )?;
+                                        if object.generation == 0 {
+                                            return Err(
+                                                "original registration evidence has generation zero"
+                                                    .to_owned(),
+                                            );
+                                        }
+                                        commit_original_registration(
+                                            &mut stored.value,
+                                            &registration,
+                                        )?;
+                                        stored = self.persist(stored)?;
+                                    }
+                                    return Ok(stored);
+                                }
+                                RegistrationDecision::Duplicate { .. } => {
+                                    report.duplicates += 1;
+                                    return Ok(stored);
+                                }
+                                RegistrationDecision::Ignore { reason } => {
+                                    return self.block_invalid_approval(
+                                        stored,
+                                        &change.file.file_id,
+                                        &reason,
+                                        mode,
+                                        report,
+                                    );
+                                }
+                            }
+                        }
+                        OnboardingApproval::DeviceArtifact { approval } => {
+                            let frontier = self.broker.frontier(&approval.document_id)?;
+                            match prepare_device_artifact_binding(
+                                &self.config,
+                                &stored.value,
+                                &change,
+                                &bytes,
+                                &approval,
+                                CanonicalFrontier {
+                                    revisions: frontier,
+                                },
+                            )? {
+                                DeviceArtifactBindingDecision::Bind(binding) => {
+                                    commit_device_artifact_binding(&mut stored.value, &binding)?;
+                                    if mode == RunMode::DryRun {
+                                        report.dry_run_actions.push(format!(
+                                            "bind approved device artifact {} to {}",
+                                            binding.drive_file_id, binding.document_id
+                                        ));
+                                    } else {
+                                        stored = self.persist(stored)?;
+                                    }
+                                }
+                                DeviceArtifactBindingDecision::AlreadyBound { .. } => {}
+                                DeviceArtifactBindingDecision::Ignore { reason } => {
+                                    return self.block_invalid_approval(
+                                        stored,
+                                        &change.file.file_id,
+                                        &reason,
+                                        mode,
+                                        report,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return self.process_bound_change(stored, change, bytes, mode, report);
+                }
+                other => {
+                    return Err(format!(
+                        "unbound Drive file produced an invalid decision: {other:?}"
+                    ));
+                }
+            }
+        }
+
+        let bytes = if change.file.trashed {
+            Vec::new()
+        } else {
+            self.download_verified(&change.file)?
+        };
+        self.process_bound_change(stored, change, bytes, mode, report)
+    }
+
+    fn process_bound_change(
+        &self,
+        mut stored: VersionedCheckpoint,
+        change: DriveChange,
+        bytes: Vec<u8>,
+        mode: RunMode,
+        report: &mut RunReport,
+    ) -> Result<VersionedCheckpoint, String> {
+        let binding = stored
+            .value
+            .binding_for_file(&change.file.file_id)
+            .ok_or_else(|| "Drive binding disappeared".to_owned())?;
+        let frontier = self.broker.frontier(&binding.document_id)?;
+        match prepare_drive_input(
+            &self.config,
+            &stored.value,
+            &change,
+            &bytes,
+            CanonicalFrontier {
+                revisions: frontier,
+            },
+        )? {
+            DriveInputDecision::Ignore { .. } => report.ignored += 1,
+            DriveInputDecision::Duplicate { .. } => report.duplicates += 1,
+            DriveInputDecision::Unbound { file_id } => {
+                return Err(format!("bound Drive file became unbound: {file_id}"));
+            }
+            DriveInputDecision::Deferred {
+                pending_drive_event_id,
+                ..
+            } => {
+                return Err(format!(
+                    "Drive input is still blocked by pending event {pending_drive_event_id}"
+                ));
+            }
+            DriveInputDecision::Upload(input) => {
+                if mode == RunMode::DryRun {
+                    report.dry_run_actions.push(format!(
+                        "upload {} as immutable evidence {}",
+                        input.drive_event_id, input.gcs_object_path
+                    ));
+                    return Ok(stored);
+                }
+                let object =
+                    self.evidence
+                        .put_immutable(&input.gcs_object_path, &bytes, &input.metadata)?;
+                commit_drive_input(&mut stored.value, &input, object.generation)?;
+                stored = self.persist(stored)?;
+                let pending = stored
+                    .value
+                    .pending_drive_inputs
+                    .get(&input.drive_event_id)
+                    .cloned()
+                    .ok_or_else(|| "committed Drive input disappeared".to_owned())?;
+                stored = self.finish_pending_input(stored, &pending, report)?;
+            }
+        }
+        Ok(stored)
+    }
+
+    fn download_verified(&self, listed: &DriveFileRevision) -> Result<Vec<u8>, String> {
+        let bytes = self.drive.download(&listed.file_id)?;
+        let current = self.drive.file_revision(&listed.file_id)?;
+        if &current != listed {
+            return Err(format!(
+                "Drive file {} changed while it was being downloaded; retry the job",
+                listed.file_id
+            ));
+        }
+        if bytes.len() as u64 != listed.size {
+            return Err(format!(
+                "Drive download length {} does not match declared size {}",
+                bytes.len(),
+                listed.size
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn block_unapproved(
+        &self,
+        stored: VersionedCheckpoint,
+        file_id: &str,
+        mode: RunMode,
+        report: &mut RunReport,
+    ) -> Result<VersionedCheckpoint, String> {
+        report.unbound.push(file_id.to_owned());
+        if mode == RunMode::DryRun {
+            report.dry_run_actions.push(format!(
+                "require explicit onboarding approval for {file_id}"
+            ));
+            Ok(stored)
+        } else {
+            Err(format!(
+                "Drive file {file_id} is unbound and has no explicit onboarding approval; page token retained"
+            ))
+        }
+    }
+
+    fn block_invalid_approval(
+        &self,
+        stored: VersionedCheckpoint,
+        file_id: &str,
+        reason: &str,
+        mode: RunMode,
+        report: &mut RunReport,
+    ) -> Result<VersionedCheckpoint, String> {
+        report.unbound.push(file_id.to_owned());
+        if mode == RunMode::DryRun {
+            report.dry_run_actions.push(format!(
+                "reject onboarding approval for {file_id}: {reason}"
+            ));
+            Ok(stored)
+        } else {
+            Err(format!(
+                "Drive onboarding approval for {file_id} is invalid: {reason}; page token retained"
+            ))
+        }
     }
 
     fn recover_pending_inputs(
@@ -682,6 +893,8 @@ mod tests {
     #[derive(Default)]
     struct FakeDrive {
         page: Mutex<Option<DriveChangePage>>,
+        initial_files: Mutex<Vec<DriveFileRevision>>,
+        current_revisions: Mutex<BTreeMap<String, DriveFileRevision>>,
         downloads: Mutex<BTreeMap<String, Vec<u8>>>,
         deliveries: Mutex<Vec<DriveFileRevision>>,
         creates: Mutex<usize>,
@@ -706,6 +919,13 @@ mod tests {
             Ok("initial".to_owned())
         }
 
+        fn list_initial_files(
+            &self,
+            _folder_ids: &[String],
+        ) -> Result<Vec<DriveFileRevision>, String> {
+            Ok(self.initial_files.lock().unwrap().clone())
+        }
+
         fn list_changes(&self, _page_token: &str) -> Result<DriveChangePage, String> {
             self.page
                 .lock()
@@ -721,6 +941,31 @@ mod tests {
                 .get(file_id)
                 .cloned()
                 .ok_or_else(|| "missing download".to_owned())
+        }
+
+        fn file_revision(&self, file_id: &str) -> Result<DriveFileRevision, String> {
+            if let Some(revision) = self.current_revisions.lock().unwrap().get(file_id).cloned() {
+                return Ok(revision);
+            }
+            self.page
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|page| {
+                    page.changes
+                        .iter()
+                        .find(|change| change.file.file_id == file_id)
+                })
+                .map(|change| change.file.clone())
+                .or_else(|| {
+                    self.initial_files
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|file| file.file_id == file_id)
+                        .cloned()
+                })
+                .ok_or_else(|| "missing Drive file revision".to_owned())
         }
 
         fn find_delivery(&self, delivery_id: &str) -> Result<Vec<DriveFileRevision>, String> {
@@ -897,6 +1142,17 @@ mod tests {
         output: Option<BrokerDriveOutput>,
     }
 
+    #[derive(Default)]
+    struct FakeApprovals {
+        values: Mutex<BTreeMap<String, OnboardingApproval>>,
+    }
+
+    impl OnboardingApprovalStore for FakeApprovals {
+        fn load(&self, drive_file_id: &str) -> Result<Option<OnboardingApproval>, String> {
+            Ok(self.values.lock().unwrap().get(drive_file_id).cloned())
+        }
+    }
+
     impl BrokerPort for FakeBroker {
         fn frontier(&self, _document_id: &str) -> Result<RevisionPair, String> {
             Ok(RevisionPair::default())
@@ -921,7 +1177,23 @@ mod tests {
         evidence: Arc<FakeEvidence>,
         broker: Arc<FakeBroker>,
     ) -> GatewayJob {
-        GatewayJob::new(config(), drive, checkpoints, evidence, broker).unwrap()
+        job_with_approvals(
+            drive,
+            checkpoints,
+            evidence,
+            broker,
+            Arc::new(FakeApprovals::default()),
+        )
+    }
+
+    fn job_with_approvals(
+        drive: Arc<FakeDrive>,
+        checkpoints: Arc<FakeCheckpoints>,
+        evidence: Arc<FakeEvidence>,
+        broker: Arc<FakeBroker>,
+        approvals: Arc<FakeApprovals>,
+    ) -> GatewayJob {
+        GatewayJob::new(config(), drive, checkpoints, evidence, broker, approvals).unwrap()
     }
 
     #[test]
@@ -1111,5 +1383,238 @@ mod tests {
         let report = job.run_once(RunMode::Apply).unwrap();
         assert_eq!(report.ignored, 1);
         assert!(report.unbound.is_empty());
+    }
+
+    fn initial_pdf(file_id: &str, parent: &str, bytes: &[u8]) -> DriveFileRevision {
+        DriveFileRevision {
+            file_id: file_id.to_owned(),
+            name: "clean-original.pdf".to_owned(),
+            version: 1,
+            mime_type: "application/pdf".to_owned(),
+            parents: vec![parent.to_owned()],
+            size: bytes.len() as u64,
+            trashed: false,
+            app_properties: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn fresh_checkpoint_bootstraps_both_approved_originals_before_saving_cursor() {
+        let bytes = b"%PDF-1.7 clean original";
+        let boox = initial_pdf("boox-original", "boox-folder-123", bytes);
+        let supernote = initial_pdf("supernote-original", "supernote-folder-123", bytes);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![boox.clone(), supernote.clone()];
+        drive.downloads.lock().unwrap().extend([
+            (boox.file_id.clone(), bytes.to_vec()),
+            (supernote.file_id.clone(), bytes.to_vec()),
+        ]);
+        let approvals = Arc::new(FakeApprovals::default());
+        for file in [&boox, &supernote] {
+            approvals.values.lock().unwrap().insert(
+                file.file_id.clone(),
+                OnboardingApproval::Original {
+                    approval: OriginalRegistrationApproval {
+                        drive_file_id: file.file_id.clone(),
+                        drive_file_version: file.version,
+                        content_sha256: sha256_hex(bytes),
+                    },
+                },
+            );
+        }
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let evidence = Arc::new(FakeEvidence::default());
+        let job = job_with_approvals(
+            drive,
+            checkpoints.clone(),
+            evidence.clone(),
+            Arc::new(FakeBroker {
+                fail_once: Mutex::new(false),
+                output: None,
+            }),
+            approvals,
+        );
+
+        let report = job.run_once(RunMode::Apply).unwrap();
+        assert!(report.initialized_page_token);
+        assert_eq!(report.changes_seen, 2);
+        let checkpoint = checkpoints.value();
+        assert_eq!(checkpoint.next_page_token.as_deref(), Some("initial"));
+        assert_eq!(checkpoint.documents.len(), 1);
+        let document_id = inkbridge_broker::stable_document_id(bytes);
+        let binding = &checkpoint.documents[&document_id];
+        assert!(binding.boox_file_ids.contains("boox-original"));
+        assert!(binding.supernote_file_ids.contains("supernote-original"));
+        assert_eq!(evidence.objects.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn first_dry_run_inspects_existing_files_without_mutating_state() {
+        let bytes = b"%PDF-1.7 clean original";
+        let file = initial_pdf("boox-original", "boox-folder-123", bytes);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![file.clone()];
+        drive
+            .downloads
+            .lock()
+            .unwrap()
+            .insert(file.file_id.clone(), bytes.to_vec());
+        let approvals = Arc::new(FakeApprovals::default());
+        approvals.values.lock().unwrap().insert(
+            file.file_id.clone(),
+            OnboardingApproval::Original {
+                approval: OriginalRegistrationApproval {
+                    drive_file_id: file.file_id,
+                    drive_file_version: file.version,
+                    content_sha256: sha256_hex(bytes),
+                },
+            },
+        );
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let evidence = Arc::new(FakeEvidence::default());
+        let job = job_with_approvals(
+            drive,
+            checkpoints.clone(),
+            evidence.clone(),
+            Arc::new(FakeBroker {
+                fail_once: Mutex::new(false),
+                output: None,
+            }),
+            approvals,
+        );
+
+        let report = job.run_once(RunMode::DryRun).unwrap();
+        assert!(report.initialized_page_token);
+        assert_eq!(report.changes_seen, 1);
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("register approved original")));
+        assert_eq!(checkpoints.value(), DriveGatewayCheckpoint::empty());
+        assert!(evidence.objects.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unapproved_initial_file_blocks_cursor_commit_in_apply_mode() {
+        let bytes = b"%PDF-1.7 unknown PDF";
+        let file = initial_pdf("unknown-file", "boox-folder-123", bytes);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![file.clone()];
+        drive
+            .downloads
+            .lock()
+            .unwrap()
+            .insert(file.file_id, bytes.to_vec());
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let job = job(
+            drive,
+            checkpoints.clone(),
+            Arc::new(FakeEvidence::default()),
+            Arc::new(FakeBroker {
+                fail_once: Mutex::new(false),
+                output: None,
+            }),
+        );
+
+        let error = job.run_once(RunMode::Apply).unwrap_err();
+        assert!(error.contains("no explicit onboarding approval"));
+        assert!(checkpoints.value().next_page_token.is_none());
+    }
+
+    #[test]
+    fn equal_sized_newer_drive_revision_is_rejected_after_download() {
+        let bytes = br#"{"schemaVersion":1}"#;
+        let drive = Arc::new(FakeDrive::with_page(bytes));
+        let mut newer = change(bytes).file;
+        newer.version += 1;
+        drive
+            .current_revisions
+            .lock()
+            .unwrap()
+            .insert(newer.file_id.clone(), newer);
+        let checkpoints = Arc::new(FakeCheckpoints::new(checkpoint()));
+        let evidence = Arc::new(FakeEvidence::default());
+        let job = job(
+            drive,
+            checkpoints.clone(),
+            evidence.clone(),
+            Arc::new(FakeBroker {
+                fail_once: Mutex::new(false),
+                output: None,
+            }),
+        );
+
+        let error = job.run_once(RunMode::Apply).unwrap_err();
+        assert!(error.contains("changed while it was being downloaded"));
+        assert_eq!(
+            checkpoints.value().next_page_token.as_deref(),
+            Some("page-1")
+        );
+        assert!(evidence.objects.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn approved_unbound_device_artifact_is_bound_and_processed_on_the_same_page() {
+        let bytes = br#"{"schemaVersion":1,"operations":[]}"#;
+        let artifact = DriveFileRevision {
+            file_id: "new-supernote-export".to_owned(),
+            name: "native-export.json".to_owned(),
+            version: 4,
+            mime_type: "application/json".to_owned(),
+            parents: vec!["supernote-folder-123".to_owned()],
+            size: bytes.len() as u64,
+            trashed: false,
+            app_properties: BTreeMap::new(),
+        };
+        let drive = Arc::new(FakeDrive::default());
+        *drive.page.lock().unwrap() = Some(DriveChangePage {
+            changes: vec![DriveChange {
+                file: artifact.clone(),
+            }],
+            next_page_token: None,
+            new_start_page_token: Some("page-2".to_owned()),
+        });
+        drive
+            .downloads
+            .lock()
+            .unwrap()
+            .insert(artifact.file_id.clone(), bytes.to_vec());
+        let approvals = Arc::new(FakeApprovals::default());
+        approvals.values.lock().unwrap().insert(
+            artifact.file_id.clone(),
+            OnboardingApproval::DeviceArtifact {
+                approval: DeviceArtifactBindingApproval {
+                    drive_file_id: artifact.file_id.clone(),
+                    drive_file_version: artifact.version,
+                    content_sha256: sha256_hex(bytes),
+                    document_id: document_id(),
+                    source: inkbridge_broker::DeviceSide::Supernote,
+                    based_on: RevisionPair::default(),
+                },
+            },
+        );
+        let checkpoints = Arc::new(FakeCheckpoints::new(checkpoint()));
+        let job = job_with_approvals(
+            drive,
+            checkpoints.clone(),
+            Arc::new(FakeEvidence::default()),
+            Arc::new(FakeBroker {
+                fail_once: Mutex::new(false),
+                output: None,
+            }),
+            approvals,
+        );
+
+        let report = job.run_once(RunMode::Apply).unwrap();
+        assert_eq!(report.inputs_applied, 1);
+        let checkpoint = checkpoints.value();
+        assert!(checkpoint.documents[&document_id()]
+            .supernote_file_ids
+            .contains("new-supernote-export"));
+        assert_eq!(
+            checkpoint.file_observed_frontiers["new-supernote-export"].supernote,
+            1
+        );
+        assert_eq!(checkpoint.next_page_token.as_deref(), Some("page-2"));
     }
 }
