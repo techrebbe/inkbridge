@@ -69,6 +69,16 @@ pub fn prepare_drive_input(
     let content_sha256 = sha256_hex(bytes);
     let event_id =
         drive_event_id_from_parts(&change.file.file_id, change.file.version, &content_sha256);
+    if let Some(pending) = checkpoint
+        .pending_drive_inputs
+        .values()
+        .find(|pending| pending.drive_file_id == change.file.file_id)
+    {
+        return Ok(DriveInputDecision::Deferred {
+            file_id: change.file.file_id.clone(),
+            pending_drive_event_id: pending.drive_event_id.clone(),
+        });
+    }
     if checkpoint
         .accepted_file_content_sha256
         .get(&change.file.file_id)
@@ -81,16 +91,6 @@ pub fn prepare_drive_input(
     if checkpoint.processed_drive_events.contains(&event_id) {
         return Ok(DriveInputDecision::Duplicate {
             drive_event_id: event_id,
-        });
-    }
-    if let Some(pending) = checkpoint
-        .pending_drive_inputs
-        .values()
-        .find(|pending| pending.drive_file_id == change.file.file_id)
-    {
-        return Ok(DriveInputDecision::Deferred {
-            file_id: change.file.file_id.clone(),
-            pending_drive_event_id: pending.drive_event_id.clone(),
         });
     }
     let source = binding
@@ -443,6 +443,7 @@ pub fn commit_original_registration(
                 registration.drive_file_id
             ));
         }
+        return Ok(());
     }
     if checkpoint
         .documents
@@ -1034,11 +1035,81 @@ mod tests {
         };
         commit_drive_input(&mut checkpoint, &input).unwrap();
         assert_eq!(
+            prepare_drive_input(&config(), &checkpoint, &change, bytes, frontier.clone()).unwrap(),
+            DriveInputDecision::Deferred {
+                file_id: change.file.file_id.clone(),
+                pending_drive_event_id: input.drive_event_id.clone()
+            }
+        );
+        accept_drive_input(&mut checkpoint, &input.drive_event_id).unwrap();
+        assert_eq!(
             prepare_drive_input(&config(), &checkpoint, &change, bytes, frontier).unwrap(),
             DriveInputDecision::Duplicate {
                 drive_event_id: input.drive_event_id
             }
         );
+    }
+
+    #[test]
+    fn reverted_bytes_wait_for_pending_input_before_duplicate_suppression() {
+        let config = config();
+        let accepted_bytes = b"accepted pdf";
+        let pending_bytes = b"accepted pdf plus ink";
+        let mut checkpoint = checkpoint();
+        checkpoint
+            .accepted_file_content_sha256
+            .insert("boox-file".to_owned(), sha256_hex(accepted_bytes));
+        let frontier = CanonicalFrontier {
+            revisions: RevisionPair {
+                boox: 3,
+                supernote: 5,
+            },
+        };
+        let mut pending_change = change("boox-file", "application/pdf");
+        pending_change.file.size = pending_bytes.len() as u64;
+        let DriveInputDecision::Upload(pending) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &pending_change,
+            pending_bytes,
+            frontier.clone(),
+        )
+        .unwrap() else {
+            panic!("expected pending edit")
+        };
+        commit_drive_input(&mut checkpoint, &pending).unwrap();
+
+        let mut reverted_change = pending_change;
+        reverted_change.file.version += 1;
+        reverted_change.file.size = accepted_bytes.len() as u64;
+        assert_eq!(
+            prepare_drive_input(
+                &config,
+                &checkpoint,
+                &reverted_change,
+                accepted_bytes,
+                frontier.clone(),
+            )
+            .unwrap(),
+            DriveInputDecision::Deferred {
+                file_id: "boox-file".to_owned(),
+                pending_drive_event_id: pending.drive_event_id.clone(),
+            }
+        );
+
+        accept_drive_input(&mut checkpoint, &pending.drive_event_id).unwrap();
+        let DriveInputDecision::Upload(reverted) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &reverted_change,
+            accepted_bytes,
+            frontier,
+        )
+        .unwrap() else {
+            panic!("reverted content must enter after the pending edit is accepted")
+        };
+        assert_eq!(reverted.based_on.boox, 4);
+        assert_eq!(reverted.source_revision, 5);
     }
 
     #[test]
@@ -1574,8 +1645,16 @@ mod tests {
         accept_drive_input(&mut checkpoint, &edit.drive_event_id).unwrap();
         assert_eq!(checkpoint.file_observed_frontiers["boox-new"].boox, 1);
 
-        commit_original_registration(&mut checkpoint, &boox_registration).unwrap();
+        let delayed_registration = PreparedOriginalRegistration {
+            drive_event_id: "delayed-registration-for-newer-drive-version".to_owned(),
+            ..boox_registration.clone()
+        };
+        commit_original_registration(&mut checkpoint, &delayed_registration).unwrap();
         assert_eq!(checkpoint.file_observed_frontiers["boox-new"].boox, 1);
+        assert_eq!(
+            checkpoint.accepted_file_content_sha256["boox-new"],
+            sha256_hex(edited_bytes)
+        );
     }
 
     #[test]

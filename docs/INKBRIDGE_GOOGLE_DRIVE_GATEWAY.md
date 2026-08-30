@@ -72,8 +72,9 @@ For every bound file revision it:
 - advances that file's observed frontier and accepted hash only after the
   broker accepts the object; broker rejection clears the pending record without
   advancing either value, so a corrected revision retains the real causal base;
-- defers later versions of a file while one input is pending and retains the
-  Drive page token until the broker outcome is durable;
+- checks for a pending file before duplicate/hash suppression, defers every later
+  version while one input is pending, and retains the Drive page token until the
+  broker outcome is durable—even if the later bytes revert to an older hash;
 - advances the Drive page token only after the complete page is durable.
 
 Duplicate change delivery therefore produces the same event and cannot create
