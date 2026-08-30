@@ -101,13 +101,21 @@ Each file carries private `appProperties` with the broker producer, source
 event, document ID, revision pair, content hash, Cloud Storage generation, and
 delivery ID. A repeated job recognizes the delivery ID and does nothing.
 
-After Drive confirms the create, the gateway records the returned file ID and
-version, binds that file to its document and target device, and marks that exact
-generated revision as processed. This prevents the initial broker output from
-re-entering the broker. A later user edit of the same file has a new Drive
-version and content hash, so it enters the normal inbound path even though
-Drive preserves the private InkBridge properties. An unbound file carrying an
-InkBridge producer property is ignored rather than guessed or registered.
+Before calling `files.create`, the gateway durably reserves the delivery ID and
+queries Drive for that exact private property. Only a confirmed absence permits
+the create. If the process crashes after Drive creates the file but before the
+checkpoint records the returned identity, the retry reconciles and binds the
+existing file rather than creating a visible duplicate. Multiple matches fail
+closed for operator repair.
+
+After Drive confirms or reconciliation recovers the create, the gateway records
+the returned file ID and version, binds that file to its document and target
+device, clears the reservation, and marks that exact generated revision as
+processed. This prevents the initial broker output from re-entering the broker.
+A later user edit of the same file has a new Drive version and content hash, so
+it enters the normal inbound path even though Drive preserves the private
+InkBridge properties. An unbound file carrying an InkBridge producer property
+is ignored rather than guessed or registered.
 
 ## Authentication and access boundary
 

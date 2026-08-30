@@ -1,8 +1,8 @@
 use crate::{
     BrokerDriveOutput, CanonicalFrontier, DeliveredDriveOutput, DeviceArtifactBindingApproval,
-    DeviceArtifactBindingDecision, DriveChange, DriveGatewayCheckpoint, DriveGatewayConfig,
-    DriveInputDecision, DriveOutputDecision, OriginalRegistrationApproval, PendingDriveInput,
-    PreparedDeviceArtifactBinding, PreparedDriveInput, PreparedDriveOutput,
+    DeviceArtifactBindingDecision, DriveChange, DriveFileRevision, DriveGatewayCheckpoint,
+    DriveGatewayConfig, DriveInputDecision, DriveOutputDecision, OriginalRegistrationApproval,
+    PendingDriveInput, PreparedDeviceArtifactBinding, PreparedDriveInput, PreparedDriveOutput,
     PreparedOriginalRegistration, RegistrationDecision, DRIVE_GATEWAY_PRODUCER,
 };
 use inkbridge_broker::{
@@ -706,7 +706,7 @@ pub fn prepare_drive_output(
         ),
         ("inkbridgeDeliveryId".to_owned(), delivery_id.clone()),
     ]);
-    Ok(DriveOutputDecision::Create(PreparedDriveOutput {
+    let prepared = PreparedDriveOutput {
         delivery_id,
         document_id: output.document_id.clone(),
         target: output.target,
@@ -715,7 +715,17 @@ pub fn prepare_drive_output(
         parent_folder_id: config.folder_id(output.target).to_owned(),
         file_name,
         app_properties,
-    }))
+    };
+    if let Some(pending) = checkpoint.pending_drive_outputs.get(&prepared.delivery_id) {
+        if pending != &prepared {
+            return Err(format!(
+                "pending Drive delivery {} has different content",
+                prepared.delivery_id
+            ));
+        }
+        return Ok(DriveOutputDecision::Reconcile(prepared));
+    }
+    Ok(DriveOutputDecision::Reserve(prepared))
 }
 
 fn safe_extension(value: &str) -> Result<&str, String> {
@@ -724,6 +734,91 @@ fn safe_extension(value: &str) -> Result<&str, String> {
         Ok(value)
     } else {
         Err(format!("unsupported Drive output extension {value}"))
+    }
+}
+
+pub fn reserve_drive_output(
+    checkpoint: &mut DriveGatewayCheckpoint,
+    output: &PreparedDriveOutput,
+) -> Result<(), String> {
+    checkpoint.validate()?;
+    if checkpoint
+        .delivered_broker_outputs
+        .contains_key(&output.delivery_id)
+    {
+        return Ok(());
+    }
+    match checkpoint
+        .pending_drive_outputs
+        .entry(output.delivery_id.clone())
+    {
+        Entry::Vacant(entry) => {
+            entry.insert(output.clone());
+        }
+        Entry::Occupied(entry) if entry.get() == output => {}
+        Entry::Occupied(_) => {
+            return Err(format!(
+                "pending Drive delivery {} has different content",
+                output.delivery_id
+            ));
+        }
+    }
+    checkpoint.validate()
+}
+
+pub fn reconcile_drive_output(
+    config: &DriveGatewayConfig,
+    checkpoint: &DriveGatewayCheckpoint,
+    output: &PreparedDriveOutput,
+    matching_files: &[DriveFileRevision],
+) -> Result<DriveOutputDecision, String> {
+    config.validate()?;
+    checkpoint.validate()?;
+    if output.parent_folder_id != config.folder_id(output.target) {
+        return Err(format!(
+            "Drive delivery {} targets an unexpected folder",
+            output.delivery_id
+        ));
+    }
+    let pending = checkpoint
+        .pending_drive_outputs
+        .get(&output.delivery_id)
+        .ok_or_else(|| format!("Drive delivery {} is not reserved", output.delivery_id))?;
+    if pending != output {
+        return Err(format!(
+            "Drive delivery {} does not match its reservation",
+            output.delivery_id
+        ));
+    }
+    match matching_files {
+        [] => Ok(DriveOutputDecision::Create(output.clone())),
+        [file] => {
+            if file.trashed
+                || file.version == 0
+                || !file
+                    .parents
+                    .iter()
+                    .any(|parent| parent == &output.parent_folder_id)
+                || output
+                    .app_properties
+                    .iter()
+                    .any(|(key, value)| file.app_properties.get(key) != Some(value))
+            {
+                return Err(format!(
+                    "existing Drive delivery {} does not match its reserved output",
+                    output.delivery_id
+                ));
+            }
+            Ok(DriveOutputDecision::Existing {
+                output: output.clone(),
+                drive_file_id: file.file_id.clone(),
+                drive_file_version: file.version,
+            })
+        }
+        _ => Err(format!(
+            "Drive delivery {} has multiple matching files; refusing to create or bind another",
+            output.delivery_id
+        )),
     }
 }
 
@@ -752,6 +847,12 @@ pub fn commit_drive_output(
         }
         return Err(format!(
             "Drive delivery {} was already committed to another file revision",
+            output.delivery_id
+        ));
+    }
+    if checkpoint.pending_drive_outputs.get(&output.delivery_id) != Some(output) {
+        return Err(format!(
+            "Drive delivery {} was not durably reserved before create/reconciliation",
             output.delivery_id
         ));
     }
@@ -788,6 +889,7 @@ pub fn commit_drive_output(
     checkpoint
         .delivered_broker_outputs
         .insert(output.delivery_id.clone(), delivered);
+    checkpoint.pending_drive_outputs.remove(&output.delivery_id);
     checkpoint.validate()
 }
 
@@ -843,6 +945,7 @@ mod tests {
                 ),
             ]),
             pending_drive_inputs: BTreeMap::new(),
+            pending_drive_outputs: BTreeMap::new(),
             delivered_broker_outputs: BTreeMap::new(),
         }
     }
@@ -1239,13 +1342,22 @@ mod tests {
             file_extension: "pdf".to_owned(),
         };
         let mut checkpoint = checkpoint();
-        let DriveOutputDecision::Create(plan) =
+        let DriveOutputDecision::Reserve(plan) =
             prepare_drive_output(&config, &checkpoint, &output).unwrap()
         else {
-            panic!("expected create")
+            panic!("expected reservation")
         };
         assert_eq!(plan.parent_folder_id, config.boox_folder_id);
         assert_eq!(plan.app_properties[GENERATED_BY_PROPERTY], BROKER_PRODUCER);
+        reserve_drive_output(&mut checkpoint, &plan).unwrap();
+        assert_eq!(
+            prepare_drive_output(&config, &checkpoint, &output).unwrap(),
+            DriveOutputDecision::Reconcile(plan.clone())
+        );
+        assert_eq!(
+            reconcile_drive_output(&config, &checkpoint, &plan, &[]).unwrap(),
+            DriveOutputDecision::Create(plan.clone())
+        );
         commit_drive_output(&mut checkpoint, &plan, "boox-created-file".to_owned(), 30).unwrap();
         commit_drive_output(&mut checkpoint, &plan, "boox-created-file".to_owned(), 30).unwrap();
         assert!(checkpoint
@@ -1301,6 +1413,85 @@ mod tests {
         assert_eq!(user_edit.document_id, document_id());
         assert_eq!(user_edit.based_on, output.source_revisions);
         assert_eq!(user_edit.source_revision, 21);
+    }
+
+    #[test]
+    fn retry_reconciles_a_drive_create_that_crashed_before_commit() {
+        let config = config();
+        let output = BrokerDriveOutput {
+            gcs_object_path: "BOOX_Folder/doc/reconcile.pdf".to_owned(),
+            gcs_generation: 31,
+            document_id: document_id(),
+            target: DeviceSide::Boox,
+            event_id: "broker-reconcile-event".to_owned(),
+            source_revisions: RevisionPair {
+                boox: 5,
+                supernote: 9,
+            },
+            content_sha256: sha256_hex(b"generated reconciliation view"),
+            file_extension: "pdf".to_owned(),
+        };
+        let mut checkpoint = checkpoint();
+        let DriveOutputDecision::Reserve(plan) =
+            prepare_drive_output(&config, &checkpoint, &output).unwrap()
+        else {
+            panic!("expected reservation")
+        };
+        reserve_drive_output(&mut checkpoint, &plan).unwrap();
+        assert!(matches!(
+            reconcile_drive_output(&config, &checkpoint, &plan, &[]).unwrap(),
+            DriveOutputDecision::Create(_)
+        ));
+
+        // Simulate files.create succeeding and the process crashing before the
+        // returned file identity is committed to the checkpoint.
+        let existing = DriveFileRevision {
+            file_id: "first-created-drive-file".to_owned(),
+            name: plan.file_name.clone(),
+            version: 44,
+            mime_type: "application/pdf".to_owned(),
+            parents: vec![plan.parent_folder_id.clone()],
+            size: 29,
+            trashed: false,
+            app_properties: plan.app_properties.clone(),
+        };
+
+        let DriveOutputDecision::Reconcile(retry_plan) =
+            prepare_drive_output(&config, &checkpoint, &output).unwrap()
+        else {
+            panic!("retry must reconcile before another create")
+        };
+        let DriveOutputDecision::Existing {
+            output: recovered_plan,
+            drive_file_id,
+            drive_file_version,
+        } = reconcile_drive_output(&config, &checkpoint, &retry_plan, &[existing]).unwrap()
+        else {
+            panic!("expected existing Drive delivery")
+        };
+        assert_eq!(drive_file_id, "first-created-drive-file");
+        assert_eq!(drive_file_version, 44);
+        commit_drive_output(
+            &mut checkpoint,
+            &recovered_plan,
+            drive_file_id,
+            drive_file_version,
+        )
+        .unwrap();
+
+        assert!(checkpoint.pending_drive_outputs.is_empty());
+        assert_eq!(
+            prepare_drive_output(&config, &checkpoint, &output).unwrap(),
+            DriveOutputDecision::Duplicate {
+                delivery_id: plan.delivery_id
+            }
+        );
+        assert!(checkpoint
+            .documents
+            .get(&document_id())
+            .unwrap()
+            .boox_file_ids
+            .contains("first-created-drive-file"));
     }
 
     #[test]

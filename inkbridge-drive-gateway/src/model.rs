@@ -110,6 +110,8 @@ pub struct DriveGatewayCheckpoint {
     #[serde(default)]
     pub pending_drive_inputs: BTreeMap<String, PendingDriveInput>,
     #[serde(default)]
+    pub pending_drive_outputs: BTreeMap<String, PreparedDriveOutput>,
+    #[serde(default)]
     pub delivered_broker_outputs: BTreeMap<String, DeliveredDriveOutput>,
 }
 
@@ -160,6 +162,29 @@ impl DriveGatewayCheckpoint {
                         "Drive file {file_id} is bound to more than one document"
                     ));
                 }
+            }
+        }
+        for (delivery_id, pending) in &self.pending_drive_outputs {
+            if delivery_id != &pending.delivery_id {
+                return Err(format!(
+                    "pending Drive output key {delivery_id} does not match {}",
+                    pending.delivery_id
+                ));
+            }
+            if self.delivered_broker_outputs.contains_key(delivery_id) {
+                return Err(format!(
+                    "Drive output {delivery_id} is both pending and delivered"
+                ));
+            }
+            if !self.documents.contains_key(&pending.document_id)
+                || pending.parent_folder_id.trim().is_empty()
+                || pending.file_name.trim().is_empty()
+                || pending.content_sha256.len() != 64
+                || pending.app_properties.get("inkbridgeDeliveryId") != Some(delivery_id)
+            {
+                return Err(format!(
+                    "pending Drive output {delivery_id} is structurally invalid"
+                ));
             }
         }
         for (delivery_id, delivery) in &self.delivered_broker_outputs {
@@ -399,7 +424,8 @@ pub struct BrokerDriveOutput {
     pub file_extension: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparedDriveOutput {
     pub delivery_id: String,
     pub document_id: String,
@@ -425,6 +451,15 @@ pub struct DeliveredDriveOutput {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriveOutputDecision {
-    Duplicate { delivery_id: String },
+    Duplicate {
+        delivery_id: String,
+    },
+    Reserve(PreparedDriveOutput),
+    Reconcile(PreparedDriveOutput),
     Create(PreparedDriveOutput),
+    Existing {
+        output: PreparedDriveOutput,
+        drive_file_id: String,
+        drive_file_version: u64,
+    },
 }

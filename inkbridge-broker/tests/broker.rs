@@ -1807,6 +1807,34 @@ fn delayed_older_same_side_edit_is_preserved_as_conflict() {
 }
 
 #[test]
+fn stale_based_event_cannot_jump_over_unreserved_source_revisions() {
+    let mut harness = Harness::new();
+    let future = write_boox_view(
+        &harness.original,
+        [stroke("unbounded-future-revision", 0.65, 0.7)],
+    )
+    .unwrap();
+    let event = harness.event(
+        "unbounded-future-revision",
+        DeviceSide::Boox,
+        9,
+        RevisionPair::default(),
+        future,
+    );
+
+    let error = harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .expect_err("unreserved future revision must fail closed");
+    assert!(matches!(
+        error,
+        BrokerError::InvalidEvent(message)
+            if message.contains("preserved predecessor conflict")
+    ));
+    assert!(harness.state().conflicts.is_empty());
+}
+
+#[test]
 fn conflict_preserves_the_immutable_accepted_device_revision() {
     let mut harness = Harness::new();
     let initial = harness.event(
@@ -3839,7 +3867,7 @@ fn page_scoped_supernote_conflicts_must_resolve_in_source_order() {
 }
 
 #[test]
-fn delayed_supernote_predecessor_must_arrive_before_newer_conflict_resolves() {
+fn delayed_supernote_successor_retries_after_predecessor_arrives() {
     let mut harness = Harness::with_original(original_pdf_with_pages(2));
     let base = stroke_on_page("sn-delayed-base", 0, 0.2, 0.3);
     let initial = harness.event(
@@ -3868,34 +3896,11 @@ fn delayed_supernote_predecessor_must_arrive_before_newer_conflict_resolves() {
     assert!(matches!(
         harness
             .broker
-            .process(&mut harness.storage, &revision_three)
-            .unwrap(),
-        ProcessOutcome::Conflict { .. }
-    ));
-
-    let analysis = harness
-        .broker
-        .inspect_conflict(
-            &harness.storage,
-            &harness.document_id,
-            "sn-delayed-revision-3",
-        )
-        .unwrap();
-    let request = resolution_request(
-        &harness,
-        &analysis,
-        "resolve-sn-delayed-revision-3-too-early",
-        ConflictResolutionStrategy::MergePreservingCurrent,
-    );
-    let state_before = harness.state();
-    assert!(matches!(
-        harness
-            .broker
-            .resolve_conflict(&mut harness.storage, &request),
+            .process(&mut harness.storage, &revision_three),
         Err(BrokerError::InvalidEvent(message))
-            if message.contains("immediate predecessor revision 2")
+            if message.contains("preserved predecessor conflict")
     ));
-    assert_eq!(harness.state(), state_before);
+    assert!(harness.state().conflicts.is_empty());
 
     let middle = stroke_on_page("sn-delayed-revision-2-stroke", 0, 0.5, 0.55);
     let revision_two = harness.event(
@@ -3916,24 +3921,13 @@ fn delayed_supernote_predecessor_must_arrive_before_newer_conflict_resolves() {
         ProcessOutcome::Applied { .. }
     ));
 
-    let analysis = harness
-        .broker
-        .inspect_conflict(
-            &harness.storage,
-            &harness.document_id,
-            "sn-delayed-revision-3",
-        )
-        .unwrap();
-    let request = resolution_request(
-        &harness,
-        &analysis,
-        "resolve-sn-delayed-revision-3",
-        ConflictResolutionStrategy::MergePreservingCurrent,
-    );
-    harness
-        .broker
-        .resolve_conflict(&mut harness.storage, &request)
-        .unwrap();
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &revision_three)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
 
     let state = harness.state();
     assert_eq!(state.supernote.revision, 3);
@@ -3948,7 +3942,7 @@ fn delayed_supernote_predecessor_must_arrive_before_newer_conflict_resolves() {
 }
 
 #[test]
-fn delayed_compact_boox_predecessor_must_arrive_before_newer_conflict_resolves() {
+fn delayed_compact_boox_successor_retries_after_predecessor_arrives() {
     let mut harness = Harness::new();
     let supernote_base = stroke("sn-before-delayed-compact", 0.2, 0.3);
     let initial = harness.event(
@@ -3986,34 +3980,11 @@ fn delayed_compact_boox_predecessor_must_arrive_before_newer_conflict_resolves()
     assert!(matches!(
         harness
             .broker
-            .process(&mut harness.storage, &revision_two)
-            .unwrap(),
-        ProcessOutcome::Conflict { .. }
-    ));
-
-    let analysis = harness
-        .broker
-        .inspect_conflict(
-            &harness.storage,
-            &harness.document_id,
-            "boox-delayed-compact-2",
-        )
-        .unwrap();
-    let request = resolution_request(
-        &harness,
-        &analysis,
-        "resolve-boox-delayed-compact-2-too-early",
-        ConflictResolutionStrategy::MergePreservingCurrent,
-    );
-    let state_before = harness.state();
-    assert!(matches!(
-        harness
-            .broker
-            .resolve_conflict(&mut harness.storage, &request),
+            .process(&mut harness.storage, &revision_two),
         Err(BrokerError::InvalidEvent(message))
-            if message.contains("immediate predecessor revision 1")
+            if message.contains("preserved predecessor conflict")
     ));
-    assert_eq!(harness.state(), state_before);
+    assert!(harness.state().conflicts.is_empty());
 
     let middle = stroke("boox-delayed-compact-1-stroke", 0.5, 0.55);
     let mut revision_one = harness.event(
@@ -4043,24 +4014,13 @@ fn delayed_compact_boox_predecessor_must_arrive_before_newer_conflict_resolves()
         ProcessOutcome::Applied { .. }
     ));
 
-    let analysis = harness
-        .broker
-        .inspect_conflict(
-            &harness.storage,
-            &harness.document_id,
-            "boox-delayed-compact-2",
-        )
-        .unwrap();
-    let request = resolution_request(
-        &harness,
-        &analysis,
-        "resolve-boox-delayed-compact-2",
-        ConflictResolutionStrategy::MergePreservingCurrent,
-    );
-    harness
-        .broker
-        .resolve_conflict(&mut harness.storage, &request)
-        .unwrap();
+    assert!(matches!(
+        harness
+            .broker
+            .process(&mut harness.storage, &revision_two)
+            .unwrap(),
+        ProcessOutcome::Applied { .. }
+    ));
 
     let state = harness.state();
     assert_eq!(state.boox.revision, 2);

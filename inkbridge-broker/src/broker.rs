@@ -272,14 +272,24 @@ impl Broker {
                 event_id: event.event_id.clone(),
             });
         }
-        if event.based_on == current
-            && event.source_revision
-                != current.get(event.source).checked_add(1).ok_or_else(|| {
-                    BrokerError::InvalidEvent("source revision overflow".to_owned())
-                })?
-        {
+        let expected_next = current
+            .get(event.source)
+            .checked_add(1)
+            .ok_or_else(|| BrokerError::InvalidEvent("source revision overflow".to_owned()))?;
+        let follows_preserved_predecessor = event.source_revision > expected_next
+            && event
+                .source_revision
+                .checked_sub(1)
+                .is_some_and(|predecessor_revision| {
+                    event.based_on.get(event.source) == predecessor_revision
+                        && state.conflicts.iter().any(|conflict| {
+                            conflict.source == event.source
+                                && conflict.source_revision == predecessor_revision
+                        })
+                });
+        if event.source_revision != expected_next && !follows_preserved_predecessor {
             return Err(BrokerError::InvalidEvent(format!(
-                "source revision {} must immediately follow current revision {}",
+                "source revision {} must immediately follow current revision {} or a preserved predecessor conflict",
                 event.source_revision,
                 current.get(event.source)
             )));
