@@ -1,0 +1,57 @@
+name: InkBridge Drive runtime
+
+on:
+  push:
+    branches: [master, "agent/google-drive-runtime", "feat/**"]
+    paths:
+      - "inkbridge-drive-runtime/**"
+      - "inkbridge-drive-gateway/**"
+      - "inkbridge-cloud-runtime/**"
+      - "inkbridge-broker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.drive-runtime"
+      - "cloudbuild.drive-runtime.yaml"
+      - "docs/INKBRIDGE_GOOGLE_DRIVE_GATEWAY.md"
+      - "docs/INKBRIDGE_DRIVE_RUNTIME_ROLLOUT.md"
+      - ".github/workflows/inkbridge-drive-runtime.yml"
+  pull_request:
+    paths:
+      - "inkbridge-drive-runtime/**"
+      - "inkbridge-drive-gateway/**"
+      - "inkbridge-cloud-runtime/**"
+      - "inkbridge-broker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.drive-runtime"
+      - "cloudbuild.drive-runtime.yaml"
+      - "docs/INKBRIDGE_GOOGLE_DRIVE_GATEWAY.md"
+      - "docs/INKBRIDGE_DRIVE_RUNTIME_ROLLOUT.md"
+      - ".github/workflows/inkbridge-drive-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint gateway and runtime
+        run: cargo clippy -p inkbridge-drive-gateway -p inkbridge-drive-runtime --all-targets -- -D warnings
+      - name: Test gateway and runtime
+        run: cargo test -p inkbridge-drive-gateway -p inkbridge-drive-runtime
+      - name: Build release job
+        run: cargo build --locked --release -p inkbridge-drive-runtime -p inkbridge-convert
+      - name: Verify safe default and converter dependency
+        run: |
+          test -x target/release/inkbridge-drive-runtime
+          test -x target/release/inkbridge-convert
+          grep -F 'ENTRYPOINT ["/usr/local/bin/inkbridge-drive-runtime"]' Dockerfile.drive-runtime
+          grep -F 'qpdf' Dockerfile.drive-runtime

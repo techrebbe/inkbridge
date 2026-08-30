@@ -1,0 +1,21 @@
+[package]
+name = "inkbridge-drive-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Cloud Run Job adapters and orchestration for the InkBridge Google Drive gateway"
+
+[dependencies]
+base64 = "0.22"
+inkbridge-broker.workspace = true
+inkbridge-cloud-runtime.workspace = true
+inkbridge-drive-gateway.workspace = true
+percent-encoding = "2"
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true

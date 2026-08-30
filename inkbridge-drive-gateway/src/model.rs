@@ -165,6 +165,10 @@ impl DriveGatewayCheckpoint {
             }
         }
         for (delivery_id, pending) in &self.pending_drive_outputs {
+            let expected_prefix = match pending.target {
+                DeviceSide::Boox => "BOOX_Folder/",
+                DeviceSide::Supernote => "Supernote_Folder/",
+            };
             if delivery_id != &pending.delivery_id {
                 return Err(format!(
                     "pending Drive output key {delivery_id} does not match {}",
@@ -177,10 +181,21 @@ impl DriveGatewayCheckpoint {
                 ));
             }
             if !self.documents.contains_key(&pending.document_id)
+                || pending.gcs_object_path.trim().is_empty()
+                || pending.gcs_generation == 0
                 || pending.parent_folder_id.trim().is_empty()
                 || pending.file_name.trim().is_empty()
                 || pending.content_sha256.len() != 64
                 || pending.app_properties.get("inkbridgeDeliveryId") != Some(delivery_id)
+                || pending.app_properties.get("inkbridgeDocumentId") != Some(&pending.document_id)
+                || pending.app_properties.get("inkbridgeContentSha256")
+                    != Some(&pending.content_sha256)
+                || pending.app_properties.get("inkbridgeGcsGeneration")
+                    != Some(&pending.gcs_generation.to_string())
+                || !pending.gcs_object_path.starts_with(expected_prefix)
+                || !pending
+                    .gcs_object_path
+                    .contains(&format!("/{}/", pending.document_id))
             {
                 return Err(format!(
                     "pending Drive output {delivery_id} is structurally invalid"
@@ -241,6 +256,10 @@ impl DriveGatewayCheckpoint {
         }
         let mut pending_file_ids = BTreeSet::new();
         for (event_id, pending) in &self.pending_drive_inputs {
+            let expected_prefix = match pending.source {
+                DeviceSide::Boox => "BOOX_Folder/",
+                DeviceSide::Supernote => "Supernote_Folder/",
+            };
             if event_id != &pending.drive_event_id {
                 return Err(format!(
                     "pending Drive input key {event_id} does not match {}",
@@ -299,6 +318,17 @@ impl DriveGatewayCheckpoint {
                     "pending Drive input {event_id} has an invalid content hash"
                 ));
             }
+            if pending.gcs_object_path.trim().is_empty()
+                || pending.gcs_generation == 0
+                || !pending.gcs_object_path.starts_with(expected_prefix)
+                || !pending
+                    .gcs_object_path
+                    .contains(&format!("/{}/", pending.document_id))
+            {
+                return Err(format!(
+                    "pending Drive input {event_id} has no immutable Cloud Storage evidence"
+                ));
+            }
         }
         Ok(())
     }
@@ -353,6 +383,8 @@ pub enum DriveInputDecision {
 pub struct PendingDriveInput {
     pub drive_event_id: String,
     pub drive_file_id: String,
+    pub gcs_object_path: String,
+    pub gcs_generation: u64,
     pub document_id: String,
     pub source: DeviceSide,
     pub content_sha256: String,
@@ -429,6 +461,8 @@ pub struct BrokerDriveOutput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparedDriveOutput {
     pub delivery_id: String,
+    pub gcs_object_path: String,
+    pub gcs_generation: u64,
     pub document_id: String,
     pub target: DeviceSide,
     pub content_sha256: String,

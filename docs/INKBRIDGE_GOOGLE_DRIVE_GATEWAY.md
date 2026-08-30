@@ -141,13 +141,17 @@ screen.
 
 ## Deployment sequence
 
-The present crate is storage-independent planning logic. The reviewed rollout
-is intentionally split:
+The storage-independent planning crate is now wrapped by the separately
+packaged `inkbridge-drive-runtime` Cloud Run Job. The job remains undeployed and
+defaults to dry-run. See `INKBRIDGE_DRIVE_RUNTIME_ROLLOUT.md` for the exact
+durability sequence, configuration, and later approval gates. The reviewed
+rollout remains intentionally split:
 
 1. merge deterministic registration, inbound, outbound, idempotency, and loop
    prevention rules;
-2. add Drive/Cloud Storage/Firestore/Secret Manager adapters and a Cloud Run
-   Job that scales to zero between polls;
+2. add Drive/Cloud Storage/Firestore/Secret Manager adapters and a default-safe
+   Cloud Run Job package that scales to zero between polls (implemented, not
+   deployed);
 3. add Scheduler with a conservative interval and a lease so only one poller
    owns a checkpoint;
 4. authorize the owner account once, store the refresh token in Secret Manager,
