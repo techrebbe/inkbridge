@@ -1,7 +1,8 @@
 use crate::{
-    BrokerDriveOutput, CanonicalFrontier, DeliveredDriveOutput, DriveChange,
-    DriveGatewayCheckpoint, DriveGatewayConfig, DriveInputDecision, DriveOutputDecision,
-    OriginalRegistrationApproval, PreparedDriveInput, PreparedDriveOutput,
+    BrokerDriveOutput, CanonicalFrontier, DeliveredDriveOutput, DeviceArtifactBindingApproval,
+    DeviceArtifactBindingDecision, DriveChange, DriveGatewayCheckpoint, DriveGatewayConfig,
+    DriveInputDecision, DriveOutputDecision, OriginalRegistrationApproval,
+    PreparedDeviceArtifactBinding, PreparedDriveInput, PreparedDriveOutput,
     PreparedOriginalRegistration, RegistrationDecision, DRIVE_GATEWAY_PRODUCER,
 };
 use inkbridge_broker::{
@@ -65,7 +66,18 @@ pub fn prepare_drive_input(
             change.file.size
         ));
     }
-    let event_id = drive_event_id(change, bytes);
+    let content_sha256 = sha256_hex(bytes);
+    let event_id =
+        drive_event_id_from_parts(&change.file.file_id, change.file.version, &content_sha256);
+    if checkpoint
+        .accepted_file_content_sha256
+        .get(&change.file.file_id)
+        == Some(&content_sha256)
+    {
+        return Ok(DriveInputDecision::Duplicate {
+            drive_event_id: event_id,
+        });
+    }
     if checkpoint.processed_drive_events.contains(&event_id) {
         return Ok(DriveInputDecision::Duplicate {
             drive_event_id: event_id,
@@ -84,31 +96,19 @@ pub fn prepare_drive_input(
             reason: "bound Drive file is outside its configured device folder".to_owned(),
         });
     }
-    let payload_kind = match source {
-        DeviceSide::Boox if change.file.mime_type == "application/pdf" => {
-            DevicePayloadKind::DeviceView
-        }
-        DeviceSide::Boox if change.file.mime_type == "application/json" => {
-            DevicePayloadKind::BooxOperationManifest
-        }
-        DeviceSide::Supernote if change.file.mime_type == "application/json" => {
-            DevicePayloadKind::DeviceView
-        }
-        _ => {
-            return Ok(DriveInputDecision::Ignore {
-                reason: format!(
-                    "unsupported {:?} Drive MIME type {}",
-                    source, change.file.mime_type
-                ),
-            });
-        }
+    let Some(payload_kind) = supported_payload_kind(source, &change.file.mime_type) else {
+        return Ok(DriveInputDecision::Ignore {
+            reason: format!(
+                "unsupported {:?} Drive MIME type {}",
+                source, change.file.mime_type
+            ),
+        });
     };
     let source_revision = frontier
         .revisions
         .get(source)
         .checked_add(1)
         .ok_or_else(|| "source revision overflow".to_owned())?;
-    let content_sha256 = sha256_hex(bytes);
     let side_folder = match source {
         DeviceSide::Boox => "BOOX_Folder",
         DeviceSide::Supernote => "Supernote_Folder",
@@ -164,6 +164,7 @@ pub fn prepare_drive_input(
     ]);
     Ok(DriveInputDecision::Upload(PreparedDriveInput {
         drive_event_id: event_id,
+        drive_file_id: change.file.file_id.clone(),
         gcs_object_path,
         content_sha256,
         metadata,
@@ -175,10 +176,41 @@ pub fn prepare_drive_input(
     }))
 }
 
-pub fn commit_drive_input(checkpoint: &mut DriveGatewayCheckpoint, input: &PreparedDriveInput) {
+fn supported_payload_kind(source: DeviceSide, mime_type: &str) -> Option<DevicePayloadKind> {
+    match source {
+        DeviceSide::Boox if mime_type == "application/pdf" => Some(DevicePayloadKind::DeviceView),
+        DeviceSide::Boox if mime_type == "application/json" => {
+            Some(DevicePayloadKind::BooxOperationManifest)
+        }
+        DeviceSide::Supernote if mime_type == "application/json" => {
+            Some(DevicePayloadKind::DeviceView)
+        }
+        _ => None,
+    }
+}
+
+pub fn commit_drive_input(
+    checkpoint: &mut DriveGatewayCheckpoint,
+    input: &PreparedDriveInput,
+) -> Result<(), String> {
+    let binding = checkpoint
+        .binding_for_file(&input.drive_file_id)
+        .ok_or_else(|| format!("unbound Drive input file {}", input.drive_file_id))?;
+    if binding.document_id != input.document_id
+        || binding.side_for_file(&input.drive_file_id) != Some(input.source)
+    {
+        return Err(format!(
+            "Drive input file {} no longer matches its prepared binding",
+            input.drive_file_id
+        ));
+    }
     checkpoint
         .processed_drive_events
         .insert(input.drive_event_id.clone());
+    checkpoint
+        .accepted_file_content_sha256
+        .insert(input.drive_file_id.clone(), input.content_sha256.clone());
+    checkpoint.validate()
 }
 
 pub fn prepare_original_registration(
@@ -306,6 +338,10 @@ pub fn commit_original_registration(
     checkpoint
         .processed_drive_events
         .insert(registration.drive_event_id.clone());
+    checkpoint.accepted_file_content_sha256.insert(
+        registration.drive_file_id.clone(),
+        registration.original_pdf_sha256.clone(),
+    );
     match checkpoint.documents.entry(registration.document_id.clone()) {
         Entry::Vacant(entry) => {
             let mut boox_file_ids = BTreeSet::new();
@@ -335,6 +371,131 @@ pub fn commit_original_registration(
             };
         }
     }
+    checkpoint.validate()
+}
+
+pub fn prepare_device_artifact_binding(
+    config: &DriveGatewayConfig,
+    checkpoint: &DriveGatewayCheckpoint,
+    change: &DriveChange,
+    bytes: &[u8],
+    approval: &DeviceArtifactBindingApproval,
+) -> Result<DeviceArtifactBindingDecision, String> {
+    config.validate()?;
+    checkpoint.validate()?;
+    if change.file.trashed {
+        return Ok(DeviceArtifactBindingDecision::Ignore {
+            reason: "trashed Drive artifact cannot be bound".to_owned(),
+        });
+    }
+    if let Some(existing) = checkpoint.binding_for_file(&change.file.file_id) {
+        if existing.document_id == approval.document_id
+            && existing.side_for_file(&change.file.file_id) == Some(approval.source)
+        {
+            return Ok(DeviceArtifactBindingDecision::AlreadyBound {
+                file_id: change.file.file_id.clone(),
+            });
+        }
+        return Err(format!(
+            "Drive file {} is already bound elsewhere",
+            change.file.file_id
+        ));
+    }
+    if !checkpoint.documents.contains_key(&approval.document_id) {
+        return Ok(DeviceArtifactBindingDecision::Ignore {
+            reason: format!("unknown InkBridge document {}", approval.document_id),
+        });
+    }
+    if change
+        .file
+        .app_properties
+        .get(GENERATED_BY_PROPERTY)
+        .is_some_and(|producer| producer == BROKER_PRODUCER || producer == DRIVE_GATEWAY_PRODUCER)
+    {
+        return Ok(DeviceArtifactBindingDecision::Ignore {
+            reason:
+                "uncommitted InkBridge-generated file cannot be registered as a device artifact"
+                    .to_owned(),
+        });
+    }
+    if !change
+        .file
+        .parents
+        .iter()
+        .any(|parent| parent == config.folder_id(approval.source))
+        || change
+            .file
+            .parents
+            .iter()
+            .any(|parent| parent == config.folder_id(approval.source.other()))
+    {
+        return Ok(DeviceArtifactBindingDecision::Ignore {
+            reason: "device artifact is not directly inside only its approved device folder"
+                .to_owned(),
+        });
+    }
+    if supported_payload_kind(approval.source, &change.file.mime_type).is_none() {
+        return Ok(DeviceArtifactBindingDecision::Ignore {
+            reason: format!(
+                "unsupported {:?} Drive MIME type {}",
+                approval.source, change.file.mime_type
+            ),
+        });
+    }
+    if change.file.size != bytes.len() as u64 {
+        return Err(format!(
+            "Drive download length {} does not match declared size {}",
+            bytes.len(),
+            change.file.size
+        ));
+    }
+    let content_sha256 = sha256_hex(bytes);
+    if change.file.version == 0
+        || approval.drive_file_id != change.file.file_id
+        || approval.drive_file_version != change.file.version
+        || approval.content_sha256 != content_sha256
+    {
+        return Ok(DeviceArtifactBindingDecision::Ignore {
+            reason: "device artifact lacks approval for this exact Drive revision".to_owned(),
+        });
+    }
+    Ok(DeviceArtifactBindingDecision::Bind(
+        PreparedDeviceArtifactBinding {
+            drive_file_id: change.file.file_id.clone(),
+            drive_file_version: change.file.version,
+            content_sha256,
+            document_id: approval.document_id.clone(),
+            source: approval.source,
+        },
+    ))
+}
+
+pub fn commit_device_artifact_binding(
+    checkpoint: &mut DriveGatewayCheckpoint,
+    artifact: &PreparedDeviceArtifactBinding,
+) -> Result<(), String> {
+    checkpoint.validate()?;
+    if let Some(existing) = checkpoint.binding_for_file(&artifact.drive_file_id) {
+        if existing.document_id == artifact.document_id
+            && existing.side_for_file(&artifact.drive_file_id) == Some(artifact.source)
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "Drive file {} is already bound elsewhere",
+            artifact.drive_file_id
+        ));
+    }
+    let binding = checkpoint
+        .documents
+        .get_mut(&artifact.document_id)
+        .ok_or_else(|| format!("unknown InkBridge document {}", artifact.document_id))?;
+    match artifact.source {
+        DeviceSide::Boox => binding.boox_file_ids.insert(artifact.drive_file_id.clone()),
+        DeviceSide::Supernote => binding
+            .supernote_file_ids
+            .insert(artifact.drive_file_id.clone()),
+    };
     checkpoint.validate()
 }
 
@@ -478,6 +639,9 @@ pub fn commit_drive_output(
             &output.content_sha256,
         ));
     checkpoint
+        .accepted_file_content_sha256
+        .insert(drive_file_id.clone(), output.content_sha256.clone());
+    checkpoint
         .delivered_broker_outputs
         .insert(output.delivery_id.clone(), delivered);
     checkpoint.validate()
@@ -517,6 +681,7 @@ mod tests {
                 },
             )]),
             processed_drive_events: BTreeSet::new(),
+            accepted_file_content_sha256: BTreeMap::new(),
             delivered_broker_outputs: BTreeMap::new(),
         }
     }
@@ -603,7 +768,7 @@ mod tests {
         else {
             panic!("expected upload")
         };
-        commit_drive_input(&mut checkpoint, &input);
+        commit_drive_input(&mut checkpoint, &input).unwrap();
         assert_eq!(
             prepare_drive_input(&config(), &checkpoint, &change, bytes, frontier).unwrap(),
             DriveInputDecision::Duplicate {
@@ -651,6 +816,93 @@ mod tests {
                 file_id: "different-file".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn approved_device_artifact_can_bind_and_enter_the_broker() {
+        let config = config();
+        let bytes = b"native page export";
+        let mut checkpoint = checkpoint();
+        let artifact_change = change("supernote-native-export", "application/json");
+        assert!(matches!(
+            prepare_drive_input(
+                &config,
+                &checkpoint,
+                &artifact_change,
+                bytes,
+                CanonicalFrontier {
+                    revisions: RevisionPair::default()
+                }
+            )
+            .unwrap(),
+            DriveInputDecision::Unbound { .. }
+        ));
+        let approval = DeviceArtifactBindingApproval {
+            drive_file_id: artifact_change.file.file_id.clone(),
+            drive_file_version: artifact_change.file.version,
+            content_sha256: sha256_hex(bytes),
+            document_id: document_id(),
+            source: DeviceSide::Supernote,
+        };
+        let DeviceArtifactBindingDecision::Bind(prepared) = prepare_device_artifact_binding(
+            &config,
+            &checkpoint,
+            &artifact_change,
+            bytes,
+            &approval,
+        )
+        .unwrap() else {
+            panic!("expected explicit device artifact binding")
+        };
+        commit_device_artifact_binding(&mut checkpoint, &prepared).unwrap();
+        let DriveInputDecision::Upload(input) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &artifact_change,
+            bytes,
+            CanonicalFrontier {
+                revisions: RevisionPair::default(),
+            },
+        )
+        .unwrap() else {
+            panic!("expected newly bound artifact to enter the broker")
+        };
+        assert_eq!(input.document_id, document_id());
+        assert_eq!(input.source, DeviceSide::Supernote);
+        assert_eq!(input.drive_file_id, "supernote-native-export");
+    }
+
+    #[test]
+    fn metadata_only_drive_version_does_not_create_a_source_revision() {
+        let config = config();
+        let bytes = b"pdf ink";
+        let mut checkpoint = checkpoint();
+        let original_change = change("boox-file", "application/pdf");
+        let frontier = CanonicalFrontier {
+            revisions: RevisionPair {
+                boox: 4,
+                supernote: 2,
+            },
+        };
+        let DriveInputDecision::Upload(input) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &original_change,
+            bytes,
+            frontier.clone(),
+        )
+        .unwrap() else {
+            panic!("expected initial content revision")
+        };
+        commit_drive_input(&mut checkpoint, &input).unwrap();
+
+        let mut renamed = original_change;
+        renamed.file.name = "metadata-only-rename.pdf".to_owned();
+        renamed.file.version += 1;
+        assert!(matches!(
+            prepare_drive_input(&config, &checkpoint, &renamed, bytes, frontier).unwrap(),
+            DriveInputDecision::Duplicate { .. }
+        ));
     }
 
     #[test]

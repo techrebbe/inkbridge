@@ -42,12 +42,22 @@ manual binding.
 ## Drive to broker
 
 The scheduled gateway reads the Drive change feed from its durable page token.
+The first companion-created BOOX manifest or Supernote native export has a new
+Drive file ID, so it uses an authenticated association action that names the
+existing document and device side and approves the exact file ID, Drive
+version, and SHA-256. The gateway checks the expected folder and payload type,
+persists that binding, and then processes the same revision normally. It never
+associates a device artifact by filename.
+
 For every bound file revision it:
 
 - rejects incomplete downloads by comparing received bytes with Drive's size;
 - requires a bound file to remain directly in the configured folder for its
   device side;
-- derives a content-stable event ID from file ID, Drive version, and SHA-256;
+- suppresses metadata-only Drive versions when that file's downloaded SHA-256
+  matches its last accepted content;
+- derives an event ID from file ID, Drive version, and SHA-256 for real content
+  revisions;
 - reads the broker's current revision frontier;
 - creates an immutable object under `BOOX_Folder/` or `Supernote_Folder/` with
   the same metadata contract used by Eventarc;
@@ -55,7 +65,9 @@ For every bound file revision it:
 - advances the Drive page token only after the complete page is durable.
 
 Duplicate change delivery therefore produces the same event and cannot create
-duplicate annotations. Rename is harmless because file ID, original bytes, and
+duplicate annotations. A rename or other metadata-only update is harmless even
+though Drive increments its version: the per-file accepted content hash keeps
+it from consuming a canonical source revision. File ID, original bytes, and
 canonical document ID—not path or modification time—carry identity.
 
 BOOX supplies either a NeoReader PDF revision or, for normal large-document
@@ -132,8 +144,10 @@ cargo test -p inkbridge-drive-gateway
 ```
 
 Tests cover stable identity across rename, matching clean originals from both
-folders, duplicate Drive events, generated-output loop suppression, refusal to
-guess an unbound file from its name, create-only broker delivery, and explicit
-page-token commit. The outbound lifecycle test also proves that the exact
-created revision is suppressed while a subsequent device edit of the same
-Drive file is accepted under the original stable document identity.
+folders, duplicate Drive events, metadata-only version suppression,
+authenticated first-device-artifact association, generated-output loop
+suppression, refusal to guess an unbound file from its name, create-only broker
+delivery, and explicit page-token commit. The outbound lifecycle test also
+proves that the exact created revision is suppressed while a subsequent device
+edit of the same Drive file is accepted under the original stable document
+identity.

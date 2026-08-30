@@ -104,6 +104,8 @@ pub struct DriveGatewayCheckpoint {
     #[serde(default)]
     pub processed_drive_events: BTreeSet<String>,
     #[serde(default)]
+    pub accepted_file_content_sha256: BTreeMap<String, String>,
+    #[serde(default)]
     pub delivered_broker_outputs: BTreeMap<String, DeliveredDriveOutput>,
 }
 
@@ -178,6 +180,22 @@ impl DriveGatewayCheckpoint {
                 ));
             }
         }
+        for (file_id, content_sha256) in &self.accepted_file_content_sha256 {
+            if !all_file_ids.contains(file_id) {
+                return Err(format!(
+                    "accepted content hash references unbound Drive file {file_id}"
+                ));
+            }
+            if content_sha256.len() != 64
+                || !content_sha256
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "accepted content hash for Drive file {file_id} is invalid"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -196,6 +214,7 @@ pub struct CanonicalFrontier {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedDriveInput {
     pub drive_event_id: String,
+    pub drive_file_id: String,
     pub gcs_object_path: String,
     pub content_sha256: String,
     pub metadata: BTreeMap<String, String>,
@@ -230,6 +249,31 @@ pub struct PreparedOriginalRegistration {
     pub original_pdf_sha256: String,
     pub gcs_object_path: String,
     pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceArtifactBindingApproval {
+    pub drive_file_id: String,
+    pub drive_file_version: u64,
+    pub content_sha256: String,
+    pub document_id: String,
+    pub source: DeviceSide,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedDeviceArtifactBinding {
+    pub drive_file_id: String,
+    pub drive_file_version: u64,
+    pub content_sha256: String,
+    pub document_id: String,
+    pub source: DeviceSide,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceArtifactBindingDecision {
+    Ignore { reason: String },
+    AlreadyBound { file_id: String },
+    Bind(PreparedDeviceArtifactBinding),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
