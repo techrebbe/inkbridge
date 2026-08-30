@@ -1184,12 +1184,14 @@ mod tests {
         checkpoint
             .file_observed_frontiers
             .insert("boox-file".to_owned(), base);
-        let first_change = change("boox-file", "application/pdf");
+        let first_bytes = b"malformed pdf ink";
+        let mut first_change = change("boox-file", "application/pdf");
+        first_change.file.size = first_bytes.len() as u64;
         let DriveInputDecision::Upload(first) = prepare_drive_input(
             &config,
             &checkpoint,
             &first_change,
-            b"malformed pdf ink",
+            first_bytes,
             CanonicalFrontier { revisions: base },
         )
         .unwrap() else {
