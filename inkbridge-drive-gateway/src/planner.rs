@@ -37,7 +37,7 @@ pub fn prepare_drive_input(
         return Ok(DriveInputDecision::Ignore {
             reason:
                 "Drive file is trashed; annotation deletion must arrive as a tombstone manifest"
-            .to_owned(),
+                    .to_owned(),
         });
     }
     let Some(binding) = checkpoint.binding_for_file(&change.file.file_id) else {
