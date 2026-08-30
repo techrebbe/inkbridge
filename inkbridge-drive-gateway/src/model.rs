@@ -153,7 +153,7 @@ impl DriveGatewayCheckpoint {
                 .iter()
                 .chain(&binding.supernote_file_ids)
             {
-                if !all_file_ids.insert(file_id) {
+                if !all_file_ids.insert(file_id.clone()) {
                     return Err(format!(
                         "Drive file {file_id} is bound to more than one document"
                     ));

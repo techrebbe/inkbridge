@@ -6,7 +6,7 @@ use crate::{
     PreparedOriginalRegistration, RegistrationDecision, DRIVE_GATEWAY_PRODUCER,
 };
 use inkbridge_broker::{
-    sha256_hex, stable_document_id, DevicePayloadKind, DeviceSide, BROKER_PRODUCER,
+    sha256_hex, stable_document_id, DevicePayloadKind, DeviceSide, RevisionPair, BROKER_PRODUCER,
 };
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 
