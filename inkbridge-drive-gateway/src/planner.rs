@@ -37,20 +37,7 @@ pub fn prepare_drive_input(
         return Ok(DriveInputDecision::Ignore {
             reason:
                 "Drive file is trashed; annotation deletion must arrive as a tombstone manifest"
-                    .to_owned(),
-        });
-    }
-    if change.file.size != bytes.len() as u64 {
-        return Err(format!(
-            "Drive download length {} does not match declared size {}",
-            bytes.len(),
-            change.file.size
-        ));
-    }
-    let event_id = drive_event_id(change, bytes);
-    if checkpoint.processed_drive_events.contains(&event_id) {
-        return Ok(DriveInputDecision::Duplicate {
-            drive_event_id: event_id,
+            .to_owned(),
         });
     }
     let Some(binding) = checkpoint.binding_for_file(&change.file.file_id) else {
@@ -71,6 +58,19 @@ pub fn prepare_drive_input(
             file_id: change.file.file_id.clone(),
         });
     };
+    if change.file.size != bytes.len() as u64 {
+        return Err(format!(
+            "Drive download length {} does not match declared size {}",
+            bytes.len(),
+            change.file.size
+        ));
+    }
+    let event_id = drive_event_id(change, bytes);
+    if checkpoint.processed_drive_events.contains(&event_id) {
+        return Ok(DriveInputDecision::Duplicate {
+            drive_event_id: event_id,
+        });
+    }
     let source = binding
         .side_for_file(&change.file.file_id)
         .ok_or_else(|| "ambiguous Drive file binding".to_owned())?;
