@@ -108,6 +108,8 @@ pub struct DriveGatewayCheckpoint {
     #[serde(default)]
     pub file_observed_frontiers: BTreeMap<String, RevisionPair>,
     #[serde(default)]
+    pub pending_drive_inputs: BTreeMap<String, PendingDriveInput>,
+    #[serde(default)]
     pub delivered_broker_outputs: BTreeMap<String, DeliveredDriveOutput>,
 }
 
@@ -212,6 +214,69 @@ impl DriveGatewayCheckpoint {
                 ));
             }
         }
+        let mut pending_file_ids = BTreeSet::new();
+        for (event_id, pending) in &self.pending_drive_inputs {
+            if event_id != &pending.drive_event_id {
+                return Err(format!(
+                    "pending Drive input key {event_id} does not match {}",
+                    pending.drive_event_id
+                ));
+            }
+            if !self.processed_drive_events.contains(event_id) {
+                return Err(format!(
+                    "pending Drive input {event_id} is not marked processed"
+                ));
+            }
+            if !pending_file_ids.insert(&pending.drive_file_id) {
+                return Err(format!(
+                    "Drive file {} has more than one pending input",
+                    pending.drive_file_id
+                ));
+            }
+            let binding = self
+                .binding_for_file(&pending.drive_file_id)
+                .ok_or_else(|| {
+                    format!(
+                        "pending Drive input {event_id} references unbound file {}",
+                        pending.drive_file_id
+                    )
+                })?;
+            if binding.document_id != pending.document_id
+                || binding.side_for_file(&pending.drive_file_id) != Some(pending.source)
+            {
+                return Err(format!(
+                    "pending Drive input {event_id} does not match its file binding"
+                ));
+            }
+            if self.file_observed_frontiers.get(&pending.drive_file_id)
+                != Some(&pending.previous_frontier)
+            {
+                return Err(format!(
+                    "pending Drive input {event_id} does not match its file frontier"
+                ));
+            }
+            let mut expected = pending.previous_frontier;
+            let next_revision = expected
+                .get(pending.source)
+                .checked_add(1)
+                .ok_or_else(|| format!("pending Drive input {event_id} revision overflow"))?;
+            expected.set(pending.source, next_revision);
+            if pending.proposed_frontier != expected {
+                return Err(format!(
+                    "pending Drive input {event_id} has an invalid proposed frontier"
+                ));
+            }
+            if pending.content_sha256.len() != 64
+                || !pending
+                    .content_sha256
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "pending Drive input {event_id} has an invalid content hash"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -243,10 +308,32 @@ pub struct PreparedDriveInput {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriveInputDecision {
-    Ignore { reason: String },
-    Duplicate { drive_event_id: String },
-    Unbound { file_id: String },
+    Ignore {
+        reason: String,
+    },
+    Duplicate {
+        drive_event_id: String,
+    },
+    Deferred {
+        file_id: String,
+        pending_drive_event_id: String,
+    },
+    Unbound {
+        file_id: String,
+    },
     Upload(PreparedDriveInput),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingDriveInput {
+    pub drive_event_id: String,
+    pub drive_file_id: String,
+    pub document_id: String,
+    pub source: DeviceSide,
+    pub content_sha256: String,
+    pub previous_frontier: RevisionPair,
+    pub proposed_frontier: RevisionPair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

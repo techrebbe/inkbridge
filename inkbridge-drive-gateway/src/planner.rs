@@ -1,7 +1,7 @@
 use crate::{
     BrokerDriveOutput, CanonicalFrontier, DeliveredDriveOutput, DeviceArtifactBindingApproval,
     DeviceArtifactBindingDecision, DriveChange, DriveGatewayCheckpoint, DriveGatewayConfig,
-    DriveInputDecision, DriveOutputDecision, OriginalRegistrationApproval,
+    DriveInputDecision, DriveOutputDecision, OriginalRegistrationApproval, PendingDriveInput,
     PreparedDeviceArtifactBinding, PreparedDriveInput, PreparedDriveOutput,
     PreparedOriginalRegistration, RegistrationDecision, DRIVE_GATEWAY_PRODUCER,
 };
@@ -81,6 +81,16 @@ pub fn prepare_drive_input(
     if checkpoint.processed_drive_events.contains(&event_id) {
         return Ok(DriveInputDecision::Duplicate {
             drive_event_id: event_id,
+        });
+    }
+    if let Some(pending) = checkpoint
+        .pending_drive_inputs
+        .values()
+        .find(|pending| pending.drive_file_id == change.file.file_id)
+    {
+        return Ok(DriveInputDecision::Deferred {
+            file_id: change.file.file_id.clone(),
+            pending_drive_event_id: pending.drive_event_id.clone(),
         });
     }
     let source = binding
@@ -208,22 +218,6 @@ pub fn commit_drive_input(
             input.drive_file_id
         ));
     }
-    if checkpoint
-        .processed_drive_events
-        .contains(&input.drive_event_id)
-    {
-        if checkpoint
-            .accepted_file_content_sha256
-            .get(&input.drive_file_id)
-            == Some(&input.content_sha256)
-        {
-            return Ok(());
-        }
-        return Err(format!(
-            "Drive event {} was committed with different content",
-            input.drive_event_id
-        ));
-    }
     if input.source_revision
         != input
             .based_on
@@ -241,17 +235,94 @@ pub fn commit_drive_input(
     if current_file_frontier != input.based_on {
         return Err("prepared Drive input is stale against its file frontier".to_owned());
     }
-    let mut next_file_frontier = input.based_on;
-    next_file_frontier.set(input.source, input.source_revision);
-    checkpoint
-        .file_observed_frontiers
-        .insert(input.drive_file_id.clone(), next_file_frontier);
+    let mut proposed_frontier = input.based_on;
+    proposed_frontier.set(input.source, input.source_revision);
+    let pending = PendingDriveInput {
+        drive_event_id: input.drive_event_id.clone(),
+        drive_file_id: input.drive_file_id.clone(),
+        document_id: input.document_id.clone(),
+        source: input.source,
+        content_sha256: input.content_sha256.clone(),
+        previous_frontier: input.based_on,
+        proposed_frontier,
+    };
+    if let Some(existing) = checkpoint.pending_drive_inputs.get(&input.drive_event_id) {
+        if existing == &pending {
+            return Ok(());
+        }
+        return Err(format!(
+            "pending Drive event {} has different content",
+            input.drive_event_id
+        ));
+    }
+    if checkpoint
+        .pending_drive_inputs
+        .values()
+        .any(|existing| existing.drive_file_id == input.drive_file_id)
+    {
+        return Err(format!(
+            "Drive file {} already has a pending input",
+            input.drive_file_id
+        ));
+    }
+    if checkpoint
+        .processed_drive_events
+        .contains(&input.drive_event_id)
+    {
+        if checkpoint
+            .accepted_file_content_sha256
+            .get(&input.drive_file_id)
+            == Some(&input.content_sha256)
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "Drive event {} was already finalized with different content",
+            input.drive_event_id
+        ));
+    }
     checkpoint
         .processed_drive_events
         .insert(input.drive_event_id.clone());
     checkpoint
+        .pending_drive_inputs
+        .insert(input.drive_event_id.clone(), pending);
+    checkpoint.validate()
+}
+
+pub fn accept_drive_input(
+    checkpoint: &mut DriveGatewayCheckpoint,
+    drive_event_id: &str,
+) -> Result<(), String> {
+    checkpoint.validate()?;
+    let Some(pending) = checkpoint.pending_drive_inputs.remove(drive_event_id) else {
+        return Ok(());
+    };
+    if checkpoint
+        .file_observed_frontiers
+        .get(&pending.drive_file_id)
+        != Some(&pending.previous_frontier)
+    {
+        checkpoint
+            .pending_drive_inputs
+            .insert(pending.drive_event_id.clone(), pending);
+        return Err("pending Drive input is stale against its file frontier".to_owned());
+    }
+    checkpoint
+        .file_observed_frontiers
+        .insert(pending.drive_file_id.clone(), pending.proposed_frontier);
+    checkpoint
         .accepted_file_content_sha256
-        .insert(input.drive_file_id.clone(), input.content_sha256.clone());
+        .insert(pending.drive_file_id, pending.content_sha256);
+    checkpoint.validate()
+}
+
+pub fn reject_drive_input(
+    checkpoint: &mut DriveGatewayCheckpoint,
+    drive_event_id: &str,
+) -> Result<(), String> {
+    checkpoint.validate()?;
+    checkpoint.pending_drive_inputs.remove(drive_event_id);
     checkpoint.validate()
 }
 
@@ -356,6 +427,7 @@ pub fn commit_original_registration(
     checkpoint: &mut DriveGatewayCheckpoint,
     registration: &PreparedOriginalRegistration,
 ) -> Result<(), String> {
+    checkpoint.validate()?;
     if let Some(existing) = checkpoint.binding_for_file(&registration.drive_file_id) {
         if existing.document_id != registration.document_id {
             return Err(format!(
@@ -376,6 +448,22 @@ pub fn commit_original_registration(
         .is_some_and(|binding| binding.original_pdf_sha256 != registration.original_pdf_sha256)
     {
         return Err("registration collides with a different original PDF".to_owned());
+    }
+    if checkpoint
+        .processed_drive_events
+        .contains(&registration.drive_event_id)
+    {
+        if checkpoint
+            .binding_for_file(&registration.drive_file_id)
+            .is_some_and(|binding| {
+                binding.document_id == registration.document_id
+                    && binding.side_for_file(&registration.drive_file_id)
+                        == Some(registration.source)
+            })
+        {
+            return Ok(());
+        }
+        return Err("processed original registration lacks its file binding".to_owned());
     }
     checkpoint
         .processed_drive_events
@@ -752,6 +840,7 @@ mod tests {
                     },
                 ),
             ]),
+            pending_drive_inputs: BTreeMap::new(),
             delivered_broker_outputs: BTreeMap::new(),
         }
     }
@@ -969,6 +1058,7 @@ mod tests {
             panic!("expected initial content revision")
         };
         commit_drive_input(&mut checkpoint, &input).unwrap();
+        accept_drive_input(&mut checkpoint, &input.drive_event_id).unwrap();
 
         let mut renamed = original_change;
         renamed.file.name = "metadata-only-rename.pdf".to_owned();
@@ -980,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_upload_advances_the_file_frontier() {
+    fn pending_upload_defers_later_file_versions_until_acceptance() {
         let config = config();
         let mut checkpoint = checkpoint();
         let frontier = CanonicalFrontier {
@@ -1005,11 +1095,26 @@ mod tests {
         };
         assert_eq!(first.source_revision, 5);
         commit_drive_input(&mut checkpoint, &first).unwrap();
+        assert_eq!(checkpoint.file_observed_frontiers["boox-file"].boox, 4);
 
         let second_bytes = b"pdf ink plus another stroke";
         let mut second_change = first_change;
         second_change.file.version += 1;
         second_change.file.size = second_bytes.len() as u64;
+        assert!(matches!(
+            prepare_drive_input(
+                &config,
+                &checkpoint,
+                &second_change,
+                second_bytes,
+                frontier.clone()
+            )
+            .unwrap(),
+            DriveInputDecision::Deferred { .. }
+        ));
+        accept_drive_input(&mut checkpoint, &first.drive_event_id).unwrap();
+        assert_eq!(checkpoint.file_observed_frontiers["boox-file"].boox, 5);
+
         let DriveInputDecision::Upload(second) =
             prepare_drive_input(&config, &checkpoint, &second_change, second_bytes, frontier)
                 .unwrap()
@@ -1020,6 +1125,8 @@ mod tests {
         assert_eq!(second.based_on.supernote, 2);
         assert_eq!(second.source_revision, 6);
         commit_drive_input(&mut checkpoint, &second).unwrap();
+        assert_eq!(checkpoint.file_observed_frontiers["boox-file"].boox, 5);
+        accept_drive_input(&mut checkpoint, &second.drive_event_id).unwrap();
         assert_eq!(checkpoint.file_observed_frontiers["boox-file"].boox, 6);
     }
 
@@ -1064,6 +1171,50 @@ mod tests {
         assert_eq!(supernote.based_on.boox, 4);
         assert_eq!(supernote.based_on.supernote, 2);
         assert_eq!(supernote.source_revision, 3);
+    }
+
+    #[test]
+    fn rejected_upload_keeps_the_previous_file_frontier() {
+        let config = config();
+        let mut checkpoint = checkpoint();
+        let base = RevisionPair {
+            boox: 4,
+            supernote: 2,
+        };
+        checkpoint
+            .file_observed_frontiers
+            .insert("boox-file".to_owned(), base);
+        let first_change = change("boox-file", "application/pdf");
+        let DriveInputDecision::Upload(first) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &first_change,
+            b"malformed pdf ink",
+            CanonicalFrontier { revisions: base },
+        )
+        .unwrap() else {
+            panic!("expected first upload")
+        };
+        commit_drive_input(&mut checkpoint, &first).unwrap();
+        reject_drive_input(&mut checkpoint, &first.drive_event_id).unwrap();
+        assert_eq!(checkpoint.file_observed_frontiers["boox-file"], base);
+
+        let corrected_bytes = b"corrected pdf ink";
+        let mut corrected_change = first_change;
+        corrected_change.file.version += 1;
+        corrected_change.file.size = corrected_bytes.len() as u64;
+        let DriveInputDecision::Upload(corrected) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &corrected_change,
+            corrected_bytes,
+            CanonicalFrontier { revisions: base },
+        )
+        .unwrap() else {
+            panic!("expected corrected upload")
+        };
+        assert_eq!(corrected.based_on, base);
+        assert_eq!(corrected.source_revision, 5);
     }
 
     #[test]
@@ -1208,6 +1359,28 @@ mod tests {
             .unwrap();
         assert!(binding.boox_file_ids.contains("boox-new"));
         assert!(binding.supernote_file_ids.contains("supernote-new"));
+
+        let edited_bytes = b"%PDF-clean-with-ink";
+        boox.file.version += 1;
+        boox.file.size = edited_bytes.len() as u64;
+        let DriveInputDecision::Upload(edit) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &boox,
+            edited_bytes,
+            CanonicalFrontier {
+                revisions: RevisionPair::default(),
+            },
+        )
+        .unwrap() else {
+            panic!("expected first BOOX edit")
+        };
+        commit_drive_input(&mut checkpoint, &edit).unwrap();
+        accept_drive_input(&mut checkpoint, &edit.drive_event_id).unwrap();
+        assert_eq!(checkpoint.file_observed_frontiers["boox-new"].boox, 1);
+
+        commit_original_registration(&mut checkpoint, &boox_registration).unwrap();
+        assert_eq!(checkpoint.file_observed_frontiers["boox-new"].boox, 1);
     }
 
     #[test]

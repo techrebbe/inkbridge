@@ -65,7 +65,12 @@ For every bound file revision it:
   repeated edits uploaded before Eventarc catches up still chain sequentially;
 - creates an immutable object under `BOOX_Folder/` or `Supernote_Folder/` with
   the same metadata contract used by Eventarc;
-- records the event only after the Cloud Storage create succeeds;
+- records the event as pending only after the Cloud Storage create succeeds;
+- advances that file's observed frontier and accepted hash only after the
+  broker accepts the object; broker rejection clears the pending record without
+  advancing either value, so a corrected revision retains the real causal base;
+- defers later versions of a file while one input is pending and retains the
+  Drive page token until the broker outcome is durable;
 - advances the Drive page token only after the complete page is durable.
 
 Duplicate change delivery therefore produces the same event and cannot create
@@ -151,7 +156,8 @@ Tests cover stable identity across rename, matching clean originals from both
 folders, duplicate Drive events, metadata-only version suppression,
 authenticated first-device-artifact association, generated-output loop
 suppression, per-file causal-frontier preservation, pending-upload sequencing,
-refusal to guess an unbound file from its name, create-only broker delivery,
-and explicit page-token commit. The outbound lifecycle test also proves that
-the exact created revision is suppressed while a subsequent device edit of the
-same Drive file is accepted under the original stable document identity.
+broker rejection rollback, retry-safe original registration, refusal to guess
+an unbound file from its name, create-only broker delivery, and explicit
+page-token commit. The outbound lifecycle test also proves that the exact
+created revision is suppressed while a subsequent device edit of the same
+Drive file is accepted under the original stable document identity.
