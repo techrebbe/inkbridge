@@ -28,8 +28,9 @@ remain hidden device-local cache artifacts. They are not uploaded to Drive.
    version is the clean original. Its approval records file ID, Drive version,
    and SHA-256; the background watcher cannot invent this approval.
 3. The gateway verifies byte length and that exact approval, rejects every
-   InkBridge-generated PDF, and submits a create-only registration object to
-   Cloud Storage.
+   InkBridge-generated PDF, submits a create-only registration object to Cloud
+   Storage, and synchronously requires the broker to parse and register that
+   exact immutable generation.
 4. Equal original bytes converge on one stable document ID even when the files
    have different names.
 5. Only after registration succeeds does the gateway persist each Drive file
@@ -37,6 +38,10 @@ remain hidden device-local cache artifacts. They are not uploaded to Drive.
 
 The runtime captures its first Drive change cursor before enumerating both
 device folders, then processes that initial snapshot before saving the cursor.
+Approved originals are ordered ahead of dependent artifacts, independent of
+Drive file ordering. The checkpoint binds a Drive file only after the broker
+confirms the same document ID and original hash; malformed PDFs cannot leave a
+binding without canonical state.
 An exact approval is read from `inkbridgeDriveApprovals/<drive-file-id>` and is
 verified by the existing registration/association planner. An unapproved
 ordinary file blocks cursor advancement; it is never silently consumed.

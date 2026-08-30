@@ -2,7 +2,9 @@ use inkbridge_broker::{
     sha256_hex, CanonicalDocumentState, CommitError, ConditionalWrite, DeviceSide,
     GenerationPrecondition, ProcessOutcome, RevisionPair, StoredObject,
 };
-use inkbridge_cloud_runtime::{CanonicalStateStore, ObjectStore, RuntimeOutcome, RuntimeService};
+use inkbridge_cloud_runtime::{
+    CanonicalStateStore, ObjectStore, RegisterDocumentRequest, RuntimeOutcome, RuntimeService,
+};
 use inkbridge_drive_gateway::{
     accept_drive_input, commit_device_artifact_binding, commit_drive_input, commit_drive_output,
     commit_original_registration, commit_page_token, prepare_device_artifact_binding,
@@ -11,7 +13,7 @@ use inkbridge_drive_gateway::{
     CanonicalFrontier, DeviceArtifactBindingApproval, DeviceArtifactBindingDecision, DriveChange,
     DriveFileRevision, DriveGatewayCheckpoint, DriveGatewayConfig, DriveInputDecision,
     DriveOutputDecision, OriginalRegistrationApproval, PendingDriveInput, PreparedDriveOutput,
-    RegistrationDecision,
+    PreparedOriginalRegistration, RegistrationDecision,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -119,6 +121,11 @@ pub struct BrokerResult {
 }
 
 pub trait BrokerPort: Send + Sync {
+    fn register_original(
+        &self,
+        registration: &PreparedOriginalRegistration,
+        evidence_generation: u64,
+    ) -> Result<(), String>;
     fn frontier(&self, document_id: &str) -> Result<RevisionPair, String>;
     fn process(&self, pending: &PendingDriveInput) -> Result<BrokerResult, String>;
 }
@@ -222,7 +229,7 @@ impl GatewayJob {
             )
         };
 
-        for change in changes {
+        for change in self.order_changes(changes, &stored.value)? {
             report.changes_seen += 1;
             stored = self.process_change(stored, change, mode, &mut report)?;
         }
@@ -236,6 +243,30 @@ impl GatewayJob {
             let _ = self.persist(stored)?;
         }
         Ok(report)
+    }
+
+    fn order_changes(
+        &self,
+        changes: Vec<DriveChange>,
+        checkpoint: &DriveGatewayCheckpoint,
+    ) -> Result<Vec<DriveChange>, String> {
+        let mut approved_originals = Vec::new();
+        let mut remaining = Vec::new();
+        for change in changes {
+            let is_unbound = checkpoint.binding_for_file(&change.file.file_id).is_none();
+            let is_approved_original = is_unbound
+                && matches!(
+                    self.approvals.load(&change.file.file_id)?,
+                    Some(OnboardingApproval::Original { .. })
+                );
+            if is_approved_original {
+                approved_originals.push(change);
+            } else {
+                remaining.push(change);
+            }
+        }
+        approved_originals.extend(remaining);
+        Ok(approved_originals)
     }
 
     fn process_change(
@@ -292,9 +323,11 @@ impl GatewayJob {
                                         if object.generation == 0 {
                                             return Err(
                                                 "original registration evidence has generation zero"
-                                                    .to_owned(),
+                                                .to_owned(),
                                             );
                                         }
+                                        self.broker
+                                            .register_original(&registration, object.generation)?;
                                         commit_original_registration(
                                             &mut stored.value,
                                             &registration,
@@ -751,6 +784,29 @@ impl CloudBrokerPort {
 }
 
 impl BrokerPort for CloudBrokerPort {
+    fn register_original(
+        &self,
+        registration: &PreparedOriginalRegistration,
+        evidence_generation: u64,
+    ) -> Result<(), String> {
+        let original_file_name = registration
+            .metadata
+            .get("inkbridge-original-file-name")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "original registration has no source file name".to_owned())?;
+        let state = self.service.register_document(&RegisterDocumentRequest {
+            original_object_path: registration.gcs_object_path.clone(),
+            original_file_name: original_file_name.clone(),
+            source_generation: Some(evidence_generation),
+        })?;
+        if state.document_id != registration.document_id
+            || state.original_pdf_sha256 != registration.original_pdf_sha256
+        {
+            return Err("broker registered a different original document identity".to_owned());
+        }
+        Ok(())
+    }
+
     fn frontier(&self, document_id: &str) -> Result<RevisionPair, String> {
         self.state(document_id).map(|state| state.revisions())
     }
@@ -1154,6 +1210,14 @@ mod tests {
     }
 
     impl BrokerPort for FakeBroker {
+        fn register_original(
+            &self,
+            _registration: &PreparedOriginalRegistration,
+            _evidence_generation: u64,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
         fn frontier(&self, _document_id: &str) -> Result<RevisionPair, String> {
             Ok(RevisionPair::default())
         }
@@ -1168,6 +1232,58 @@ mod tests {
                 disposition: BrokerDisposition::Accepted,
                 output: self.output.clone(),
             })
+        }
+    }
+
+    struct OrderingBroker {
+        registered: Mutex<BTreeSet<String>>,
+    }
+
+    impl BrokerPort for OrderingBroker {
+        fn register_original(
+            &self,
+            registration: &PreparedOriginalRegistration,
+            _evidence_generation: u64,
+        ) -> Result<(), String> {
+            self.registered
+                .lock()
+                .unwrap()
+                .insert(registration.document_id.clone());
+            Ok(())
+        }
+
+        fn frontier(&self, document_id: &str) -> Result<RevisionPair, String> {
+            if !self.registered.lock().unwrap().contains(document_id) {
+                return Err("canonical document is not registered".to_owned());
+            }
+            Ok(RevisionPair::default())
+        }
+
+        fn process(&self, _pending: &PendingDriveInput) -> Result<BrokerResult, String> {
+            Ok(BrokerResult {
+                disposition: BrokerDisposition::Accepted,
+                output: None,
+            })
+        }
+    }
+
+    struct RejectingRegistrationBroker;
+
+    impl BrokerPort for RejectingRegistrationBroker {
+        fn register_original(
+            &self,
+            _registration: &PreparedOriginalRegistration,
+            _evidence_generation: u64,
+        ) -> Result<(), String> {
+            Err("broker rejected malformed original PDF".to_owned())
+        }
+
+        fn frontier(&self, _document_id: &str) -> Result<RevisionPair, String> {
+            Err("unregistered document has no frontier".to_owned())
+        }
+
+        fn process(&self, _pending: &PendingDriveInput) -> Result<BrokerResult, String> {
+            Err("unregistered document cannot process annotations".to_owned())
         }
     }
 
@@ -1616,5 +1732,122 @@ mod tests {
             1
         );
         assert_eq!(checkpoint.next_page_token.as_deref(), Some("page-2"));
+    }
+
+    #[test]
+    fn bootstrap_registers_original_before_an_earlier_sorted_dependent_artifact() {
+        let original_bytes = b"%PDF-1.7 clean original";
+        let artifact_bytes = br#"{"schemaVersion":1,"operations":[]}"#;
+        let original = initial_pdf("z-original", "boox-folder-123", original_bytes);
+        let artifact = DriveFileRevision {
+            file_id: "a-artifact".to_owned(),
+            name: "native-export.json".to_owned(),
+            version: 1,
+            mime_type: "application/json".to_owned(),
+            parents: vec!["supernote-folder-123".to_owned()],
+            size: artifact_bytes.len() as u64,
+            trashed: false,
+            app_properties: BTreeMap::new(),
+        };
+        let document_id = inkbridge_broker::stable_document_id(original_bytes);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![artifact.clone(), original.clone()];
+        drive.downloads.lock().unwrap().extend([
+            (artifact.file_id.clone(), artifact_bytes.to_vec()),
+            (original.file_id.clone(), original_bytes.to_vec()),
+        ]);
+        let approvals = Arc::new(FakeApprovals::default());
+        approvals.values.lock().unwrap().extend([
+            (
+                original.file_id.clone(),
+                OnboardingApproval::Original {
+                    approval: OriginalRegistrationApproval {
+                        drive_file_id: original.file_id.clone(),
+                        drive_file_version: original.version,
+                        content_sha256: sha256_hex(original_bytes),
+                    },
+                },
+            ),
+            (
+                artifact.file_id.clone(),
+                OnboardingApproval::DeviceArtifact {
+                    approval: DeviceArtifactBindingApproval {
+                        drive_file_id: artifact.file_id.clone(),
+                        drive_file_version: artifact.version,
+                        content_sha256: sha256_hex(artifact_bytes),
+                        document_id: document_id.clone(),
+                        source: inkbridge_broker::DeviceSide::Supernote,
+                        based_on: RevisionPair::default(),
+                    },
+                },
+            ),
+        ]);
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let broker = Arc::new(OrderingBroker {
+            registered: Mutex::new(BTreeSet::new()),
+        });
+        let job = GatewayJob::new(
+            config(),
+            drive,
+            checkpoints.clone(),
+            Arc::new(FakeEvidence::default()),
+            broker.clone(),
+            approvals,
+        )
+        .unwrap();
+
+        let report = job.run_once(RunMode::Apply).unwrap();
+        assert_eq!(report.inputs_applied, 1);
+        assert!(broker.registered.lock().unwrap().contains(&document_id));
+        let checkpoint = checkpoints.value();
+        assert!(checkpoint.documents[&document_id]
+            .boox_file_ids
+            .contains("z-original"));
+        assert!(checkpoint.documents[&document_id]
+            .supernote_file_ids
+            .contains("a-artifact"));
+        assert_eq!(checkpoint.next_page_token.as_deref(), Some("initial"));
+    }
+
+    #[test]
+    fn broker_rejection_never_commits_an_original_binding_or_cursor() {
+        let bytes = b"not actually a PDF";
+        let file = initial_pdf("bad-original", "boox-folder-123", bytes);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![file.clone()];
+        drive
+            .downloads
+            .lock()
+            .unwrap()
+            .insert(file.file_id.clone(), bytes.to_vec());
+        let approvals = Arc::new(FakeApprovals::default());
+        approvals.values.lock().unwrap().insert(
+            file.file_id.clone(),
+            OnboardingApproval::Original {
+                approval: OriginalRegistrationApproval {
+                    drive_file_id: file.file_id,
+                    drive_file_version: file.version,
+                    content_sha256: sha256_hex(bytes),
+                },
+            },
+        );
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let evidence = Arc::new(FakeEvidence::default());
+        let job = GatewayJob::new(
+            config(),
+            drive,
+            checkpoints.clone(),
+            evidence.clone(),
+            Arc::new(RejectingRegistrationBroker),
+            approvals,
+        )
+        .unwrap();
+
+        let error = job.run_once(RunMode::Apply).unwrap_err();
+        assert!(error.contains("rejected malformed original PDF"));
+        let checkpoint = checkpoints.value();
+        assert!(checkpoint.documents.is_empty());
+        assert!(checkpoint.next_page_token.is_none());
+        assert_eq!(evidence.objects.lock().unwrap().len(), 1);
     }
 }

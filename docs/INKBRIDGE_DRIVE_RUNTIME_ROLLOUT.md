@@ -17,6 +17,14 @@ the captured change-feed cursor, while existing files are never skipped. An
 unbound ordinary file without an exact onboarding approval blocks cursor
 advancement instead of disappearing from the feed.
 
+Approved clean originals are processed before dependent device artifacts in
+the same snapshot or change page, regardless of Drive's file ordering. After
+the immutable evidence object is staged, the runtime synchronously asks the
+broker to parse and register that exact GCS generation. Only a successful,
+identity-matching broker registration permits the Drive binding or page cursor
+to be committed. A malformed original therefore leaves retry evidence but
+cannot create a checkpoint that names a nonexistent canonical document.
+
 ```text
 Drive changes.list
   -> exact file-version download and post-download metadata recheck
@@ -120,6 +128,12 @@ separate explicit approval.
 - If an existing or newly observed file has not been explicitly approved for
   original registration or artifact association, the job retains the page
   token and stops rather than silently skipping it.
+- If a dependent artifact sorts before its approved original, the runtime
+  registers the original first so the broker frontier exists before binding or
+  processing the artifact.
+- If the broker cannot parse or register an approved original, no Drive-file
+  binding and no page cursor is committed. A retry reuses the immutable staged
+  evidence generation.
 - If the broker permanently rejects an event, the pending input is cleared but
   its file frontier/hash is not advanced; a corrected new Drive revision keeps
   the true causal base.
