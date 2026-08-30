@@ -59,6 +59,10 @@ For every bound file revision it:
 - derives an event ID from file ID, Drive version, and SHA-256 for real content
   revisions;
 - reads the broker's current revision frontier;
+- merges the source side with its durable locally reserved revision, so
+  multiple same-side changes uploaded before Eventarc catches up still receive
+  sequential revisions; the other side remains the broker frontier so a truly
+  concurrent device edit is not mislabeled as already observed;
 - creates an immutable object under `BOOX_Folder/` or `Supernote_Folder/` with
   the same metadata contract used by Eventarc;
 - records the event only after the Cloud Storage create succeeds;
@@ -146,8 +150,8 @@ cargo test -p inkbridge-drive-gateway
 Tests cover stable identity across rename, matching clean originals from both
 folders, duplicate Drive events, metadata-only version suppression,
 authenticated first-device-artifact association, generated-output loop
-suppression, refusal to guess an unbound file from its name, create-only broker
-delivery, and explicit page-token commit. The outbound lifecycle test also
-proves that the exact created revision is suppressed while a subsequent device
-edit of the same Drive file is accepted under the original stable document
-identity.
+suppression, pending-upload revision reservation, refusal to guess an unbound
+file from its name, create-only broker delivery, and explicit page-token
+commit. The outbound lifecycle test also proves that the exact created revision
+is suppressed while a subsequent device edit of the same Drive file is
+accepted under the original stable document identity.

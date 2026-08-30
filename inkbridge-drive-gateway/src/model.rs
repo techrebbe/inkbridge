@@ -106,6 +106,8 @@ pub struct DriveGatewayCheckpoint {
     #[serde(default)]
     pub accepted_file_content_sha256: BTreeMap<String, String>,
     #[serde(default)]
+    pub reserved_document_frontiers: BTreeMap<String, RevisionPair>,
+    #[serde(default)]
     pub delivered_broker_outputs: BTreeMap<String, DeliveredDriveOutput>,
 }
 
@@ -193,6 +195,13 @@ impl DriveGatewayCheckpoint {
             {
                 return Err(format!(
                     "accepted content hash for Drive file {file_id} is invalid"
+                ));
+            }
+        }
+        for document_id in self.reserved_document_frontiers.keys() {
+            if !self.documents.contains_key(document_id) {
+                return Err(format!(
+                    "reserved Drive frontier references unbound document {document_id}"
                 ));
             }
         }

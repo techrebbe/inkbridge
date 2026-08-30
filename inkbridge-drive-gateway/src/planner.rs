@@ -104,8 +104,14 @@ pub fn prepare_drive_input(
             ),
         });
     };
-    let source_revision = frontier
-        .revisions
+    let mut based_on = frontier.revisions;
+    let reserved_source_revision = checkpoint
+        .reserved_document_frontiers
+        .get(&binding.document_id)
+        .map(|reserved| reserved.get(source))
+        .unwrap_or_default();
+    based_on.set(source, based_on.get(source).max(reserved_source_revision));
+    let source_revision = based_on
         .get(source)
         .checked_add(1)
         .ok_or_else(|| "source revision overflow".to_owned())?;
@@ -133,11 +139,11 @@ pub fn prepare_drive_input(
         ),
         (
             "inkbridge-based-on-boox".to_owned(),
-            frontier.revisions.boox.to_string(),
+            based_on.boox.to_string(),
         ),
         (
             "inkbridge-based-on-supernote".to_owned(),
-            frontier.revisions.supernote.to_string(),
+            based_on.supernote.to_string(),
         ),
         ("inkbridge-sync-ready".to_owned(), "true".to_owned()),
         (
@@ -171,7 +177,7 @@ pub fn prepare_drive_input(
         document_id: binding.document_id.clone(),
         source,
         source_revision,
-        based_on: frontier.revisions,
+        based_on,
         payload_kind,
     }))
 }
@@ -204,6 +210,44 @@ pub fn commit_drive_input(
             input.drive_file_id
         ));
     }
+    if checkpoint
+        .processed_drive_events
+        .contains(&input.drive_event_id)
+    {
+        if checkpoint
+            .accepted_file_content_sha256
+            .get(&input.drive_file_id)
+            == Some(&input.content_sha256)
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "Drive event {} was committed with different content",
+            input.drive_event_id
+        ));
+    }
+    if input.source_revision
+        != input
+            .based_on
+            .get(input.source)
+            .checked_add(1)
+            .ok_or_else(|| "source revision overflow".to_owned())?
+    {
+        return Err("prepared Drive input has an invalid source revision".to_owned());
+    }
+    let current_reservation = checkpoint
+        .reserved_document_frontiers
+        .get(&input.document_id)
+        .copied()
+        .unwrap_or_default();
+    if current_reservation.get(input.source) > input.based_on.get(input.source) {
+        return Err("prepared Drive input is stale against the reserved frontier".to_owned());
+    }
+    let mut reserved = current_reservation;
+    reserved.set(input.source, input.source_revision);
+    checkpoint
+        .reserved_document_frontiers
+        .insert(input.document_id.clone(), reserved);
     checkpoint
         .processed_drive_events
         .insert(input.drive_event_id.clone());
@@ -682,6 +726,7 @@ mod tests {
             )]),
             processed_drive_events: BTreeSet::new(),
             accepted_file_content_sha256: BTreeMap::new(),
+            reserved_document_frontiers: BTreeMap::new(),
             delivered_broker_outputs: BTreeMap::new(),
         }
     }
@@ -903,6 +948,87 @@ mod tests {
             prepare_drive_input(&config, &checkpoint, &renamed, bytes, frontier).unwrap(),
             DriveInputDecision::Duplicate { .. }
         ));
+    }
+
+    #[test]
+    fn pending_upload_reserves_the_next_source_revision() {
+        let config = config();
+        let mut checkpoint = checkpoint();
+        let frontier = CanonicalFrontier {
+            revisions: RevisionPair {
+                boox: 4,
+                supernote: 2,
+            },
+        };
+        let first_change = change("boox-file", "application/pdf");
+        let DriveInputDecision::Upload(first) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &first_change,
+            b"pdf ink",
+            frontier.clone(),
+        )
+        .unwrap() else {
+            panic!("expected first upload")
+        };
+        assert_eq!(first.source_revision, 5);
+        commit_drive_input(&mut checkpoint, &first).unwrap();
+
+        let second_bytes = b"pdf ink plus another stroke";
+        let mut second_change = first_change;
+        second_change.file.version += 1;
+        second_change.file.size = second_bytes.len() as u64;
+        let DriveInputDecision::Upload(second) =
+            prepare_drive_input(&config, &checkpoint, &second_change, second_bytes, frontier)
+                .unwrap()
+        else {
+            panic!("expected second upload")
+        };
+        assert_eq!(second.based_on.boox, 5);
+        assert_eq!(second.based_on.supernote, 2);
+        assert_eq!(second.source_revision, 6);
+        commit_drive_input(&mut checkpoint, &second).unwrap();
+        assert_eq!(
+            checkpoint.reserved_document_frontiers[&document_id()].boox,
+            6
+        );
+    }
+
+    #[test]
+    fn pending_opposite_side_upload_does_not_hide_concurrency() {
+        let config = config();
+        let mut checkpoint = checkpoint();
+        let frontier = CanonicalFrontier {
+            revisions: RevisionPair {
+                boox: 4,
+                supernote: 2,
+            },
+        };
+        let DriveInputDecision::Upload(boox) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &change("boox-file", "application/pdf"),
+            b"pdf ink",
+            frontier.clone(),
+        )
+        .unwrap() else {
+            panic!("expected BOOX upload")
+        };
+        commit_drive_input(&mut checkpoint, &boox).unwrap();
+
+        let DriveInputDecision::Upload(supernote) = prepare_drive_input(
+            &config,
+            &checkpoint,
+            &change("supernote-file", "application/json"),
+            b"native page export",
+            frontier,
+        )
+        .unwrap() else {
+            panic!("expected concurrent Supernote upload")
+        };
+        assert_eq!(supernote.based_on.boox, 4);
+        assert_eq!(supernote.based_on.supernote, 2);
+        assert_eq!(supernote.source_revision, 3);
     }
 
     #[test]
