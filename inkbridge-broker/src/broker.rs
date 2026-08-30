@@ -61,6 +61,19 @@ impl fmt::Display for BrokerError {
 
 impl std::error::Error for BrokerError {}
 
+pub fn validate_original_pdf(original_pdf: &[u8]) -> Result<usize, BrokerError> {
+    let original_document = lopdf::Document::load_mem(original_pdf).map_err(|error| {
+        BrokerError::InvalidEvent(format!("immutable original is not a readable PDF: {error}"))
+    })?;
+    let original_page_count = original_document.get_pages().len();
+    if original_page_count == 0 {
+        return Err(BrokerError::InvalidEvent(
+            "immutable original PDF must contain at least one page".to_owned(),
+        ));
+    }
+    Ok(original_page_count)
+}
+
 pub struct Broker {
     pub(crate) normalized_y_offset: f64,
 }
@@ -92,16 +105,7 @@ impl Broker {
             ));
         }
         // Parsing now prevents registering a hash-stable but unusable original.
-        let original_document = lopdf::Document::load_mem(original_pdf).map_err(|error| {
-            BrokerError::InvalidEvent(format!("immutable original is not a readable PDF: {error}"))
-        })?;
-        let original_page_count = original_document.get_pages().len();
-        if original_page_count == 0 {
-            return Err(BrokerError::InvalidEvent(
-                "immutable original PDF must contain at least one page".to_owned(),
-            ));
-        }
-        drop(original_document);
+        let original_page_count = validate_original_pdf(original_pdf)?;
         let document_id = stable_document_id(original_pdf);
         let original_path = original_path(&document_id);
         let state_path = state_path(&document_id);

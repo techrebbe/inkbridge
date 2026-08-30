@@ -1,6 +1,6 @@
 use inkbridge_broker::{
-    sha256_hex, CanonicalDocumentState, CommitError, ConditionalWrite, DeviceSide,
-    GenerationPrecondition, ProcessOutcome, RevisionPair, StoredObject,
+    sha256_hex, validate_original_pdf, CanonicalDocumentState, CommitError, ConditionalWrite,
+    DeviceSide, GenerationPrecondition, ProcessOutcome, RevisionPair, StoredObject,
 };
 use inkbridge_cloud_runtime::{
     CanonicalStateStore, ObjectStore, RegisterDocumentRequest, RuntimeOutcome, RuntimeService,
@@ -313,14 +313,28 @@ impl GatewayJob {
                             )? {
                                 RegistrationDecision::Register(registration) => {
                                     if mode == RunMode::DryRun {
+                                        validate_original_pdf(&bytes)
+                                            .map_err(|error| error.to_string())?;
+                                        let frontier = if let Some(frontier) =
+                                            simulated_frontiers.get(&registration.document_id)
+                                        {
+                                            *frontier
+                                        } else if stored
+                                            .value
+                                            .documents
+                                            .contains_key(&registration.document_id)
+                                        {
+                                            self.broker.frontier(&registration.document_id)?
+                                        } else {
+                                            RevisionPair::default()
+                                        };
                                         commit_original_registration(
                                             &mut stored.value,
                                             &registration,
                                         )?;
-                                        simulated_frontiers.insert(
-                                            registration.document_id.clone(),
-                                            RevisionPair::default(),
-                                        );
+                                        simulated_frontiers
+                                            .entry(registration.document_id.clone())
+                                            .or_insert(frontier);
                                         report.dry_run_actions.push(format!(
                                             "register approved original {} as {}",
                                             registration.drive_file_id, registration.document_id
@@ -924,6 +938,7 @@ mod tests {
     use inkbridge_drive_gateway::{
         DocumentBinding, DRIVE_GATEWAY_PRODUCER, DRIVE_GATEWAY_SCHEMA_VERSION,
     };
+    use lopdf::{dictionary, Document, Object};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
@@ -939,6 +954,32 @@ mod tests {
             boox_folder_id: "boox-folder-123".to_owned(),
             supernote_folder_id: "supernote-folder-123".to_owned(),
         }
+    }
+
+    fn original_pdf() -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {},
+        });
+        document.objects.insert(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }
+            .into(),
+        );
+        let catalog_id =
+            document.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages_id});
+        document.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        bytes
     }
 
     fn checkpoint() -> DriveGatewayCheckpoint {
@@ -1319,6 +1360,29 @@ mod tests {
         }
     }
 
+    struct StaticFrontierBroker(RevisionPair);
+
+    impl BrokerPort for StaticFrontierBroker {
+        fn register_original(
+            &self,
+            _registration: &PreparedOriginalRegistration,
+            _evidence_generation: u64,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn frontier(&self, _document_id: &str) -> Result<RevisionPair, String> {
+            Ok(self.0)
+        }
+
+        fn process(&self, _pending: &PendingDriveInput) -> Result<BrokerResult, String> {
+            Ok(BrokerResult {
+                disposition: BrokerDisposition::Accepted,
+                output: None,
+            })
+        }
+    }
+
     fn job(
         drive: Arc<FakeDrive>,
         checkpoints: Arc<FakeCheckpoints>,
@@ -1598,15 +1662,15 @@ mod tests {
 
     #[test]
     fn first_dry_run_inspects_existing_files_without_mutating_state() {
-        let bytes = b"%PDF-1.7 clean original";
-        let file = initial_pdf("boox-original", "boox-folder-123", bytes);
+        let bytes = original_pdf();
+        let file = initial_pdf("boox-original", "boox-folder-123", &bytes);
         let drive = Arc::new(FakeDrive::default());
         *drive.initial_files.lock().unwrap() = vec![file.clone()];
         drive
             .downloads
             .lock()
             .unwrap()
-            .insert(file.file_id.clone(), bytes.to_vec());
+            .insert(file.file_id.clone(), bytes.clone());
         let approvals = Arc::new(FakeApprovals::default());
         approvals.values.lock().unwrap().insert(
             file.file_id.clone(),
@@ -1614,7 +1678,7 @@ mod tests {
                 approval: OriginalRegistrationApproval {
                     drive_file_id: file.file_id,
                     drive_file_version: file.version,
-                    content_sha256: sha256_hex(bytes),
+                    content_sha256: sha256_hex(&bytes),
                 },
             },
         );
@@ -1640,6 +1704,58 @@ mod tests {
             .any(|action| action.contains("register approved original")));
         assert_eq!(checkpoints.value(), DriveGatewayCheckpoint::empty());
         assert!(evidence.objects.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn first_dry_run_simulates_two_original_copies_as_one_new_document() {
+        let bytes = original_pdf();
+        let boox = initial_pdf("boox-original", "boox-folder-123", &bytes);
+        let supernote = initial_pdf("supernote-original", "supernote-folder-123", &bytes);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![boox.clone(), supernote.clone()];
+        drive.downloads.lock().unwrap().extend([
+            (boox.file_id.clone(), bytes.clone()),
+            (supernote.file_id.clone(), bytes.clone()),
+        ]);
+        let approvals = Arc::new(FakeApprovals::default());
+        for file in [&boox, &supernote] {
+            approvals.values.lock().unwrap().insert(
+                file.file_id.clone(),
+                OnboardingApproval::Original {
+                    approval: OriginalRegistrationApproval {
+                        drive_file_id: file.file_id.clone(),
+                        drive_file_version: file.version,
+                        content_sha256: sha256_hex(&bytes),
+                    },
+                },
+            );
+        }
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let broker = Arc::new(OrderingBroker {
+            registered: Mutex::new(BTreeSet::new()),
+        });
+        let job = GatewayJob::new(
+            config(),
+            drive,
+            checkpoints.clone(),
+            Arc::new(FakeEvidence::default()),
+            broker.clone(),
+            approvals,
+        )
+        .unwrap();
+
+        let report = job.run_once(RunMode::DryRun).unwrap();
+
+        assert_eq!(
+            report
+                .dry_run_actions
+                .iter()
+                .filter(|action| action.contains("register approved original"))
+                .count(),
+            2
+        );
+        assert!(broker.registered.lock().unwrap().is_empty());
+        assert_eq!(checkpoints.value(), DriveGatewayCheckpoint::empty());
     }
 
     #[test]
@@ -1843,9 +1959,9 @@ mod tests {
 
     #[test]
     fn bootstrap_dry_run_simulates_original_before_validating_dependent_artifact() {
-        let original_bytes = b"%PDF-1.7 clean original";
+        let original_bytes = original_pdf();
         let artifact_bytes = br#"{"schemaVersion":1,"operations":[]}"#;
-        let original = initial_pdf("z-original", "boox-folder-123", original_bytes);
+        let original = initial_pdf("z-original", "boox-folder-123", &original_bytes);
         let artifact = DriveFileRevision {
             file_id: "a-artifact".to_owned(),
             name: "native-export.json".to_owned(),
@@ -1856,12 +1972,12 @@ mod tests {
             trashed: false,
             app_properties: BTreeMap::new(),
         };
-        let document_id = inkbridge_broker::stable_document_id(original_bytes);
+        let document_id = inkbridge_broker::stable_document_id(&original_bytes);
         let drive = Arc::new(FakeDrive::default());
         *drive.initial_files.lock().unwrap() = vec![artifact.clone(), original.clone()];
         drive.downloads.lock().unwrap().extend([
             (artifact.file_id.clone(), artifact_bytes.to_vec()),
-            (original.file_id.clone(), original_bytes.to_vec()),
+            (original.file_id.clone(), original_bytes.clone()),
         ]);
         let approvals = Arc::new(FakeApprovals::default());
         approvals.values.lock().unwrap().extend([
@@ -1871,7 +1987,7 @@ mod tests {
                     approval: OriginalRegistrationApproval {
                         drive_file_id: original.file_id.clone(),
                         drive_file_version: original.version,
-                        content_sha256: sha256_hex(original_bytes),
+                        content_sha256: sha256_hex(&original_bytes),
                     },
                 },
             ),
@@ -1923,6 +2039,140 @@ mod tests {
         let checkpoint = checkpoints.value();
         assert!(checkpoint.documents.is_empty());
         assert!(checkpoint.next_page_token.is_none());
+    }
+
+    #[test]
+    fn dry_run_preserves_existing_canonical_frontier_for_second_original() {
+        let original_bytes = original_pdf();
+        let artifact_bytes = br#"{"schemaVersion":1,"operations":[]}"#;
+        let document_id = inkbridge_broker::stable_document_id(&original_bytes);
+        let original = initial_pdf(
+            "z-supernote-original",
+            "supernote-folder-123",
+            &original_bytes,
+        );
+        let artifact = DriveFileRevision {
+            file_id: "a-supernote-artifact".to_owned(),
+            name: "native-export.json".to_owned(),
+            version: 1,
+            mime_type: "application/json".to_owned(),
+            parents: vec!["supernote-folder-123".to_owned()],
+            size: artifact_bytes.len() as u64,
+            trashed: false,
+            app_properties: BTreeMap::new(),
+        };
+        let frontier = RevisionPair {
+            boox: 7,
+            supernote: 4,
+        };
+        let mut initial_checkpoint = DriveGatewayCheckpoint::empty();
+        initial_checkpoint.documents.insert(
+            document_id.clone(),
+            DocumentBinding {
+                document_id: document_id.clone(),
+                original_pdf_sha256: sha256_hex(&original_bytes),
+                boox_file_ids: BTreeSet::from(["existing-boox".to_owned()]),
+                supernote_file_ids: BTreeSet::new(),
+            },
+        );
+        initial_checkpoint
+            .file_observed_frontiers
+            .insert("existing-boox".to_owned(), frontier);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![artifact.clone(), original.clone()];
+        drive.downloads.lock().unwrap().extend([
+            (artifact.file_id.clone(), artifact_bytes.to_vec()),
+            (original.file_id.clone(), original_bytes.clone()),
+        ]);
+        let approvals = Arc::new(FakeApprovals::default());
+        approvals.values.lock().unwrap().extend([
+            (
+                original.file_id.clone(),
+                OnboardingApproval::Original {
+                    approval: OriginalRegistrationApproval {
+                        drive_file_id: original.file_id.clone(),
+                        drive_file_version: original.version,
+                        content_sha256: sha256_hex(&original_bytes),
+                    },
+                },
+            ),
+            (
+                artifact.file_id.clone(),
+                OnboardingApproval::DeviceArtifact {
+                    approval: DeviceArtifactBindingApproval {
+                        drive_file_id: artifact.file_id.clone(),
+                        drive_file_version: artifact.version,
+                        content_sha256: sha256_hex(artifact_bytes),
+                        document_id: document_id.clone(),
+                        source: DeviceSide::Supernote,
+                        based_on: frontier,
+                    },
+                },
+            ),
+        ]);
+        let checkpoints = Arc::new(FakeCheckpoints::new(initial_checkpoint.clone()));
+        let job = GatewayJob::new(
+            config(),
+            drive,
+            checkpoints.clone(),
+            Arc::new(FakeEvidence::default()),
+            Arc::new(StaticFrontierBroker(frontier)),
+            approvals,
+        )
+        .unwrap();
+
+        let report = job.run_once(RunMode::DryRun).unwrap();
+
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("bind approved device artifact")));
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("upload drive-v1-")));
+        assert_eq!(checkpoints.value(), initial_checkpoint);
+    }
+
+    #[test]
+    fn dry_run_rejects_malformed_original_before_simulating_its_binding() {
+        let bytes = b"not actually a PDF";
+        let file = initial_pdf("bad-original", "boox-folder-123", bytes);
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![file.clone()];
+        drive
+            .downloads
+            .lock()
+            .unwrap()
+            .insert(file.file_id.clone(), bytes.to_vec());
+        let approvals = Arc::new(FakeApprovals::default());
+        approvals.values.lock().unwrap().insert(
+            file.file_id.clone(),
+            OnboardingApproval::Original {
+                approval: OriginalRegistrationApproval {
+                    drive_file_id: file.file_id,
+                    drive_file_version: file.version,
+                    content_sha256: sha256_hex(bytes),
+                },
+            },
+        );
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let evidence = Arc::new(FakeEvidence::default());
+        let job = GatewayJob::new(
+            config(),
+            drive,
+            checkpoints.clone(),
+            evidence.clone(),
+            Arc::new(RejectingRegistrationBroker),
+            approvals,
+        )
+        .unwrap();
+
+        let error = job.run_once(RunMode::DryRun).unwrap_err();
+
+        assert!(error.contains("not a readable PDF"));
+        assert!(checkpoints.value().documents.is_empty());
+        assert!(evidence.objects.lock().unwrap().is_empty());
     }
 
     #[test]

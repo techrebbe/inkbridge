@@ -43,10 +43,12 @@ The job defaults to dry-run. Production mutation requires the explicit
 `--apply` argument. A first dry-run enumerates the current device folders; later
 dry-runs inspect the next change page. Both download and validate relevant
 files. When an approved original and dependent artifact share the page, dry-run
-simulates their binding and zero revision frontier in memory so it can validate
-the complete onboarding sequence. It never persists that simulation, uploads
-evidence, invokes a mutating broker path, creates a Drive file, or advances the
-page token.
+first runs the broker's same non-mutating PDF/page validation, then simulates
+their binding in memory so it can validate the complete onboarding sequence. A
+genuinely new document uses a zero revision frontier; a second device copy of
+an existing document reads and preserves its real canonical frontier. Dry-run
+never persists that simulation, uploads evidence, invokes a mutating broker
+path, creates a Drive file, or advances the page token.
 
 ## Required configuration
 
