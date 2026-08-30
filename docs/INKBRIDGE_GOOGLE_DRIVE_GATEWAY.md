@@ -24,11 +24,15 @@ remain hidden device-local cache artifacts. They are not uploaded to Drive.
 ## Onboarding a document
 
 1. Put the same clean original PDF in both device folders before annotating it.
-2. The gateway downloads each new unbound PDF, verifies its byte length, hashes
-   its bytes, and submits a create-only registration object to Cloud Storage.
-3. Equal original bytes converge on one stable document ID even when the files
+2. The onboarding flow asks the user to confirm that each exact Drive file
+   version is the clean original. Its approval records file ID, Drive version,
+   and SHA-256; the background watcher cannot invent this approval.
+3. The gateway verifies byte length and that exact approval, rejects every
+   InkBridge-generated PDF, and submits a create-only registration object to
+   Cloud Storage.
+4. Equal original bytes converge on one stable document ID even when the files
    have different names.
-4. Only after registration succeeds does the gateway persist each Drive file
+5. Only after registration succeeds does the gateway persist each Drive file
    ID as the BOOX or Supernote representation of that document.
 
 An already-annotated unbound PDF is not safe to auto-register because its byte
@@ -41,6 +45,8 @@ The scheduled gateway reads the Drive change feed from its durable page token.
 For every bound file revision it:
 
 - rejects incomplete downloads by comparing received bytes with Drive's size;
+- requires a bound file to remain directly in the configured folder for its
+  device side;
 - derives a content-stable event ID from file ID, Drive version, and SHA-256;
 - reads the broker's current revision frontier;
 - creates an immutable object under `BOOX_Folder/` or `Supernote_Folder/` with
@@ -125,4 +131,3 @@ Tests cover stable identity across rename, matching clean originals from both
 folders, duplicate Drive events, generated-output loop suppression, refusal to
 guess an unbound file from its name, create-only broker delivery, and explicit
 page-token commit.
-

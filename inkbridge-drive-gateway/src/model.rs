@@ -193,6 +193,13 @@ pub enum DriveInputDecision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginalRegistrationApproval {
+    pub drive_file_id: String,
+    pub drive_file_version: u64,
+    pub content_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedOriginalRegistration {
     pub drive_event_id: String,
     pub drive_file_id: String,

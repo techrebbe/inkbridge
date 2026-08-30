@@ -1,7 +1,8 @@
 use crate::{
     BrokerDriveOutput, CanonicalFrontier, DriveChange, DriveGatewayCheckpoint, DriveGatewayConfig,
-    DriveInputDecision, DriveOutputDecision, PreparedDriveInput, PreparedDriveOutput,
-    PreparedOriginalRegistration, RegistrationDecision, DRIVE_GATEWAY_PRODUCER,
+    DriveInputDecision, DriveOutputDecision, OriginalRegistrationApproval, PreparedDriveInput,
+    PreparedDriveOutput, PreparedOriginalRegistration, RegistrationDecision,
+    DRIVE_GATEWAY_PRODUCER,
 };
 use inkbridge_broker::{
     sha256_hex, stable_document_id, DevicePayloadKind, DeviceSide, BROKER_PRODUCER,
@@ -21,11 +22,13 @@ pub fn drive_event_id(change: &DriveChange, bytes: &[u8]) -> String {
 }
 
 pub fn prepare_drive_input(
+    config: &DriveGatewayConfig,
     checkpoint: &DriveGatewayCheckpoint,
     change: &DriveChange,
     bytes: &[u8],
     frontier: CanonicalFrontier,
 ) -> Result<DriveInputDecision, String> {
+    config.validate()?;
     checkpoint.validate()?;
     if change.file.trashed {
         return Ok(DriveInputDecision::Ignore {
@@ -65,6 +68,16 @@ pub fn prepare_drive_input(
     let source = binding
         .side_for_file(&change.file.file_id)
         .ok_or_else(|| "ambiguous Drive file binding".to_owned())?;
+    if !change
+        .file
+        .parents
+        .iter()
+        .any(|parent| parent == config.folder_id(source))
+    {
+        return Ok(DriveInputDecision::Ignore {
+            reason: "bound Drive file is outside its configured device folder".to_owned(),
+        });
+    }
     let payload_kind = match source {
         DeviceSide::Boox if change.file.mime_type == "application/pdf" => {
             DevicePayloadKind::DeviceView
@@ -167,12 +180,23 @@ pub fn prepare_original_registration(
     checkpoint: &DriveGatewayCheckpoint,
     change: &DriveChange,
     bytes: &[u8],
+    approval: &OriginalRegistrationApproval,
 ) -> Result<RegistrationDecision, String> {
     config.validate()?;
     checkpoint.validate()?;
     if change.file.trashed || change.file.mime_type != "application/pdf" {
         return Ok(RegistrationDecision::Ignore {
             reason: "only a live PDF can register an original document".to_owned(),
+        });
+    }
+    if change
+        .file
+        .app_properties
+        .get(GENERATED_BY_PROPERTY)
+        .is_some_and(|producer| producer == BROKER_PRODUCER || producer == DRIVE_GATEWAY_PRODUCER)
+    {
+        return Ok(RegistrationDecision::Ignore {
+            reason: "InkBridge-generated PDF cannot become an immutable original".to_owned(),
         });
     }
     if change.file.size != bytes.len() as u64 {
@@ -195,13 +219,22 @@ pub fn prepare_original_registration(
             });
         }
     };
+    let actual_hash = sha256_hex(bytes);
+    if approval.drive_file_id != change.file.file_id
+        || approval.drive_file_version != change.file.version
+        || approval.content_sha256 != actual_hash
+    {
+        return Ok(RegistrationDecision::Ignore {
+            reason: "unbound PDF lacks approval for this exact clean original revision".to_owned(),
+        });
+    }
     let event_id = drive_event_id(change, bytes);
     if checkpoint.processed_drive_events.contains(&event_id) {
         return Ok(RegistrationDecision::Duplicate {
             drive_event_id: event_id,
         });
     }
-    let original_pdf_sha256 = sha256_hex(bytes);
+    let original_pdf_sha256 = actual_hash;
     let document_id = stable_document_id(bytes);
     let staging_key = sha256_hex(event_id.as_bytes());
     let gcs_object_path = format!("Staging/drive-{staging_key}.pdf");
@@ -425,6 +458,14 @@ mod tests {
         }
     }
 
+    fn config() -> DriveGatewayConfig {
+        DriveGatewayConfig {
+            schema_version: DRIVE_GATEWAY_SCHEMA_VERSION,
+            boox_folder_id: "boox-folder-id-123".to_owned(),
+            supernote_folder_id: "supernote-folder-id-123".to_owned(),
+        }
+    }
+
     fn change(file_id: &str, mime_type: &str) -> DriveChange {
         DriveChange {
             file: DriveFileRevision {
@@ -432,7 +473,11 @@ mod tests {
                 name: "renamed-anything.pdf".to_owned(),
                 version: 17,
                 mime_type: mime_type.to_owned(),
-                parents: vec!["device-folder".to_owned()],
+                parents: vec![if file_id.starts_with("supernote") {
+                    config().supernote_folder_id
+                } else {
+                    config().boox_folder_id
+                }],
                 size: if mime_type == "application/pdf" {
                     7
                 } else {
@@ -448,6 +493,7 @@ mod tests {
     fn mapped_boox_revision_uses_file_identity_not_filename() {
         let bytes = b"pdf ink";
         let decision = prepare_drive_input(
+            &config(),
             &checkpoint(),
             &change("boox-file", "application/pdf"),
             bytes,
@@ -490,13 +536,13 @@ mod tests {
         };
         let mut checkpoint = checkpoint();
         let DriveInputDecision::Upload(input) =
-            prepare_drive_input(&checkpoint, &change, bytes, frontier.clone()).unwrap()
+            prepare_drive_input(&config(), &checkpoint, &change, bytes, frontier.clone()).unwrap()
         else {
             panic!("expected upload")
         };
         commit_drive_input(&mut checkpoint, &input);
         assert_eq!(
-            prepare_drive_input(&checkpoint, &change, bytes, frontier).unwrap(),
+            prepare_drive_input(&config(), &checkpoint, &change, bytes, frontier).unwrap(),
             DriveInputDecision::Duplicate {
                 drive_event_id: input.drive_event_id
             }
@@ -512,6 +558,7 @@ mod tests {
             .insert(GENERATED_BY_PROPERTY.to_owned(), BROKER_PRODUCER.to_owned());
         assert!(matches!(
             prepare_drive_input(
+                &config(),
                 &checkpoint(),
                 &change,
                 b"view",
@@ -528,6 +575,7 @@ mod tests {
     fn unbound_file_is_not_guessed_from_matching_name() {
         assert_eq!(
             prepare_drive_input(
+                &config(),
                 &checkpoint(),
                 &change("different-file", "application/pdf"),
                 b"view",
@@ -544,11 +592,7 @@ mod tests {
 
     #[test]
     fn broker_outputs_are_create_only_and_idempotent() {
-        let config = DriveGatewayConfig {
-            schema_version: DRIVE_GATEWAY_SCHEMA_VERSION,
-            boox_folder_id: "boox-folder-id-123".to_owned(),
-            supernote_folder_id: "supernote-folder-id-123".to_owned(),
-        };
+        let config = config();
         let output = BrokerDriveOutput {
             gcs_object_path: "BOOX_Folder/doc/view.pdf".to_owned(),
             gcs_generation: 29,
@@ -589,19 +633,21 @@ mod tests {
 
     #[test]
     fn clean_originals_from_both_folders_join_one_content_identity() {
-        let config = DriveGatewayConfig {
-            schema_version: DRIVE_GATEWAY_SCHEMA_VERSION,
-            boox_folder_id: "boox-folder-id-123".to_owned(),
-            supernote_folder_id: "supernote-folder-id-123".to_owned(),
-        };
+        let config = config();
         let bytes = b"%PDF-clean";
         let mut checkpoint = DriveGatewayCheckpoint::empty();
         let mut boox = change("boox-new", "application/pdf");
         boox.file.name = "Book.pdf".to_owned();
         boox.file.size = bytes.len() as u64;
         boox.file.parents = vec![config.boox_folder_id.clone()];
+        let boox_approval = OriginalRegistrationApproval {
+            drive_file_id: boox.file.file_id.clone(),
+            drive_file_version: boox.file.version,
+            content_sha256: sha256_hex(bytes),
+        };
         let RegistrationDecision::Register(boox_registration) =
-            prepare_original_registration(&config, &checkpoint, &boox, bytes).unwrap()
+            prepare_original_registration(&config, &checkpoint, &boox, bytes, &boox_approval)
+                .unwrap()
         else {
             panic!("expected BOOX registration")
         };
@@ -611,9 +657,19 @@ mod tests {
         supernote.file.name = "Renamed Book.pdf".to_owned();
         supernote.file.size = bytes.len() as u64;
         supernote.file.parents = vec![config.supernote_folder_id.clone()];
-        let RegistrationDecision::Register(supernote_registration) =
-            prepare_original_registration(&config, &checkpoint, &supernote, bytes).unwrap()
-        else {
+        let supernote_approval = OriginalRegistrationApproval {
+            drive_file_id: supernote.file.file_id.clone(),
+            drive_file_version: supernote.file.version,
+            content_sha256: sha256_hex(bytes),
+        };
+        let RegistrationDecision::Register(supernote_registration) = prepare_original_registration(
+            &config,
+            &checkpoint,
+            &supernote,
+            bytes,
+            &supernote_approval,
+        )
+        .unwrap() else {
             panic!("expected Supernote registration")
         };
         assert_eq!(
@@ -627,5 +683,58 @@ mod tests {
             .unwrap();
         assert!(binding.boox_file_ids.contains("boox-new"));
         assert!(binding.supernote_file_ids.contains("supernote-new"));
+    }
+
+    #[test]
+    fn bound_file_moved_to_the_other_folder_is_not_ingested() {
+        let mut change = change("boox-file", "application/pdf");
+        change.file.parents = vec![config().supernote_folder_id];
+        assert!(matches!(
+            prepare_drive_input(
+                &config(),
+                &checkpoint(),
+                &change,
+                b"pdf ink",
+                CanonicalFrontier {
+                    revisions: RevisionPair::default()
+                }
+            )
+            .unwrap(),
+            DriveInputDecision::Ignore { .. }
+        ));
+    }
+
+    #[test]
+    fn registration_rejects_generated_or_unapproved_pdf() {
+        let config = config();
+        let checkpoint = DriveGatewayCheckpoint::empty();
+        let bytes = b"%PDF-clean";
+        let mut change = change("boox-new", "application/pdf");
+        change.file.size = bytes.len() as u64;
+        change.file.parents = vec![config.boox_folder_id.clone()];
+        let approval = OriginalRegistrationApproval {
+            drive_file_id: change.file.file_id.clone(),
+            drive_file_version: change.file.version,
+            content_sha256: sha256_hex(bytes),
+        };
+        change
+            .file
+            .app_properties
+            .insert(GENERATED_BY_PROPERTY.to_owned(), BROKER_PRODUCER.to_owned());
+        assert!(matches!(
+            prepare_original_registration(&config, &checkpoint, &change, bytes, &approval).unwrap(),
+            RegistrationDecision::Ignore { .. }
+        ));
+
+        change.file.app_properties.clear();
+        let stale_approval = OriginalRegistrationApproval {
+            content_sha256: "f".repeat(64),
+            ..approval
+        };
+        assert!(matches!(
+            prepare_original_registration(&config, &checkpoint, &change, bytes, &stale_approval)
+                .unwrap(),
+            RegistrationDecision::Ignore { .. }
+        ));
     }
 }
