@@ -704,7 +704,7 @@ mod tests {
                 &generated_change,
                 generated_bytes,
                 CanonicalFrontier {
-                    revisions: output.source_revisions.clone()
+                    revisions: output.source_revisions
                 }
             )
             .unwrap(),
