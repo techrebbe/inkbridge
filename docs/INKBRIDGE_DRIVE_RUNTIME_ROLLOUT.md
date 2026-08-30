@@ -32,9 +32,9 @@ Drive changes.list
   -> Firestore pending checkpoint (compare-and-swap)
   -> existing private broker processing
   -> accept/reject checkpoint
-  -> reserve broker delivery
+  -> pre-generate a Drive file ID and reserve it with the broker delivery
   -> query exact inkbridgeDeliveryId
-  -> Drive files.create or reconcile existing file
+  -> Drive files.create with the reserved ID or reconcile that exact file
   -> bind returned Drive file ID/version
   -> advance Drive page token
 ```
@@ -92,9 +92,13 @@ poller, a stale retry, or an operator edit therefore fails closed instead of
 overwriting a newer page token or output reservation.
 
 Pending inputs retain the exact immutable GCS path and generation. Pending
-outputs retain the exact broker-output GCS path and generation. Those fields
-allow a new container instance to resume after process termination without
-guessing which bytes it should deliver.
+outputs retain the exact broker-output GCS path and generation plus a Drive ID
+obtained from `files.generateIds`. Those fields allow a new container instance
+to resume after process termination without guessing which bytes it should
+deliver. The reserved ID is committed in Firestore before any external Drive
+create. Concurrent workers therefore use the same identity; Drive accepts at
+most one create, and a retry that receives HTTP 409 reads and verifies that
+exact file instead of creating a visible duplicate.
 
 ## Proposed deployment (later approval)
 
@@ -123,8 +127,10 @@ separate explicit approval.
   immutable generation.
 - If the broker commits before a crash, retry processes the pending event
   idempotently and recovers its generated view.
-- If Drive creates an output before checkpointing its file ID, retry queries
-  the exact private `inkbridgeDeliveryId` and binds the existing file.
+- If Drive creates an output before delivery completion is checkpointed, retry
+  queries the exact private `inkbridgeDeliveryId` and verifies the previously
+  reserved file ID. The same pre-generated ID makes concurrent or retried
+  creates idempotent at Drive as well as in Firestore.
 - If more than one Drive file claims the delivery ID, the job stops for repair.
 - If Firestore `updateTime` changes, the stale job stops without advancing the
   Drive token.

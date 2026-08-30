@@ -181,6 +181,7 @@ impl DriveGatewayCheckpoint {
                 ));
             }
             if !self.documents.contains_key(&pending.document_id)
+                || pending.drive_file_id.trim().is_empty()
                 || pending.gcs_object_path.trim().is_empty()
                 || pending.gcs_generation == 0
                 || pending.parent_folder_id.trim().is_empty()
@@ -463,6 +464,8 @@ pub struct BrokerDriveOutput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparedDriveOutput {
     pub delivery_id: String,
+    #[serde(default)]
+    pub drive_file_id: String,
     pub gcs_object_path: String,
     pub gcs_generation: u64,
     pub document_id: String,

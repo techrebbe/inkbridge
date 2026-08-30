@@ -59,6 +59,7 @@ pub trait DriveApi: Send + Sync {
     fn download(&self, file_id: &str) -> Result<Vec<u8>, String>;
     fn file_revision(&self, file_id: &str) -> Result<DriveFileRevision, String>;
     fn find_delivery(&self, delivery_id: &str) -> Result<Vec<DriveFileRevision>, String>;
+    fn generate_file_id(&self) -> Result<String, String>;
     fn create_delivery(
         &self,
         output: &PreparedDriveOutput,
@@ -127,6 +128,9 @@ pub trait BrokerPort: Send + Sync {
         evidence_generation: u64,
     ) -> Result<(), String>;
     fn frontier(&self, document_id: &str) -> Result<RevisionPair, String>;
+    fn frontier_if_exists(&self, document_id: &str) -> Result<Option<RevisionPair>, String> {
+        self.frontier(document_id).map(Some)
+    }
     fn process(&self, pending: &PendingDriveInput) -> Result<BrokerResult, String>;
 }
 
@@ -315,18 +319,14 @@ impl GatewayJob {
                                     if mode == RunMode::DryRun {
                                         validate_original_pdf(&bytes)
                                             .map_err(|error| error.to_string())?;
-                                        let frontier = if let Some(frontier) =
-                                            simulated_frontiers.get(&registration.document_id)
+                                        let frontier = match simulated_frontiers
+                                            .get(&registration.document_id)
                                         {
-                                            *frontier
-                                        } else if stored
-                                            .value
-                                            .documents
-                                            .contains_key(&registration.document_id)
-                                        {
-                                            self.broker.frontier(&registration.document_id)?
-                                        } else {
-                                            RevisionPair::default()
+                                            Some(frontier) => *frontier,
+                                            None => self
+                                                .broker
+                                                .frontier_if_exists(&registration.document_id)?
+                                                .unwrap_or_default(),
                                         };
                                         commit_original_registration(
                                             &mut stored.value,
@@ -619,7 +619,8 @@ impl GatewayJob {
     ) -> Result<VersionedCheckpoint, String> {
         match prepare_drive_output(&self.config, &stored.value, output)? {
             DriveOutputDecision::Duplicate { .. } => Ok(stored),
-            DriveOutputDecision::Reserve(prepared) => {
+            DriveOutputDecision::Reserve(mut prepared) => {
+                prepared.drive_file_id = self.drive.generate_file_id()?;
                 reserve_drive_output(&mut stored.value, &prepared)?;
                 Ok(stored)
             }
@@ -662,7 +663,23 @@ impl GatewayJob {
                             ));
                         }
                         let created = self.drive.create_delivery(&create, &object.bytes)?;
-                        (created.file_id, created.version)
+                        match reconcile_drive_output(
+                            &self.config,
+                            &stored.value,
+                            &create,
+                            std::slice::from_ref(&created),
+                        )? {
+                            DriveOutputDecision::Existing {
+                                drive_file_id,
+                                drive_file_version,
+                                ..
+                            } => (drive_file_id, drive_file_version),
+                            other => {
+                                return Err(format!(
+                                    "created Drive delivery failed reconciliation: {other:?}"
+                                ));
+                            }
+                        }
                     }
                     DriveOutputDecision::Existing {
                         drive_file_id,
@@ -763,10 +780,15 @@ impl CloudBrokerPort {
     }
 
     fn state(&self, document_id: &str) -> Result<CanonicalDocumentState, String> {
+        self.state_if_exists(document_id)?
+            .ok_or_else(|| format!("canonical state does not exist for {document_id}"))
+    }
+
+    fn state_if_exists(&self, document_id: &str) -> Result<Option<CanonicalDocumentState>, String> {
         let record = self.states.load(document_id)?;
-        let active = record
-            .active
-            .ok_or_else(|| format!("canonical state does not exist for {document_id}"))?;
+        let Some(active) = record.active else {
+            return Ok(None);
+        };
         let object = self
             .objects
             .read_generation(&active.payload.path, active.payload.generation)?
@@ -776,7 +798,9 @@ impl CloudBrokerPort {
                     active.payload.path, active.payload.generation
                 )
             })?;
-        serde_json::from_slice(&object.bytes).map_err(|error| error.to_string())
+        serde_json::from_slice(&object.bytes)
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 
     fn output_for_event(
@@ -855,6 +879,11 @@ impl BrokerPort for CloudBrokerPort {
 
     fn frontier(&self, document_id: &str) -> Result<RevisionPair, String> {
         self.state(document_id).map(|state| state.revisions())
+    }
+
+    fn frontier_if_exists(&self, document_id: &str) -> Result<Option<RevisionPair>, String> {
+        self.state_if_exists(document_id)
+            .map(|state| state.map(|state| state.revisions()))
     }
 
     fn process(&self, pending: &PendingDriveInput) -> Result<BrokerResult, String> {
@@ -940,7 +969,7 @@ mod tests {
     };
     use lopdf::{dictionary, Document, Object};
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -1026,7 +1055,9 @@ mod tests {
         current_revisions: Mutex<BTreeMap<String, DriveFileRevision>>,
         downloads: Mutex<BTreeMap<String, Vec<u8>>>,
         deliveries: Mutex<Vec<DriveFileRevision>>,
+        generated_ids: Mutex<usize>,
         creates: Mutex<usize>,
+        find_barrier: Option<Arc<Barrier>>,
     }
 
     impl FakeDrive {
@@ -1098,6 +1129,9 @@ mod tests {
         }
 
         fn find_delivery(&self, delivery_id: &str) -> Result<Vec<DriveFileRevision>, String> {
+            if let Some(barrier) = &self.find_barrier {
+                barrier.wait();
+            }
             Ok(self
                 .deliveries
                 .lock()
@@ -1113,14 +1147,28 @@ mod tests {
                 .collect())
         }
 
+        fn generate_file_id(&self) -> Result<String, String> {
+            let mut count = self.generated_ids.lock().unwrap();
+            *count += 1;
+            Ok(format!("generated-drive-file-{count}"))
+        }
+
         fn create_delivery(
             &self,
             output: &PreparedDriveOutput,
             bytes: &[u8],
         ) -> Result<DriveFileRevision, String> {
+            let mut deliveries = self.deliveries.lock().unwrap();
+            if let Some(existing) = deliveries
+                .iter()
+                .find(|file| file.file_id == output.drive_file_id)
+                .cloned()
+            {
+                return Ok(existing);
+            }
             *self.creates.lock().unwrap() += 1;
             let file = DriveFileRevision {
-                file_id: format!("created-{}", output.delivery_id),
+                file_id: output.drive_file_id.clone(),
                 name: output.file_name.clone(),
                 version: 9,
                 mime_type: if output.file_name.ends_with(".pdf") {
@@ -1133,7 +1181,7 @@ mod tests {
                 trashed: false,
                 app_properties: output.app_properties.clone(),
             };
-            self.deliveries.lock().unwrap().push(file.clone());
+            deliveries.push(file.clone());
             Ok(file)
         }
     }
@@ -1295,6 +1343,10 @@ mod tests {
             Ok(RevisionPair::default())
         }
 
+        fn frontier_if_exists(&self, _document_id: &str) -> Result<Option<RevisionPair>, String> {
+            Ok(None)
+        }
+
         fn process(&self, _pending: &PendingDriveInput) -> Result<BrokerResult, String> {
             let mut fail = self.fail_once.lock().unwrap();
             if *fail {
@@ -1332,6 +1384,15 @@ mod tests {
             Ok(RevisionPair::default())
         }
 
+        fn frontier_if_exists(&self, document_id: &str) -> Result<Option<RevisionPair>, String> {
+            Ok(self
+                .registered
+                .lock()
+                .unwrap()
+                .contains(document_id)
+                .then_some(RevisionPair::default()))
+        }
+
         fn process(&self, _pending: &PendingDriveInput) -> Result<BrokerResult, String> {
             Ok(BrokerResult {
                 disposition: BrokerDisposition::Accepted,
@@ -1355,6 +1416,10 @@ mod tests {
             Err("unregistered document has no frontier".to_owned())
         }
 
+        fn frontier_if_exists(&self, _document_id: &str) -> Result<Option<RevisionPair>, String> {
+            Ok(None)
+        }
+
         fn process(&self, _pending: &PendingDriveInput) -> Result<BrokerResult, String> {
             Err("unregistered document cannot process annotations".to_owned())
         }
@@ -1373,6 +1438,10 @@ mod tests {
 
         fn frontier(&self, _document_id: &str) -> Result<RevisionPair, String> {
             Ok(self.0)
+        }
+
+        fn frontier_if_exists(&self, _document_id: &str) -> Result<Option<RevisionPair>, String> {
+            Ok(Some(self.0))
         }
 
         fn process(&self, _pending: &PendingDriveInput) -> Result<BrokerResult, String> {
@@ -1474,6 +1543,77 @@ mod tests {
         assert_eq!(*drive.creates.lock().unwrap(), 1);
         assert!(checkpoints.value().pending_drive_outputs.is_empty());
         assert_eq!(checkpoints.value().delivered_broker_outputs.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_output_recovery_uses_one_pre_generated_drive_file() {
+        let output_bytes = b"supernote manifest";
+        let output_path = format!("Supernote_Folder/{}/incoming.json", document_id());
+        let output = BrokerDriveOutput {
+            gcs_object_path: output_path.clone(),
+            gcs_generation: 44,
+            document_id: document_id(),
+            target: DeviceSide::Supernote,
+            event_id: "concurrent-drive-event".to_owned(),
+            source_revisions: RevisionPair {
+                boox: 1,
+                supernote: 0,
+            },
+            content_sha256: sha256_hex(output_bytes),
+            file_extension: "json".to_owned(),
+        };
+        let mut initial = checkpoint();
+        let DriveOutputDecision::Reserve(mut prepared) =
+            prepare_drive_output(&config(), &initial, &output).unwrap()
+        else {
+            panic!("expected output reservation")
+        };
+        prepared.drive_file_id = "reserved-concurrent-drive-file".to_owned();
+        reserve_drive_output(&mut initial, &prepared).unwrap();
+
+        let drive = Arc::new(FakeDrive {
+            find_barrier: Some(Arc::new(Barrier::new(2))),
+            ..FakeDrive::default()
+        });
+        let checkpoints = Arc::new(FakeCheckpoints::new(initial));
+        let evidence = Arc::new(FakeEvidence::default());
+        evidence.insert(&output_path, output_bytes, 44);
+        let job = Arc::new(job(
+            drive.clone(),
+            checkpoints.clone(),
+            evidence,
+            Arc::new(FakeBroker {
+                fail_once: Mutex::new(false),
+                output: None,
+            }),
+        ));
+        let first_snapshot = checkpoints.load().unwrap();
+        let second_snapshot = first_snapshot.clone();
+
+        let first_job = job.clone();
+        let first = std::thread::spawn(move || {
+            first_job.recover_pending_outputs(first_snapshot, &mut RunReport::default())
+        });
+        let second_job = job.clone();
+        let second = std::thread::spawn(move || {
+            second_job.recover_pending_outputs(second_snapshot, &mut RunReport::default())
+        });
+        let results = [first.join().unwrap(), second.join().unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .any(|error| error.contains("stale checkpoint generation")));
+        assert_eq!(*drive.creates.lock().unwrap(), 1);
+        let deliveries = drive.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].file_id, "reserved-concurrent-drive-file");
+        drop(deliveries);
+        let checkpoint = checkpoints.value();
+        assert!(checkpoint.pending_drive_outputs.is_empty());
+        assert_eq!(checkpoint.delivered_broker_outputs.len(), 1);
     }
 
     #[test]
@@ -2132,6 +2272,90 @@ mod tests {
             .iter()
             .any(|action| action.contains("upload drive-v1-")));
         assert_eq!(checkpoints.value(), initial_checkpoint);
+    }
+
+    #[test]
+    fn dry_run_recovers_canonical_frontier_when_checkpoint_was_recreated() {
+        let original_bytes = original_pdf();
+        let artifact_bytes = br#"{"schemaVersion":1,"operations":[]}"#;
+        let document_id = inkbridge_broker::stable_document_id(&original_bytes);
+        let original = initial_pdf(
+            "z-supernote-original",
+            "supernote-folder-123",
+            &original_bytes,
+        );
+        let artifact = DriveFileRevision {
+            file_id: "a-supernote-artifact".to_owned(),
+            name: "native-export.json".to_owned(),
+            version: 1,
+            mime_type: "application/json".to_owned(),
+            parents: vec!["supernote-folder-123".to_owned()],
+            size: artifact_bytes.len() as u64,
+            trashed: false,
+            app_properties: BTreeMap::new(),
+        };
+        let frontier = RevisionPair {
+            boox: 7,
+            supernote: 4,
+        };
+        let drive = Arc::new(FakeDrive::default());
+        *drive.initial_files.lock().unwrap() = vec![artifact.clone(), original.clone()];
+        drive.downloads.lock().unwrap().extend([
+            (artifact.file_id.clone(), artifact_bytes.to_vec()),
+            (original.file_id.clone(), original_bytes.clone()),
+        ]);
+        let approvals = Arc::new(FakeApprovals::default());
+        approvals.values.lock().unwrap().extend([
+            (
+                original.file_id.clone(),
+                OnboardingApproval::Original {
+                    approval: OriginalRegistrationApproval {
+                        drive_file_id: original.file_id.clone(),
+                        drive_file_version: original.version,
+                        content_sha256: sha256_hex(&original_bytes),
+                    },
+                },
+            ),
+            (
+                artifact.file_id.clone(),
+                OnboardingApproval::DeviceArtifact {
+                    approval: DeviceArtifactBindingApproval {
+                        drive_file_id: artifact.file_id.clone(),
+                        drive_file_version: artifact.version,
+                        content_sha256: sha256_hex(artifact_bytes),
+                        document_id,
+                        source: DeviceSide::Supernote,
+                        based_on: frontier,
+                    },
+                },
+            ),
+        ]);
+        let checkpoints = Arc::new(FakeCheckpoints::new(DriveGatewayCheckpoint::empty()));
+        let job = GatewayJob::new(
+            config(),
+            drive,
+            checkpoints.clone(),
+            Arc::new(FakeEvidence::default()),
+            Arc::new(StaticFrontierBroker(frontier)),
+            approvals,
+        )
+        .unwrap();
+
+        let report = job.run_once(RunMode::DryRun).unwrap();
+
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("register approved original")));
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("bind approved device artifact")));
+        assert!(report
+            .dry_run_actions
+            .iter()
+            .any(|action| action.contains("upload drive-v1-")));
+        assert_eq!(checkpoints.value(), DriveGatewayCheckpoint::empty());
     }
 
     #[test]

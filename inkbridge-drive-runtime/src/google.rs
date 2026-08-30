@@ -310,6 +310,11 @@ struct StartPageToken {
     start_page_token: String,
 }
 
+#[derive(Deserialize)]
+struct GeneratedIds {
+    ids: Vec<String>,
+}
+
 impl GoogleDriveApi {
     pub fn new(transport: Arc<dyn HttpTransport>, tokens: Arc<dyn TokenProvider>) -> Self {
         Self {
@@ -533,6 +538,37 @@ impl DriveApi for GoogleDriveApi {
             .collect()
     }
 
+    fn generate_file_id(&self) -> Result<String, String> {
+        let response = self.transport.execute(HttpRequest {
+            method: "GET".to_owned(),
+            url: format!(
+                "{}/files/generateIds?count=1&space=drive&type=files",
+                self.api_base
+            ),
+            headers: self.headers()?,
+            body: HttpBody::empty(),
+        })?;
+        if response.status != 200 {
+            return Err(format!(
+                "Drive files.generateIds returned HTTP {}",
+                response.status
+            ));
+        }
+        let generated: GeneratedIds =
+            serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
+        match generated.ids.as_slice() {
+            [file_id]
+                if !file_id.is_empty()
+                    && file_id.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                    }) =>
+            {
+                Ok(file_id.clone())
+            }
+            _ => Err("Drive files.generateIds returned no single valid file ID".to_owned()),
+        }
+    }
+
     fn create_delivery(
         &self,
         output: &PreparedDriveOutput,
@@ -544,6 +580,7 @@ impl DriveApi for GoogleDriveApi {
             "application/json"
         };
         let metadata = serde_json::to_vec(&json!({
+            "id": output.drive_file_id,
             "name": output.file_name,
             "parents": [output.parent_folder_id],
             "appProperties": output.app_properties,
@@ -566,6 +603,9 @@ impl DriveApi for GoogleDriveApi {
             headers,
             body: HttpBody::bytes(metadata),
         })?;
+        if session.status == 409 {
+            return self.file_revision(&output.drive_file_id);
+        }
         if !matches!(session.status, 200 | 201) {
             return Err(format!(
                 "Drive resumable create session returned HTTP {}",
@@ -587,6 +627,9 @@ impl DriveApi for GoogleDriveApi {
             ]),
             body: HttpBody::bytes(bytes.to_vec()),
         })?;
+        if response.status == 409 {
+            return self.file_revision(&output.drive_file_id);
+        }
         if !matches!(response.status, 200 | 201) {
             return Err(format!(
                 "Drive file create returned HTTP {}",
@@ -595,7 +638,11 @@ impl DriveApi for GoogleDriveApi {
         }
         let file: DriveFileWire =
             serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;
-        file.into_revision()
+        let revision = file.into_revision()?;
+        if revision.file_id != output.drive_file_id {
+            return Err("Drive created a file with a different pre-generated ID".to_owned());
+        }
+        Ok(revision)
     }
 }
 
@@ -1041,7 +1088,7 @@ mod tests {
         transport.push(
             200,
             br#"{
-              "id":"created","name":"delivery.json","version":"4",
+              "id":"reserved-drive-id","name":"delivery.json","version":"4",
               "mimeType":"application/json","parents":["sn-folder"],
               "size":"3","trashed":false,
               "appProperties":{"inkbridgeDeliveryId":"delivery-1"}
@@ -1054,6 +1101,7 @@ mod tests {
         .with_endpoints("https://drive.example/v3", "https://upload.example/v3");
         let output = PreparedDriveOutput {
             delivery_id: "delivery-1".to_owned(),
+            drive_file_id: "reserved-drive-id".to_owned(),
             gcs_object_path: "Supernote_Folder/doc/view.json".to_owned(),
             gcs_generation: 5,
             document_id:
@@ -1072,12 +1120,79 @@ mod tests {
         };
 
         let created = api.create_delivery(&output, b"new").unwrap();
-        assert_eq!(created.file_id, "created");
+        assert_eq!(created.file_id, "reserved-drive-id");
         let requests = transport.requests.lock().unwrap();
         assert!(requests[0].url.contains("uploadType=resumable"));
-        assert!(String::from_utf8_lossy(requests[0].body.as_ref()).contains("inkbridgeDeliveryId"));
+        let metadata = String::from_utf8_lossy(requests[0].body.as_ref());
+        assert!(metadata.contains("inkbridgeDeliveryId"));
+        assert!(metadata.contains("reserved-drive-id"));
         assert_eq!(requests[1].url, "https://upload.example/session");
         assert_eq!(requests[1].body.as_ref(), b"new");
+    }
+
+    #[test]
+    fn drive_generates_one_reserved_file_id() {
+        let transport = Arc::new(RecordingTransport::default());
+        transport.push(200, br#"{"ids":["reserved-drive-id"]}"#);
+        let api = GoogleDriveApi::new(
+            transport.clone(),
+            Arc::new(StaticTokenProvider("drive-token".to_owned())),
+        )
+        .with_endpoints("https://drive.example/v3", "https://upload.example/v3");
+
+        assert_eq!(api.generate_file_id().unwrap(), "reserved-drive-id");
+        let requests = transport.requests.lock().unwrap();
+        assert!(requests[0]
+            .url
+            .ends_with("/files/generateIds?count=1&space=drive&type=files"));
+    }
+
+    #[test]
+    fn drive_create_conflict_recovers_the_pre_generated_file() {
+        let transport = Arc::new(RecordingTransport::default());
+        transport.push(409, br#"{"error":{"code":409}}"#);
+        transport.push(
+            200,
+            br#"{
+              "id":"reserved-drive-id","name":"delivery.json","version":"4",
+              "mimeType":"application/json","parents":["sn-folder"],
+              "size":"3","trashed":false,
+              "appProperties":{"inkbridgeDeliveryId":"delivery-1"}
+            }"#,
+        );
+        let api = GoogleDriveApi::new(
+            transport.clone(),
+            Arc::new(StaticTokenProvider("drive-token".to_owned())),
+        )
+        .with_endpoints("https://drive.example/v3", "https://upload.example/v3");
+        let output = PreparedDriveOutput {
+            delivery_id: "delivery-1".to_owned(),
+            drive_file_id: "reserved-drive-id".to_owned(),
+            gcs_object_path: "Supernote_Folder/doc/view.json".to_owned(),
+            gcs_generation: 5,
+            document_id:
+                "inkbridge-doc-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+            target: inkbridge_broker::DeviceSide::Supernote,
+            content_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            source_revisions: inkbridge_broker::RevisionPair::default(),
+            parent_folder_id: "sn-folder".to_owned(),
+            file_name: "delivery.json".to_owned(),
+            app_properties: BTreeMap::from([(
+                "inkbridgeDeliveryId".to_owned(),
+                "delivery-1".to_owned(),
+            )]),
+        };
+
+        let recovered = api.create_delivery(&output, b"new").unwrap();
+
+        assert_eq!(recovered.file_id, "reserved-drive-id");
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .url
+            .contains("/files/reserved%2Ddrive%2Did?fields="));
     }
 
     #[test]

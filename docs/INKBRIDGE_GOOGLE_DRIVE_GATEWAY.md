@@ -118,12 +118,16 @@ Each file carries private `appProperties` with the broker producer, source
 event, document ID, revision pair, content hash, Cloud Storage generation, and
 delivery ID. A repeated job recognizes the delivery ID and does nothing.
 
-Before calling `files.create`, the gateway durably reserves the delivery ID and
-queries Drive for that exact private property. Only a confirmed absence permits
-the create. If the process crashes after Drive creates the file but before the
-checkpoint records the returned identity, the retry reconciles and binds the
-existing file rather than creating a visible duplicate. Multiple matches fail
-closed for operator repair.
+Before calling `files.create`, the gateway obtains a pre-generated Drive file ID
+and durably reserves it together with the delivery ID. It then queries Drive for
+that exact private delivery property. Only a confirmed absence permits a
+create, and the create explicitly uses the reserved file ID. If two workers
+race after the same absence check, both therefore target the same Drive
+identity: at most one create succeeds, and the other recovers the exact
+reserved file on HTTP 409. If the process crashes after Drive creates the file
+but before checkpointing delivery completion, retry reconciles and binds that
+exact file rather than creating a visible duplicate. A different ID or multiple
+matching deliveries fail closed for operator repair.
 
 After Drive confirms or reconciliation recovers the create, the gateway records
 the returned file ID and version, binds that file to its document and target

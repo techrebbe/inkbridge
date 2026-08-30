@@ -729,6 +729,7 @@ pub fn prepare_drive_output(
     ]);
     let prepared = PreparedDriveOutput {
         delivery_id,
+        drive_file_id: String::new(),
         gcs_object_path: output.gcs_object_path.clone(),
         gcs_generation: output.gcs_generation,
         document_id: output.document_id.clone(),
@@ -740,13 +741,15 @@ pub fn prepare_drive_output(
         app_properties,
     };
     if let Some(pending) = checkpoint.pending_drive_outputs.get(&prepared.delivery_id) {
-        if pending != &prepared {
+        let mut expected = prepared;
+        expected.drive_file_id.clone_from(&pending.drive_file_id);
+        if pending != &expected {
             return Err(format!(
                 "pending Drive delivery {} has different content",
-                prepared.delivery_id
+                expected.delivery_id
             ));
         }
-        return Ok(DriveOutputDecision::Reconcile(prepared));
+        return Ok(DriveOutputDecision::Reconcile(pending.clone()));
     }
     Ok(DriveOutputDecision::Reserve(prepared))
 }
@@ -765,6 +768,9 @@ pub fn reserve_drive_output(
     output: &PreparedDriveOutput,
 ) -> Result<(), String> {
     checkpoint.validate()?;
+    if output.drive_file_id.trim().is_empty() {
+        return Err("Drive output must reserve a pre-generated file ID before create".to_owned());
+    }
     if checkpoint
         .delivered_broker_outputs
         .contains_key(&output.delivery_id)
@@ -816,7 +822,8 @@ pub fn reconcile_drive_output(
     match matching_files {
         [] => Ok(DriveOutputDecision::Create(output.clone())),
         [file] => {
-            if file.trashed
+            if file.file_id != output.drive_file_id
+                || file.trashed
                 || file.version == 0
                 || !file
                     .parents
@@ -854,6 +861,12 @@ pub fn commit_drive_output(
     checkpoint.validate()?;
     if drive_file_id.trim().is_empty() || drive_file_version == 0 {
         return Err("created Drive output identity is incomplete".to_owned());
+    }
+    if drive_file_id != output.drive_file_id {
+        return Err(format!(
+            "created Drive output {} does not use its reserved file ID",
+            output.delivery_id
+        ));
     }
     let delivered = DeliveredDriveOutput {
         delivery_id: output.delivery_id.clone(),
@@ -1479,13 +1492,14 @@ mod tests {
             file_extension: "pdf".to_owned(),
         };
         let mut checkpoint = checkpoint();
-        let DriveOutputDecision::Reserve(plan) =
+        let DriveOutputDecision::Reserve(mut plan) =
             prepare_drive_output(&config, &checkpoint, &output).unwrap()
         else {
             panic!("expected reservation")
         };
         assert_eq!(plan.parent_folder_id, config.boox_folder_id);
         assert_eq!(plan.app_properties[GENERATED_BY_PROPERTY], BROKER_PRODUCER);
+        plan.drive_file_id = "boox-created-file".to_owned();
         reserve_drive_output(&mut checkpoint, &plan).unwrap();
         assert_eq!(
             prepare_drive_output(&config, &checkpoint, &output).unwrap(),
@@ -1495,6 +1509,24 @@ mod tests {
             reconcile_drive_output(&config, &checkpoint, &plan, &[]).unwrap(),
             DriveOutputDecision::Create(plan.clone())
         );
+        let wrong_identity = DriveFileRevision {
+            file_id: "unexpected-drive-file".to_owned(),
+            name: plan.file_name.clone(),
+            version: 30,
+            mime_type: "application/pdf".to_owned(),
+            parents: vec![plan.parent_folder_id.clone()],
+            size: generated_bytes.len() as u64,
+            trashed: false,
+            app_properties: plan.app_properties.clone(),
+        };
+        assert!(reconcile_drive_output(&config, &checkpoint, &plan, &[wrong_identity]).is_err());
+        assert!(commit_drive_output(
+            &mut checkpoint,
+            &plan,
+            "unexpected-drive-file".to_owned(),
+            30,
+        )
+        .is_err());
         commit_drive_output(&mut checkpoint, &plan, "boox-created-file".to_owned(), 30).unwrap();
         commit_drive_output(&mut checkpoint, &plan, "boox-created-file".to_owned(), 30).unwrap();
         assert!(checkpoint
@@ -1569,11 +1601,12 @@ mod tests {
             file_extension: "pdf".to_owned(),
         };
         let mut checkpoint = checkpoint();
-        let DriveOutputDecision::Reserve(plan) =
+        let DriveOutputDecision::Reserve(mut plan) =
             prepare_drive_output(&config, &checkpoint, &output).unwrap()
         else {
             panic!("expected reservation")
         };
+        plan.drive_file_id = "first-created-drive-file".to_owned();
         reserve_drive_output(&mut checkpoint, &plan).unwrap();
         assert!(matches!(
             reconcile_drive_output(&config, &checkpoint, &plan, &[]).unwrap(),
