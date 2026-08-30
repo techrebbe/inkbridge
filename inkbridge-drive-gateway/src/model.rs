@@ -255,13 +255,11 @@ impl DriveGatewayCheckpoint {
                     "pending Drive input {event_id} does not match its file frontier"
                 ));
             }
-            let mut expected = pending.previous_frontier;
-            let next_revision = expected
-                .get(pending.source)
-                .checked_add(1)
-                .ok_or_else(|| format!("pending Drive input {event_id} revision overflow"))?;
-            expected.set(pending.source, next_revision);
-            if pending.proposed_frontier != expected {
+            if pending.proposed_frontier.get(pending.source)
+                <= pending.previous_frontier.get(pending.source)
+                || pending.proposed_frontier.get(pending.source.other())
+                    != pending.previous_frontier.get(pending.source.other())
+            {
                 return Err(format!(
                     "pending Drive input {event_id} has an invalid proposed frontier"
                 ));
@@ -303,6 +301,7 @@ pub struct PreparedDriveInput {
     pub source: DeviceSide,
     pub source_revision: u64,
     pub based_on: RevisionPair,
+    pub canonical_frontier: RevisionPair,
     pub payload_kind: DevicePayloadKind,
 }
 

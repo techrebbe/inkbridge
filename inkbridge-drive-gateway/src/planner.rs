@@ -30,7 +30,7 @@ pub fn prepare_drive_input(
     checkpoint: &DriveGatewayCheckpoint,
     change: &DriveChange,
     bytes: &[u8],
-    _frontier: CanonicalFrontier,
+    frontier: CanonicalFrontier,
 ) -> Result<DriveInputDecision, String> {
     config.validate()?;
     checkpoint.validate()?;
@@ -121,6 +121,7 @@ pub fn prepare_drive_input(
         .ok_or_else(|| "bound Drive file lacks an observed revision frontier".to_owned())?;
     let source_revision = based_on
         .get(source)
+        .max(frontier.revisions.get(source))
         .checked_add(1)
         .ok_or_else(|| "source revision overflow".to_owned())?;
     let side_folder = match source {
@@ -186,6 +187,7 @@ pub fn prepare_drive_input(
         source,
         source_revision,
         based_on,
+        canonical_frontier: frontier.revisions,
         payload_kind,
     }))
 }
@@ -218,13 +220,13 @@ pub fn commit_drive_input(
             input.drive_file_id
         ));
     }
-    if input.source_revision
-        != input
-            .based_on
-            .get(input.source)
-            .checked_add(1)
-            .ok_or_else(|| "source revision overflow".to_owned())?
-    {
+    let expected_source_revision = input
+        .based_on
+        .get(input.source)
+        .max(input.canonical_frontier.get(input.source))
+        .checked_add(1)
+        .ok_or_else(|| "source revision overflow".to_owned())?;
+    if input.source_revision != expected_source_revision {
         return Err("prepared Drive input has an invalid source revision".to_owned());
     }
     let current_file_frontier = checkpoint
@@ -1298,7 +1300,7 @@ mod tests {
         assert_eq!(user_edit.source, DeviceSide::Boox);
         assert_eq!(user_edit.document_id, document_id());
         assert_eq!(user_edit.based_on, output.source_revisions);
-        assert_eq!(user_edit.source_revision, output.source_revisions.boox + 1);
+        assert_eq!(user_edit.source_revision, 21);
     }
 
     #[test]

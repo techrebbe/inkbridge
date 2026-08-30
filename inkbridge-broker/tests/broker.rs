@@ -1747,6 +1747,66 @@ fn simultaneous_edits_preserve_incoming_input_as_conflict() {
 }
 
 #[test]
+fn delayed_older_same_side_edit_is_preserved_as_conflict() {
+    let mut harness = Harness::new();
+    for revision in 1..=3 {
+        let based_on = RevisionPair {
+            boox: revision - 1,
+            supernote: 0,
+        };
+        let pdf = write_boox_view(
+            &harness.original,
+            [stroke(
+                &format!("accepted-boox-{revision}"),
+                0.1 * revision as f64,
+                0.2,
+            )],
+        )
+        .unwrap();
+        let event = harness.event(
+            &format!("accepted-boox-{revision}"),
+            DeviceSide::Boox,
+            revision,
+            based_on,
+            pdf,
+        );
+        assert!(matches!(
+            harness
+                .broker
+                .process(&mut harness.storage, &event)
+                .unwrap(),
+            ProcessOutcome::Applied { .. }
+        ));
+    }
+
+    let delayed_edit = write_boox_view(
+        &harness.original,
+        [stroke("edit-from-older-delivery", 0.75, 0.65)],
+    )
+    .unwrap();
+    let event = harness.event(
+        "delayed-older-same-side-edit",
+        DeviceSide::Boox,
+        2,
+        RevisionPair {
+            boox: 1,
+            supernote: 0,
+        },
+        delayed_edit,
+    );
+    let outcome = harness
+        .broker
+        .process(&mut harness.storage, &event)
+        .unwrap();
+
+    assert!(matches!(outcome, ProcessOutcome::Conflict { .. }));
+    let state = harness.state();
+    assert_eq!(state.boox.revision, 3);
+    assert_eq!(state.conflicts.len(), 1);
+    assert_eq!(state.conflicts[0].event_id, "delayed-older-same-side-edit");
+}
+
+#[test]
 fn conflict_preserves_the_immutable_accepted_device_revision() {
     let mut harness = Harness::new();
     let initial = harness.event(

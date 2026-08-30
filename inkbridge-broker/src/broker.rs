@@ -243,10 +243,15 @@ impl Broker {
         }
         let current = state.revisions();
         let source_state = state.device(event.source);
+        if event.source_revision <= event.based_on.get(event.source) {
+            return Err(BrokerError::InvalidEvent(format!(
+                "source revision {} must be newer than based-on revision {}",
+                event.source_revision,
+                event.based_on.get(event.source)
+            )));
+        }
         if event.source_revision <= source_state.revision {
-            if event.source_revision == source_state.revision
-                && event.content_sha256 != source_state.content_sha256
-            {
+            if event.content_sha256 != source_state.content_sha256 {
                 return self.preserve_conflict(
                     storage,
                     state,
@@ -267,11 +272,16 @@ impl Broker {
                 event_id: event.event_id.clone(),
             });
         }
-        if event.source_revision != event.based_on.get(event.source) + 1 {
+        if event.based_on == current
+            && event.source_revision
+                != current.get(event.source).checked_add(1).ok_or_else(|| {
+                    BrokerError::InvalidEvent("source revision overflow".to_owned())
+                })?
+        {
             return Err(BrokerError::InvalidEvent(format!(
-                "source revision {} must immediately follow based-on revision {}",
+                "source revision {} must immediately follow current revision {}",
                 event.source_revision,
-                event.based_on.get(event.source)
+                current.get(event.source)
             )));
         }
         if event.based_on != current {

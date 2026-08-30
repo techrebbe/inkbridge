@@ -58,11 +58,14 @@ For every bound file revision it:
   matches its last accepted content;
 - derives an event ID from file ID, Drive version, and SHA-256 for real content
   revisions;
-- reads the broker's current revision frontier;
-- uses the bound file's durable observed revision frontier rather than the
-  broker's newest state, so an edit to an older delivery remains visibly stale;
-  after each accepted edit that file frontier advances on its source side, so
-  repeated edits uploaded before Eventarc catches up still chain sequentially;
+- reads the broker's current revision frontier while retaining the bound file's
+  durable observed frontier as the event's causal `basedOn` value;
+- allocates the source revision immediately after the newer of those two source
+  frontiers. An edit to an older delivery therefore remains visibly stale but
+  cannot be assigned a revision the broker would silently discard. The broker
+  preserves distinct late same-side evidence as a conflict; after each accepted
+  edit, that file frontier advances on its source side so repeated edits uploaded
+  before Eventarc catches up still chain sequentially;
 - creates an immutable object under `BOOX_Folder/` or `Supernote_Folder/` with
   the same metadata contract used by Eventarc;
 - records the event as pending only after the Cloud Storage create succeeds;
