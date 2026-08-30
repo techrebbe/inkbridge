@@ -104,7 +104,7 @@ pub struct DriveGatewayCheckpoint {
     #[serde(default)]
     pub processed_drive_events: BTreeSet<String>,
     #[serde(default)]
-    pub delivered_broker_outputs: BTreeSet<String>,
+    pub delivered_broker_outputs: BTreeMap<String, DeliveredDriveOutput>,
 }
 
 impl DriveGatewayCheckpoint {
@@ -154,6 +154,28 @@ impl DriveGatewayCheckpoint {
                         "Drive file {file_id} is bound to more than one document"
                     ));
                 }
+            }
+        }
+        for (delivery_id, delivery) in &self.delivered_broker_outputs {
+            if delivery_id != &delivery.delivery_id {
+                return Err(format!(
+                    "Drive delivery key {delivery_id} does not match {}",
+                    delivery.delivery_id
+                ));
+            }
+            if delivery.drive_file_version == 0 {
+                return Err(format!("Drive delivery {delivery_id} has version zero"));
+            }
+            let binding = self.documents.get(&delivery.document_id).ok_or_else(|| {
+                format!(
+                    "Drive delivery {delivery_id} references unbound document {}",
+                    delivery.document_id
+                )
+            })?;
+            if binding.side_for_file(&delivery.drive_file_id) != Some(delivery.target) {
+                return Err(format!(
+                    "Drive delivery {delivery_id} file is not bound to its target side"
+                ));
             }
         }
         Ok(())
@@ -232,9 +254,23 @@ pub struct BrokerDriveOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedDriveOutput {
     pub delivery_id: String,
+    pub document_id: String,
+    pub target: DeviceSide,
+    pub content_sha256: String,
     pub parent_folder_id: String,
     pub file_name: String,
     pub app_properties: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeliveredDriveOutput {
+    pub delivery_id: String,
+    pub drive_file_id: String,
+    pub drive_file_version: u64,
+    pub document_id: String,
+    pub target: DeviceSide,
+    pub content_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

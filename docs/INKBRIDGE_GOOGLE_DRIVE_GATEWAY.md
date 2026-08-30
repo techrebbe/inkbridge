@@ -77,9 +77,13 @@ Each file carries private `appProperties` with the broker producer, source
 event, document ID, revision pair, content hash, Cloud Storage generation, and
 delivery ID. A repeated job recognizes the delivery ID and does nothing.
 
-Changes carrying an InkBridge producer property are ignored on the inbound
-path. This prevents a broker output copied to Drive from re-entering the broker
-as a device edit.
+After Drive confirms the create, the gateway records the returned file ID and
+version, binds that file to its document and target device, and marks that exact
+generated revision as processed. This prevents the initial broker output from
+re-entering the broker. A later user edit of the same file has a new Drive
+version and content hash, so it enters the normal inbound path even though
+Drive preserves the private InkBridge properties. An unbound file carrying an
+InkBridge producer property is ignored rather than guessed or registered.
 
 ## Authentication and access boundary
 
@@ -130,4 +134,6 @@ cargo test -p inkbridge-drive-gateway
 Tests cover stable identity across rename, matching clean originals from both
 folders, duplicate Drive events, generated-output loop suppression, refusal to
 guess an unbound file from its name, create-only broker delivery, and explicit
-page-token commit.
+page-token commit. The outbound lifecycle test also proves that the exact
+created revision is suppressed while a subsequent device edit of the same
+Drive file is accepted under the original stable document identity.
