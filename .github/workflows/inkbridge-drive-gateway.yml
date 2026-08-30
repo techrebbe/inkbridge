@@ -1,0 +1,40 @@
+name: InkBridge Drive gateway
+
+on:
+  push:
+    branches: [master, "agent/google-drive-gateway", "feat/**"]
+    paths:
+      - "inkbridge-drive-gateway/**"
+      - "inkbridge-broker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docs/INKBRIDGE_GOOGLE_DRIVE_GATEWAY.md"
+      - ".github/workflows/inkbridge-drive-gateway.yml"
+  pull_request:
+    paths:
+      - "inkbridge-drive-gateway/**"
+      - "inkbridge-broker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docs/INKBRIDGE_GOOGLE_DRIVE_GATEWAY.md"
+      - ".github/workflows/inkbridge-drive-gateway.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy -p inkbridge-drive-gateway --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p inkbridge-drive-gateway
+

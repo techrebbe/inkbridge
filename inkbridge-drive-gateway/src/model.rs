@@ -1,0 +1,237 @@
+use inkbridge_broker::{DevicePayloadKind, DeviceSide, RevisionPair};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const DRIVE_GATEWAY_SCHEMA_VERSION: u32 = 1;
+pub const DRIVE_GATEWAY_PRODUCER: &str = "inkbridge-drive-gateway";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DriveGatewayConfig {
+    pub schema_version: u32,
+    pub boox_folder_id: String,
+    pub supernote_folder_id: String,
+}
+
+impl DriveGatewayConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != DRIVE_GATEWAY_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported Drive gateway schema version {}",
+                self.schema_version
+            ));
+        }
+        validate_drive_id("BOOX folder", &self.boox_folder_id)?;
+        validate_drive_id("Supernote folder", &self.supernote_folder_id)?;
+        if self.boox_folder_id == self.supernote_folder_id {
+            return Err("BOOX and Supernote Drive folders must be distinct".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn folder_id(&self, side: DeviceSide) -> &str {
+        match side {
+            DeviceSide::Boox => &self.boox_folder_id,
+            DeviceSide::Supernote => &self.supernote_folder_id,
+        }
+    }
+}
+
+fn validate_drive_id(label: &str, value: &str) -> Result<(), String> {
+    if value.len() < 10
+        || value.len() > 200
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(format!("{label} ID is invalid"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DriveFileRevision {
+    pub file_id: String,
+    pub name: String,
+    pub version: u64,
+    pub mime_type: String,
+    pub parents: Vec<String>,
+    pub size: u64,
+    #[serde(default)]
+    pub trashed: bool,
+    #[serde(default)]
+    pub app_properties: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DriveChange {
+    pub file: DriveFileRevision,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DocumentBinding {
+    pub document_id: String,
+    pub original_pdf_sha256: String,
+    #[serde(default)]
+    pub boox_file_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub supernote_file_ids: BTreeSet<String>,
+}
+
+impl DocumentBinding {
+    pub fn side_for_file(&self, file_id: &str) -> Option<DeviceSide> {
+        let boox = self.boox_file_ids.contains(file_id);
+        let supernote = self.supernote_file_ids.contains(file_id);
+        match (boox, supernote) {
+            (true, false) => Some(DeviceSide::Boox),
+            (false, true) => Some(DeviceSide::Supernote),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DriveGatewayCheckpoint {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub documents: BTreeMap<String, DocumentBinding>,
+    #[serde(default)]
+    pub processed_drive_events: BTreeSet<String>,
+    #[serde(default)]
+    pub delivered_broker_outputs: BTreeSet<String>,
+}
+
+impl DriveGatewayCheckpoint {
+    pub fn empty() -> Self {
+        Self {
+            schema_version: DRIVE_GATEWAY_SCHEMA_VERSION,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != DRIVE_GATEWAY_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported Drive gateway checkpoint schema version {}",
+                self.schema_version
+            ));
+        }
+        let mut all_file_ids = BTreeSet::new();
+        for (document_id, binding) in &self.documents {
+            if document_id != &binding.document_id {
+                return Err(format!(
+                    "document binding key {document_id} does not match {}",
+                    binding.document_id
+                ));
+            }
+            if !document_id.starts_with("inkbridge-doc-v1-")
+                || binding.original_pdf_sha256.len() != 64
+                || document_id != &format!("inkbridge-doc-v1-{}", binding.original_pdf_sha256)
+            {
+                return Err(format!("invalid stable document binding {document_id}"));
+            }
+            if !binding
+                .boox_file_ids
+                .is_disjoint(&binding.supernote_file_ids)
+            {
+                return Err(format!(
+                    "document {document_id} binds one Drive file to both devices"
+                ));
+            }
+            for file_id in binding
+                .boox_file_ids
+                .iter()
+                .chain(&binding.supernote_file_ids)
+            {
+                if !all_file_ids.insert(file_id) {
+                    return Err(format!(
+                        "Drive file {file_id} is bound to more than one document"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn binding_for_file(&self, file_id: &str) -> Option<&DocumentBinding> {
+        self.documents
+            .values()
+            .find(|binding| binding.side_for_file(file_id).is_some())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalFrontier {
+    pub revisions: RevisionPair,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedDriveInput {
+    pub drive_event_id: String,
+    pub gcs_object_path: String,
+    pub content_sha256: String,
+    pub metadata: BTreeMap<String, String>,
+    pub document_id: String,
+    pub source: DeviceSide,
+    pub source_revision: u64,
+    pub based_on: RevisionPair,
+    pub payload_kind: DevicePayloadKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriveInputDecision {
+    Ignore { reason: String },
+    Duplicate { drive_event_id: String },
+    Unbound { file_id: String },
+    Upload(PreparedDriveInput),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedOriginalRegistration {
+    pub drive_event_id: String,
+    pub drive_file_id: String,
+    pub source: DeviceSide,
+    pub document_id: String,
+    pub original_pdf_sha256: String,
+    pub gcs_object_path: String,
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistrationDecision {
+    Ignore { reason: String },
+    Duplicate { drive_event_id: String },
+    Register(PreparedOriginalRegistration),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrokerDriveOutput {
+    pub gcs_object_path: String,
+    pub gcs_generation: u64,
+    pub document_id: String,
+    pub target: DeviceSide,
+    pub event_id: String,
+    pub source_revisions: RevisionPair,
+    pub content_sha256: String,
+    pub file_extension: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedDriveOutput {
+    pub delivery_id: String,
+    pub parent_folder_id: String,
+    pub file_name: String,
+    pub app_properties: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriveOutputDecision {
+    Duplicate { delivery_id: String },
+    Create(PreparedDriveOutput),
+}
