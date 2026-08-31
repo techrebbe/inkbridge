@@ -104,26 +104,6 @@ export async function publishCurrentPageExport() {
     ? await collectCurrentVirtualSpread(
         representation,
         filePath,
-        async () => {
-          const revalidated = parseNativeJson(
-            await native.validateDocumentIdentity(
-              filePath,
-              identity.documentId,
-              nativeDescriptor,
-            ),
-            'validateDocumentIdentity before identity persistence',
-          );
-          requireSameDocumentId(identity.documentId, revalidated.documentId);
-          requireSameNativeViewport(
-            nativeViewport,
-            await currentNativeViewport(
-              native,
-              filePath,
-              representation,
-              nativeDescriptor,
-            ),
-          );
-        },
         nativeViewport.descriptor,
       )
     : await collectCurrentSupernotePage(identity.documentId);

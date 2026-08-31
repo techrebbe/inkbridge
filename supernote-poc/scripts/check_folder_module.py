@@ -152,7 +152,6 @@ def main() -> None:
             fail(f"embedded-manifest regression action is missing: {required}")
     for required in (
         "collectCurrentVirtualSpread(",
-        "validateDocumentIdentity before identity persistence",
         "const applied = await applyVirtualSpreadManifest(",
         "fixtureNativeDescriptor(representation)",
         "await currentNativeViewport(",
@@ -170,18 +169,18 @@ def main() -> None:
     ):
         if required not in build_script:
             fail(f"Virtual Spread package input is missing: {required}")
-    ordered(
-        app,
-        [
-            "collectCurrentVirtualSpread(",
-            "requireSameDocumentPath(expectedFilePath, filePath)",
-            "getCurrentFilePath before identity persistence",
-            "await revalidateDocumentIdentity()",
-            "getCurrentFilePath after identity validation",
-            "persist InkBridge stroke identities",
-        ],
-        "Virtual Spread identity persistence document revalidation",
-    )
+    virtual_spread_collection = app[
+        app.find("collectCurrentVirtualSpread(") : app.find("export async function exportCurrentSupernotePage")
+    ]
+    if "PluginFileAPI.modifyElements(" in virtual_spread_collection:
+        fail("Virtual Spread export must not rewrite native strokes merely to persist identity metadata")
+    for required in (
+        "stable identity fallback",
+        "representation.documentId",
+        "buildVirtualSpreadSnapshot(",
+    ):
+        if required not in virtual_spread_collection:
+            fail(f"non-mutating Virtual Spread identity fallback is missing: {required}")
     ordered(
         companion[companion.find(": await collectCurrentSupernotePage(identity.documentId)") :],
         [

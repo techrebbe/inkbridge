@@ -1,6 +1,6 @@
 # InkBridge Supernote native folder plugin
 
-Version 0.2.2 turns the proven native-stroke proof into the Supernote endpoint for the finalized
+Version 0.2.3 turns the proven native-stroke proof into the Supernote endpoint for the finalized
 folder transport. **Export InkBridge** atomically writes the current page snapshot, **Apply
 InkBridge Sync** applies the next incoming manifest and durably acknowledges it, and **InkBridge
 Status** reports synced, pending, conflict, or error. No logcat capture or document-specific plugin
@@ -50,10 +50,16 @@ current converter and native manifest application.
 The page payload also includes the source filename, page index and page pixel size.
 
 The legacy `exportCurrentSupernotePage()` helper can still emit numbered `INKBRIDGE_EXPORT` logcat
-chunks for regression diagnosis. The installed 0.2.2 toolbar uses the packaged, fail-closed native
+chunks for regression diagnosis. The installed 0.2.3 toolbar uses the packaged, fail-closed native
 folder module instead.
 
 The exported Supernote UUID is carried into the PDF annotation `/NM` identity. NeoReader preserved those values while editing imported `/Ink`, allowing the returned PDF to be matched back to the original Supernote elements.
+
+Virtual Spread export is intentionally read-only with respect to native ink. InkBridge preserves
+canonical IDs already attached to synchronized strokes and otherwise uses the Supernote element UUID
+as its stable local fallback. It must not call `modifyElements` merely to attach identity metadata:
+on landscape Virtual Spread pages, that firmware API can reinterpret returned EMR coordinates and
+physically transform an otherwise unchanged stroke.
 
 ## Generic manifest application
 

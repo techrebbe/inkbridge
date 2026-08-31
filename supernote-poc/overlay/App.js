@@ -422,7 +422,6 @@ export async function collectCurrentSupernotePage(expectedDocumentId = null) {
 export async function collectCurrentVirtualSpread(
   representation,
   expectedFilePath = null,
-  revalidateDocumentIdentity = null,
   nativeViewport = null,
 ) {
   const {filePath, page, pageSize} = await currentDocumentContext();
@@ -441,7 +440,6 @@ export async function collectCurrentVirtualSpread(
     .map((element, elementIndex) => ({element, elementIndex}))
     .filter(({element}) => element?.type === 0 && element?.stroke);
   const strokes = [];
-  const identityTags = [];
   let totalSamples = 0;
   for (const {element, elementIndex} of nativeStrokes) {
     const retained = parseUserData(element.userData);
@@ -472,15 +470,9 @@ export async function collectCurrentVirtualSpread(
       }
       if (typeof element.uuid !== 'string' || !element.uuid.trim()) {
         throw new Error(
-          'A native stroke has no UUID that InkBridge can persist as its stable identity.',
+          'A native stroke has no UUID that InkBridge can use as its stable identity fallback.',
         );
       }
-      element.userData = JSON.stringify({
-        inkBridgeOrigin: 'inkbridge-supernote-native',
-        sourceUuid: element.uuid,
-        documentId: representation.documentId,
-      });
-      identityTags.push(element);
     }
     const serialized = await serializeSupernoteStroke(
       element,
@@ -493,28 +485,6 @@ export async function collectCurrentVirtualSpread(
       totalSamples += serialized.samples.length;
       strokes.push(serialized);
     }
-  }
-  if (identityTags.length) {
-    if (typeof revalidateDocumentIdentity !== 'function') {
-      throw new Error(
-        'InkBridge cannot persist stable stroke identities without revalidating the original document.',
-      );
-    }
-    const currentBeforeIdentityWrite = await requireResult(
-      PluginCommAPI.getCurrentFilePath(),
-      'getCurrentFilePath before identity persistence',
-    );
-    requireSameDocumentPath(filePath, currentBeforeIdentityWrite);
-    await revalidateDocumentIdentity();
-    const currentAfterIdentityValidation = await requireResult(
-      PluginCommAPI.getCurrentFilePath(),
-      'getCurrentFilePath after identity validation',
-    );
-    requireSameDocumentPath(filePath, currentAfterIdentityValidation);
-    await requireResult(
-      PluginFileAPI.modifyElements(filePath, page, identityTags),
-      'persist InkBridge stroke identities',
-    );
   }
   const pages = buildVirtualSpreadSnapshot({
     representation,
