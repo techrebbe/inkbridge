@@ -28,12 +28,23 @@ remain hidden device-local cache artifacts. They are not uploaded to Drive.
    version is the clean original. Its approval records file ID, Drive version,
    and SHA-256; the background watcher cannot invent this approval.
 3. The gateway verifies byte length and that exact approval, rejects every
-   InkBridge-generated PDF, and submits a create-only registration object to
-   Cloud Storage.
+   InkBridge-generated PDF, submits a create-only registration object to Cloud
+   Storage, and synchronously requires the broker to parse and register that
+   exact immutable generation.
 4. Equal original bytes converge on one stable document ID even when the files
    have different names.
 5. Only after registration succeeds does the gateway persist each Drive file
    ID as the BOOX or Supernote representation of that document.
+
+The runtime captures its first Drive change cursor before enumerating both
+device folders, then processes that initial snapshot before saving the cursor.
+Approved originals are ordered ahead of dependent artifacts, independent of
+Drive file ordering. The checkpoint binds a Drive file only after the broker
+confirms the same document ID and original hash; malformed PDFs cannot leave a
+binding without canonical state.
+An exact approval is read from `inkbridgeDriveApprovals/<drive-file-id>` and is
+verified by the existing registration/association planner. An unapproved
+ordinary file blocks cursor advancement; it is never silently consumed.
 
 An already-annotated unbound PDF is not safe to auto-register because its byte
 hash no longer identifies the clean original. It requires explicit recovery or
@@ -54,6 +65,9 @@ filename.
 For every bound file revision it:
 
 - rejects incomplete downloads by comparing received bytes with Drive's size;
+- refetches the full Drive file metadata after each download and rejects the
+  bytes if version, size, parent, MIME type, deletion state or private
+  properties changed during transfer;
 - requires a bound file to remain directly in the configured folder for its
   device side;
 - suppresses metadata-only Drive versions when that file's downloaded SHA-256
@@ -104,12 +118,16 @@ Each file carries private `appProperties` with the broker producer, source
 event, document ID, revision pair, content hash, Cloud Storage generation, and
 delivery ID. A repeated job recognizes the delivery ID and does nothing.
 
-Before calling `files.create`, the gateway durably reserves the delivery ID and
-queries Drive for that exact private property. Only a confirmed absence permits
-the create. If the process crashes after Drive creates the file but before the
-checkpoint records the returned identity, the retry reconciles and binds the
-existing file rather than creating a visible duplicate. Multiple matches fail
-closed for operator repair.
+Before calling `files.create`, the gateway obtains a pre-generated Drive file ID
+and durably reserves it together with the delivery ID. It then queries Drive for
+that exact private delivery property. Only a confirmed absence permits a
+create, and the create explicitly uses the reserved file ID. If two workers
+race after the same absence check, both therefore target the same Drive
+identity: at most one create succeeds, and the other recovers the exact
+reserved file on HTTP 409. If the process crashes after Drive creates the file
+but before checkpointing delivery completion, retry reconciles and binds that
+exact file rather than creating a visible duplicate. A different ID or multiple
+matching deliveries fail closed for operator repair.
 
 After Drive confirms or reconciliation recovers the create, the gateway records
 the returned file ID and version, binds that file to its document and target
@@ -141,13 +159,17 @@ screen.
 
 ## Deployment sequence
 
-The present crate is storage-independent planning logic. The reviewed rollout
-is intentionally split:
+The storage-independent planning crate is now wrapped by the separately
+packaged `inkbridge-drive-runtime` Cloud Run Job. The job remains undeployed and
+defaults to dry-run. See `INKBRIDGE_DRIVE_RUNTIME_ROLLOUT.md` for the exact
+durability sequence, configuration, and later approval gates. The reviewed
+rollout remains intentionally split:
 
 1. merge deterministic registration, inbound, outbound, idempotency, and loop
    prevention rules;
-2. add Drive/Cloud Storage/Firestore/Secret Manager adapters and a Cloud Run
-   Job that scales to zero between polls;
+2. add Drive/Cloud Storage/Firestore/Secret Manager adapters and a default-safe
+   Cloud Run Job package that scales to zero between polls (implemented, not
+   deployed);
 3. add Scheduler with a conservative interval and a lease so only one poller
    owns a checkpoint;
 4. authorize the owner account once, store the refresh token in Secret Manager,

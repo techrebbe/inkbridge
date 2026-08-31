@@ -7,6 +7,7 @@ COPY inkbridge-convert ./inkbridge-convert
 COPY inkbridge-broker ./inkbridge-broker
 COPY inkbridge-cloud-runtime ./inkbridge-cloud-runtime
 COPY inkbridge-drive-gateway ./inkbridge-drive-gateway
+COPY inkbridge-drive-runtime ./inkbridge-drive-runtime
 COPY inkbridge-folder-transport ./inkbridge-folder-transport
 COPY inkbridge-boox-native ./inkbridge-boox-native
 

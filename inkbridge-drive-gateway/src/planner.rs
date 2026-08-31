@@ -208,7 +208,11 @@ fn supported_payload_kind(source: DeviceSide, mime_type: &str) -> Option<DeviceP
 pub fn commit_drive_input(
     checkpoint: &mut DriveGatewayCheckpoint,
     input: &PreparedDriveInput,
+    gcs_generation: u64,
 ) -> Result<(), String> {
+    if gcs_generation == 0 {
+        return Err("Drive input evidence generation must be nonzero".to_owned());
+    }
     let binding = checkpoint
         .binding_for_file(&input.drive_file_id)
         .ok_or_else(|| format!("unbound Drive input file {}", input.drive_file_id))?;
@@ -242,6 +246,8 @@ pub fn commit_drive_input(
     let pending = PendingDriveInput {
         drive_event_id: input.drive_event_id.clone(),
         drive_file_id: input.drive_file_id.clone(),
+        gcs_object_path: input.gcs_object_path.clone(),
+        gcs_generation,
         document_id: input.document_id.clone(),
         source: input.source,
         content_sha256: input.content_sha256.clone(),
@@ -723,6 +729,9 @@ pub fn prepare_drive_output(
     ]);
     let prepared = PreparedDriveOutput {
         delivery_id,
+        drive_file_id: String::new(),
+        gcs_object_path: output.gcs_object_path.clone(),
+        gcs_generation: output.gcs_generation,
         document_id: output.document_id.clone(),
         target: output.target,
         content_sha256: output.content_sha256.clone(),
@@ -732,13 +741,15 @@ pub fn prepare_drive_output(
         app_properties,
     };
     if let Some(pending) = checkpoint.pending_drive_outputs.get(&prepared.delivery_id) {
-        if pending != &prepared {
+        let mut expected = prepared;
+        expected.drive_file_id.clone_from(&pending.drive_file_id);
+        if pending != &expected {
             return Err(format!(
                 "pending Drive delivery {} has different content",
-                prepared.delivery_id
+                expected.delivery_id
             ));
         }
-        return Ok(DriveOutputDecision::Reconcile(prepared));
+        return Ok(DriveOutputDecision::Reconcile(pending.clone()));
     }
     Ok(DriveOutputDecision::Reserve(prepared))
 }
@@ -757,6 +768,9 @@ pub fn reserve_drive_output(
     output: &PreparedDriveOutput,
 ) -> Result<(), String> {
     checkpoint.validate()?;
+    if output.drive_file_id.trim().is_empty() {
+        return Err("Drive output must reserve a pre-generated file ID before create".to_owned());
+    }
     if checkpoint
         .delivered_broker_outputs
         .contains_key(&output.delivery_id)
@@ -808,7 +822,8 @@ pub fn reconcile_drive_output(
     match matching_files {
         [] => Ok(DriveOutputDecision::Create(output.clone())),
         [file] => {
-            if file.trashed
+            if file.file_id != output.drive_file_id
+                || file.trashed
                 || file.version == 0
                 || !file
                     .parents
@@ -846,6 +861,12 @@ pub fn commit_drive_output(
     checkpoint.validate()?;
     if drive_file_id.trim().is_empty() || drive_file_version == 0 {
         return Err("created Drive output identity is incomplete".to_owned());
+    }
+    if drive_file_id != output.drive_file_id {
+        return Err(format!(
+            "created Drive output {} does not use its reserved file ID",
+            output.delivery_id
+        ));
     }
     let delivered = DeliveredDriveOutput {
         delivery_id: output.delivery_id.clone(),
@@ -1047,7 +1068,7 @@ mod tests {
         else {
             panic!("expected upload")
         };
-        commit_drive_input(&mut checkpoint, &input).unwrap();
+        commit_drive_input(&mut checkpoint, &input, 11).unwrap();
         assert_eq!(
             prepare_drive_input(&config(), &checkpoint, &change, bytes, frontier.clone()).unwrap(),
             DriveInputDecision::Deferred {
@@ -1091,7 +1112,7 @@ mod tests {
         .unwrap() else {
             panic!("expected pending edit")
         };
-        commit_drive_input(&mut checkpoint, &pending).unwrap();
+        commit_drive_input(&mut checkpoint, &pending, 12).unwrap();
 
         let mut reverted_change = pending_change;
         reverted_change.file.version += 1;
@@ -1291,7 +1312,7 @@ mod tests {
         .unwrap() else {
             panic!("expected initial content revision")
         };
-        commit_drive_input(&mut checkpoint, &input).unwrap();
+        commit_drive_input(&mut checkpoint, &input, 13).unwrap();
         accept_drive_input(&mut checkpoint, &input.drive_event_id).unwrap();
 
         let mut renamed = original_change;
@@ -1328,7 +1349,7 @@ mod tests {
             panic!("expected first upload")
         };
         assert_eq!(first.source_revision, 5);
-        commit_drive_input(&mut checkpoint, &first).unwrap();
+        commit_drive_input(&mut checkpoint, &first, 14).unwrap();
         assert_eq!(checkpoint.file_observed_frontiers["boox-file"].boox, 4);
 
         let second_bytes = b"pdf ink plus another stroke";
@@ -1358,7 +1379,7 @@ mod tests {
         assert_eq!(second.based_on.boox, 5);
         assert_eq!(second.based_on.supernote, 2);
         assert_eq!(second.source_revision, 6);
-        commit_drive_input(&mut checkpoint, &second).unwrap();
+        commit_drive_input(&mut checkpoint, &second, 15).unwrap();
         assert_eq!(checkpoint.file_observed_frontiers["boox-file"].boox, 5);
         accept_drive_input(&mut checkpoint, &second.drive_event_id).unwrap();
         assert_eq!(checkpoint.file_observed_frontiers["boox-file"].boox, 6);
@@ -1390,7 +1411,7 @@ mod tests {
         .unwrap() else {
             panic!("expected BOOX upload")
         };
-        commit_drive_input(&mut checkpoint, &boox).unwrap();
+        commit_drive_input(&mut checkpoint, &boox, 16).unwrap();
 
         let DriveInputDecision::Upload(supernote) = prepare_drive_input(
             &config,
@@ -1431,7 +1452,7 @@ mod tests {
         .unwrap() else {
             panic!("expected first upload")
         };
-        commit_drive_input(&mut checkpoint, &first).unwrap();
+        commit_drive_input(&mut checkpoint, &first, 17).unwrap();
         reject_drive_input(&mut checkpoint, &first.drive_event_id).unwrap();
         assert_eq!(checkpoint.file_observed_frontiers["boox-file"], base);
 
@@ -1458,7 +1479,7 @@ mod tests {
         let config = config();
         let generated_bytes = b"generated view";
         let output = BrokerDriveOutput {
-            gcs_object_path: "BOOX_Folder/doc/view.pdf".to_owned(),
+            gcs_object_path: format!("BOOX_Folder/{}/view.pdf", document_id()),
             gcs_generation: 29,
             document_id: document_id(),
             target: DeviceSide::Boox,
@@ -1471,13 +1492,14 @@ mod tests {
             file_extension: "pdf".to_owned(),
         };
         let mut checkpoint = checkpoint();
-        let DriveOutputDecision::Reserve(plan) =
+        let DriveOutputDecision::Reserve(mut plan) =
             prepare_drive_output(&config, &checkpoint, &output).unwrap()
         else {
             panic!("expected reservation")
         };
         assert_eq!(plan.parent_folder_id, config.boox_folder_id);
         assert_eq!(plan.app_properties[GENERATED_BY_PROPERTY], BROKER_PRODUCER);
+        plan.drive_file_id = "boox-created-file".to_owned();
         reserve_drive_output(&mut checkpoint, &plan).unwrap();
         assert_eq!(
             prepare_drive_output(&config, &checkpoint, &output).unwrap(),
@@ -1487,6 +1509,24 @@ mod tests {
             reconcile_drive_output(&config, &checkpoint, &plan, &[]).unwrap(),
             DriveOutputDecision::Create(plan.clone())
         );
+        let wrong_identity = DriveFileRevision {
+            file_id: "unexpected-drive-file".to_owned(),
+            name: plan.file_name.clone(),
+            version: 30,
+            mime_type: "application/pdf".to_owned(),
+            parents: vec![plan.parent_folder_id.clone()],
+            size: generated_bytes.len() as u64,
+            trashed: false,
+            app_properties: plan.app_properties.clone(),
+        };
+        assert!(reconcile_drive_output(&config, &checkpoint, &plan, &[wrong_identity]).is_err());
+        assert!(commit_drive_output(
+            &mut checkpoint,
+            &plan,
+            "unexpected-drive-file".to_owned(),
+            30,
+        )
+        .is_err());
         commit_drive_output(&mut checkpoint, &plan, "boox-created-file".to_owned(), 30).unwrap();
         commit_drive_output(&mut checkpoint, &plan, "boox-created-file".to_owned(), 30).unwrap();
         assert!(checkpoint
@@ -1548,7 +1588,7 @@ mod tests {
     fn retry_reconciles_a_drive_create_that_crashed_before_commit() {
         let config = config();
         let output = BrokerDriveOutput {
-            gcs_object_path: "BOOX_Folder/doc/reconcile.pdf".to_owned(),
+            gcs_object_path: format!("BOOX_Folder/{}/reconcile.pdf", document_id()),
             gcs_generation: 31,
             document_id: document_id(),
             target: DeviceSide::Boox,
@@ -1561,11 +1601,12 @@ mod tests {
             file_extension: "pdf".to_owned(),
         };
         let mut checkpoint = checkpoint();
-        let DriveOutputDecision::Reserve(plan) =
+        let DriveOutputDecision::Reserve(mut plan) =
             prepare_drive_output(&config, &checkpoint, &output).unwrap()
         else {
             panic!("expected reservation")
         };
+        plan.drive_file_id = "first-created-drive-file".to_owned();
         reserve_drive_output(&mut checkpoint, &plan).unwrap();
         assert!(matches!(
             reconcile_drive_output(&config, &checkpoint, &plan, &[]).unwrap(),
@@ -1699,7 +1740,7 @@ mod tests {
         .unwrap() else {
             panic!("expected first BOOX edit")
         };
-        commit_drive_input(&mut checkpoint, &edit).unwrap();
+        commit_drive_input(&mut checkpoint, &edit, 18).unwrap();
         accept_drive_input(&mut checkpoint, &edit.drive_event_id).unwrap();
         assert_eq!(checkpoint.file_observed_frontiers["boox-new"].boox, 1);
 

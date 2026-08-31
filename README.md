@@ -17,6 +17,8 @@
 > [docs/INKBRIDGE_FOLDER_TRANSPORT.md](docs/INKBRIDGE_FOLDER_TRANSPORT.md).
 > The planned Google Drive user transport and its canonical-boundary rules are in
 > [docs/INKBRIDGE_GOOGLE_DRIVE_GATEWAY.md](docs/INKBRIDGE_GOOGLE_DRIVE_GATEWAY.md).
+> Its default-dry-run Cloud Run Job package and later deployment gates are in
+> [docs/INKBRIDGE_DRIVE_RUNTIME_ROLLOUT.md](docs/INKBRIDGE_DRIVE_RUNTIME_ROLLOUT.md).
 > The schema-v3 adapter scaffold and remaining production gates for Supernote Virtual Spread are recorded in
 > [docs/INKBRIDGE_VIRTUAL_SPREAD_PREP.md](docs/INKBRIDGE_VIRTUAL_SPREAD_PREP.md).
 
