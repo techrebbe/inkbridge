@@ -85,5 +85,9 @@ jobs:
         run: grep -q 'default *= *false' variables.tf
       - name: Test disabled, guard, bootstrap, and runtime stages without credentials
         run: terraform test
+      - name: Verify Drive secrets and execution remain out of band
+        run: |
+          ! grep -R 'resource "google_cloud_scheduler_job"' .
+          ! grep -R 'resource "google_secret_manager_secret_version"' .
       - name: Verify real deployments declare a remote backend
         run: grep -q 'backend "gcs"' versions.tf

@@ -1088,6 +1088,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkbridge-drive-gateway"
+version = "1.0.1"
+dependencies = [
+ "inkbridge-broker",
+ "serde",
+]
+
+[[package]]
+name = "inkbridge-drive-runtime"
+version = "1.0.1"
+dependencies = [
+ "base64",
+ "inkbridge-broker",
+ "inkbridge-cloud-runtime",
+ "inkbridge-drive-gateway",
+ "lopdf",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "inkbridge-folder-transport"
 version = "1.0.1"
 dependencies = [

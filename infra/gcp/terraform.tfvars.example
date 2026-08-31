@@ -14,6 +14,19 @@ cloud_build_source_bucket_name = "replace-with-globally-unique-build-source-buck
 artifact_repository = "inkbridge"
 cloud_run_image      = ""
 
+# Google Drive gateway. Empty image keeps the job absent. Once configured, the
+# job is still manual and non-mutating until the separate apply acknowledgement
+# is supplied. Keep real folder IDs and operator details in a private tfvars file.
+drive_runtime_image                 = ""
+drive_runtime_operator              = ""
+drive_boox_folder_id                = ""
+drive_supernote_folder_id           = ""
+drive_checkpoint_id                 = "primary"
+drive_oauth_client_secret_id        = "inkbridge-drive-oauth-client"
+drive_refresh_token_secret_id       = "inkbridge-drive-refresh-token"
+drive_runtime_apply_mode            = false
+drive_runtime_apply_acknowledgement = ""
+
 # Optional alert only. A budget does not cap or stop spending.
 monthly_budget_usd = 0
 billing_account   = ""

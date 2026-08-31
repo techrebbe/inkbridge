@@ -61,6 +61,19 @@ impl fmt::Display for BrokerError {
 
 impl std::error::Error for BrokerError {}
 
+pub fn validate_original_pdf(original_pdf: &[u8]) -> Result<usize, BrokerError> {
+    let original_document = lopdf::Document::load_mem(original_pdf).map_err(|error| {
+        BrokerError::InvalidEvent(format!("immutable original is not a readable PDF: {error}"))
+    })?;
+    let original_page_count = original_document.get_pages().len();
+    if original_page_count == 0 {
+        return Err(BrokerError::InvalidEvent(
+            "immutable original PDF must contain at least one page".to_owned(),
+        ));
+    }
+    Ok(original_page_count)
+}
+
 pub struct Broker {
     pub(crate) normalized_y_offset: f64,
 }
@@ -92,16 +105,7 @@ impl Broker {
             ));
         }
         // Parsing now prevents registering a hash-stable but unusable original.
-        let original_document = lopdf::Document::load_mem(original_pdf).map_err(|error| {
-            BrokerError::InvalidEvent(format!("immutable original is not a readable PDF: {error}"))
-        })?;
-        let original_page_count = original_document.get_pages().len();
-        if original_page_count == 0 {
-            return Err(BrokerError::InvalidEvent(
-                "immutable original PDF must contain at least one page".to_owned(),
-            ));
-        }
-        drop(original_document);
+        let original_page_count = validate_original_pdf(original_pdf)?;
         let document_id = stable_document_id(original_pdf);
         let original_path = original_path(&document_id);
         let state_path = state_path(&document_id);
@@ -243,10 +247,15 @@ impl Broker {
         }
         let current = state.revisions();
         let source_state = state.device(event.source);
+        if event.source_revision <= event.based_on.get(event.source) {
+            return Err(BrokerError::InvalidEvent(format!(
+                "source revision {} must be newer than based-on revision {}",
+                event.source_revision,
+                event.based_on.get(event.source)
+            )));
+        }
         if event.source_revision <= source_state.revision {
-            if event.source_revision == source_state.revision
-                && event.content_sha256 != source_state.content_sha256
-            {
+            if event.content_sha256 != source_state.content_sha256 {
                 return self.preserve_conflict(
                     storage,
                     state,
@@ -267,11 +276,26 @@ impl Broker {
                 event_id: event.event_id.clone(),
             });
         }
-        if event.source_revision != event.based_on.get(event.source) + 1 {
+        let expected_next = current
+            .get(event.source)
+            .checked_add(1)
+            .ok_or_else(|| BrokerError::InvalidEvent("source revision overflow".to_owned()))?;
+        let follows_preserved_predecessor = event.source_revision > expected_next
+            && event
+                .source_revision
+                .checked_sub(1)
+                .is_some_and(|predecessor_revision| {
+                    event.based_on.get(event.source) == predecessor_revision
+                        && state.conflicts.iter().any(|conflict| {
+                            conflict.source == event.source
+                                && conflict.source_revision == predecessor_revision
+                        })
+                });
+        if event.source_revision != expected_next && !follows_preserved_predecessor {
             return Err(BrokerError::InvalidEvent(format!(
-                "source revision {} must immediately follow based-on revision {}",
+                "source revision {} must immediately follow current revision {} or a preserved predecessor conflict",
                 event.source_revision,
-                event.based_on.get(event.source)
+                current.get(event.source)
             )));
         }
         if event.based_on != current {

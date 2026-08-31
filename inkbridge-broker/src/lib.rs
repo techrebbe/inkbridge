@@ -6,7 +6,8 @@ mod pdf_view;
 mod storage;
 
 pub use broker::{
-    boox_view_path, original_path, state_path, supernote_manifest_path, Broker, BrokerError,
+    boox_view_path, original_path, state_path, supernote_manifest_path, validate_original_pdf,
+    Broker, BrokerError,
 };
 pub use conflict::conflict_resolution_path;
 pub use model::*;

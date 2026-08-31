@@ -37,3 +37,26 @@ output "folder_transport_service_account" {
   description = "Read-only bucket identity with create-only writes restricted to BOOX_Folder/ and Supernote_Folder/."
   value       = local.enabled ? google_service_account.folder_transport[0].email : null
 }
+
+output "drive_runtime_stage" {
+  description = "disabled, bootstrap, dry-run, or apply according to the guarded Drive job inputs."
+  value       = local.drive_runtime_stage
+}
+
+output "drive_runtime_job" {
+  description = "Private, manually invoked Drive gateway Cloud Run Job after a real apply."
+  value       = local.drive_runtime_enabled ? google_cloud_run_v2_job.drive_runtime[0].name : null
+}
+
+output "drive_runtime_service_account" {
+  description = "Least-privilege identity used only by the Drive gateway job."
+  value       = local.enabled ? google_service_account.drive_runtime[0].email : null
+}
+
+output "drive_runtime_secret_ids" {
+  description = "Secret Manager container IDs. Secret versions are deliberately outside Terraform."
+  value = local.enabled ? {
+    oauth_client  = google_secret_manager_secret.drive_oauth_client[0].secret_id
+    refresh_token = google_secret_manager_secret.drive_refresh_token[0].secret_id
+  } : null
+}
