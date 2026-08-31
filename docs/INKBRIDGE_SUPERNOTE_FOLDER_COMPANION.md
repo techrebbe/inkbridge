@@ -68,11 +68,13 @@ another private file transport.
   The transport rejects an older snapshot if a manifest was delivered or applied before upload;
   tapping Export again produces a fresh snapshot at the new frontier.
   Strokes inserted by InkBridge retain the canonical broker UUID stored in their native user data.
-  On the first Virtual Spread export, the plugin also persists a document-bound InkBridge tag on
-  each otherwise-untagged native stroke. Later exports therefore retain the first chosen identity
-  even if the Supernote host changes its own UUID after reopening. Unknown third-party `userData`
-  fails closed instead of being overwritten. This keeps later moves and deletions attached to the
-  same cross-device identity.
+  Otherwise, export uses the Supernote element UUID as the stable native fallback without modifying
+  the stroke. Unknown third-party `userData` fails closed instead of being overwritten. Virtual
+  Spread export must remain read-only: on the tested landscape page, sending an unchanged element
+  back through `modifyElements` solely to attach metadata caused the firmware to reinterpret its EMR
+  coordinates and physically transform the stroke. If future firmware stops retaining native UUIDs,
+  InkBridge must add a separate durable identity ledger with conservative geometry reconciliation;
+  it must not restore the destructive metadata-write path.
 - **Apply InkBridge Sync** reads the oldest unacknowledged `*.operations.json`, applies its moves,
   insertions, and deletions through the official Supernote element API, reloads the document, and
   only then publishes a durable acknowledgement. The folder transport prefixes delivered files
