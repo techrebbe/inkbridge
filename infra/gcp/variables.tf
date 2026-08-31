@@ -41,7 +41,7 @@ variable "cloud_build_source_bucket_name" {
 }
 
 variable "cloud_run_image" {
-  description = "Immutable linux/amd64 Artifact Registry digest. Empty performs the bootstrap stage without Cloud Run or Eventarc."
+  description = "Immutable linux/amd64 broker Artifact Registry digest. Empty performs the bootstrap stage without the broker Cloud Run service or Eventarc."
   type        = string
   default     = ""
 
@@ -51,6 +51,107 @@ variable "cloud_run_image" {
       can(regex("^[a-z0-9-]+-docker\\.pkg\\.dev/[^/]+/[^/]+/[^@]+@sha256:[0-9a-f]{64}$", var.cloud_run_image))
     )
     error_message = "cloud_run_image must be empty for bootstrap or an immutable Artifact Registry @sha256 digest."
+  }
+}
+
+variable "drive_runtime_image" {
+  description = "Immutable linux/amd64 Drive gateway Artifact Registry digest. Empty omits the Cloud Run Job."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.drive_runtime_image == "" ||
+      can(regex("^[a-z0-9-]+-docker\\.pkg\\.dev/[^/]+/[^/]+/[^@]+@sha256:[0-9a-f]{64}$", var.drive_runtime_image))
+    )
+    error_message = "drive_runtime_image must be empty for bootstrap or an immutable Artifact Registry @sha256 digest."
+  }
+}
+
+variable "drive_runtime_apply_mode" {
+  description = "False keeps the Cloud Run Job in non-mutating dry-run mode. True requires a separate acknowledgement."
+  type        = bool
+  default     = false
+}
+
+variable "drive_runtime_apply_acknowledgement" {
+  description = "Must equal the documented acknowledgement before the Drive job template can include --apply."
+  type        = string
+  default     = ""
+}
+
+variable "drive_runtime_operator" {
+  description = "Operator IAM member allowed to execute the private Drive Cloud Run Job."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.drive_runtime_operator == "" ||
+      can(regex("^(user|group):[^[:space:]@]+@[^[:space:]@]+$", var.drive_runtime_operator))
+    )
+    error_message = "drive_runtime_operator must be empty or a user:/group: IAM member."
+  }
+}
+
+variable "drive_boox_folder_id" {
+  description = "Exact Google Drive file ID of the BOOX device folder. Kept in private tfvars, never inferred from its name."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.drive_boox_folder_id == "" ||
+      can(regex("^[A-Za-z0-9_-]+$", var.drive_boox_folder_id))
+    )
+    error_message = "drive_boox_folder_id must be empty or a Google Drive file ID."
+  }
+}
+
+variable "drive_supernote_folder_id" {
+  description = "Exact Google Drive file ID of the Supernote device folder. Kept in private tfvars, never inferred from its name."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.drive_supernote_folder_id == "" ||
+      can(regex("^[A-Za-z0-9_-]+$", var.drive_supernote_folder_id))
+    )
+    error_message = "drive_supernote_folder_id must be empty or a Google Drive file ID."
+  }
+}
+
+variable "drive_checkpoint_id" {
+  description = "Firestore document ID for the durable Google Drive page-token and pending-work checkpoint."
+  type        = string
+  default     = "primary"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]{1,128}$", var.drive_checkpoint_id))
+    error_message = "drive_checkpoint_id must be a nonempty Firestore-safe identifier."
+  }
+}
+
+variable "drive_oauth_client_secret_id" {
+  description = "Secret Manager container ID for the OAuth client JSON. Terraform never manages a secret version."
+  type        = string
+  default     = "inkbridge-drive-oauth-client"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]{1,255}$", var.drive_oauth_client_secret_id))
+    error_message = "drive_oauth_client_secret_id must be a valid Secret Manager secret ID."
+  }
+}
+
+variable "drive_refresh_token_secret_id" {
+  description = "Secret Manager container ID for the owner's Drive refresh token. Terraform never manages a secret version."
+  type        = string
+  default     = "inkbridge-drive-refresh-token"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]{1,255}$", var.drive_refresh_token_secret_id))
+    error_message = "drive_refresh_token_secret_id must be a valid Secret Manager secret ID."
   }
 }
 
