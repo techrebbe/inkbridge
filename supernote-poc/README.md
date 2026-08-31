@@ -1,6 +1,6 @@
 # InkBridge Supernote native folder plugin
 
-Version 0.2.3 turns the proven native-stroke proof into the Supernote endpoint for the finalized
+Version 0.2.6 turns the proven native-stroke proof into the Supernote endpoint for the finalized
 folder transport. **Export InkBridge** atomically writes the current page snapshot, **Apply
 InkBridge Sync** applies the next incoming manifest and durably acknowledges it, and **InkBridge
 Status** reports synced, pending, conflict, or error. No logcat capture or document-specific plugin
@@ -17,6 +17,15 @@ certificate, the authenticated representation request, response envelope, canoni
 bytes, and activation evidence before JavaScript derives the inverse. Page dimensions or aspect
 ratio are never treated as proof of the reader's rotation, inset, or PDF placement. An unavailable
 or stale provider record fails closed and leaves the folder delivery retryable.
+Native element points are normalized from each stroke's own `maxX`/`maxY` EMR metadata rather than
+assuming the ordinary PDF page range. This preserves Supernote's wider composed-page EMR range on
+Virtual Spread while mapping the result into the provider-authorized page canvas; using
+`getPageSize()` with the standard point helper mis-scales otherwise valid strokes and can falsely
+classify them as crossing a page margin. The plugin-preview firmware does not expose the newer
+`getPageDisplaySize()` API, so this element-carried range is also the compatible authority.
+Virtual Spread insertion fails closed when a page has no native stroke from which that EMR range
+can be established; a later cache-hydration provider extension must supply equivalent authenticated
+range authority before an entirely empty regenerated page can be populated.
 Manifests spanning several physical spreads are applied one currently authorized spread at a
 time, with destination insertions completed before explicit deletions. Durable cache-path-bound
 progress survives reloads and power loss, and the original manifest is not acknowledged until all
@@ -50,7 +59,7 @@ current converter and native manifest application.
 The page payload also includes the source filename, page index and page pixel size.
 
 The legacy `exportCurrentSupernotePage()` helper can still emit numbered `INKBRIDGE_EXPORT` logcat
-chunks for regression diagnosis. The installed 0.2.3 toolbar uses the packaged, fail-closed native
+chunks for regression diagnosis. The installed 0.2.6 toolbar uses the packaged, fail-closed native
 folder module instead.
 
 The exported Supernote UUID is carried into the PDF annotation `/NM` identity. NeoReader preserved those values while editing imported `/Ink`, allowing the returned PDF to be matched back to the original Supernote elements.

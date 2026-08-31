@@ -45,6 +45,7 @@ cp "$ROOT/overlay/folderCompanion.js" "$PROJECT/folderCompanion.js"
 cp "$ROOT/overlay/virtualSpreadAdapterCore.js" "$PROJECT/virtualSpreadAdapterCore.js"
 cp "$ROOT/overlay/nativeViewportProviderCore.js" "$PROJECT/nativeViewportProviderCore.js"
 cp "$ROOT/overlay/virtualSpreadFixture.js" "$PROJECT/virtualSpreadFixture.js"
+cp "$ROOT/overlay/emrPointSpaceCore.js" "$PROJECT/emrPointSpaceCore.js"
 if [[ -n "$MANIFEST_PATH" ]]; then
   node "$ROOT/embed-manifest.mjs" "$MANIFEST_PATH" "$PROJECT/generatedManifest.js"
 else

@@ -41,6 +41,9 @@ def main() -> None:
     )
     companion = (root / "overlay" / "folderCompanion.js").read_text(encoding="utf-8")
     app = (root / "overlay" / "App.js").read_text(encoding="utf-8")
+    manifest_apply = (root / "overlay" / "manifestApply.js").read_text(
+        encoding="utf-8"
+    )
     index = (root / "overlay" / "index.js").read_text(encoding="utf-8")
     build_script = (root / "build.sh").read_text(encoding="utf-8")
 
@@ -166,6 +169,7 @@ def main() -> None:
         'cp "$ROOT/overlay/virtualSpreadAdapterCore.js"',
         'cp "$ROOT/overlay/nativeViewportProviderCore.js"',
         'cp "$ROOT/overlay/virtualSpreadFixture.js"',
+        'cp "$ROOT/overlay/emrPointSpaceCore.js"',
     ):
         if required not in build_script:
             fail(f"Virtual Spread package input is missing: {required}")
@@ -174,6 +178,16 @@ def main() -> None:
     ]
     if "PluginFileAPI.modifyElements(" in virtual_spread_collection:
         fail("Virtual Spread export must not rewrite native strokes merely to persist identity metadata")
+    if "normalizedEmrPoint(point, source)" not in app:
+        fail("Virtual Spread export must use each native stroke's authoritative EMR range")
+    if "PluginCommAPI.getPageDisplaySize()" in app:
+        fail("plugin-preview firmware does not expose getPageDisplaySize")
+    for required in (
+        "requireEmrRangeForInsertion(emrRange)",
+        "requireNativeEmrRangeForInsertions",
+    ):
+        if required not in manifest_apply:
+            fail(f"Virtual Spread insertion EMR guard is missing: {required}")
     for required in (
         "stable identity fallback",
         "representation.documentId",

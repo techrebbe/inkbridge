@@ -18,6 +18,12 @@ import {
   requireCompatibleTargetFileName,
   requireSameDocumentPath,
 } from './folderCompanionCore';
+import {
+  commonElementEmrRange,
+  emrPointFromSample,
+  normalizedEmrPoint,
+  requireEmrRangeForInsertion,
+} from './emrPointSpaceCore';
 import {manifestToVirtualSpread} from './virtualSpreadAdapterCore';
 
 async function requireResult(promise, label) {
@@ -33,10 +39,14 @@ function basename(path) {
   return slash >= 0 ? path.slice(slash + 1) : path;
 }
 
-function samplesToEmr(samples, pageSize, normalizedYOffset) {
-  const maxX = Math.max(1, pageSize.width - 1);
-  const maxY = Math.max(1, pageSize.height - 1);
-  return samples.map(([normalizedX, normalizedY]) => {
+function samplesToEmr(samples, pageSize, normalizedYOffset, emrRange = null) {
+  return samples.map(sample => {
+    if (emrRange) {
+      return emrPointFromSample(sample, emrRange, normalizedYOffset);
+    }
+    const [normalizedX, normalizedY] = sample;
+    const maxX = Math.max(1, pageSize.width - 1);
+    const maxY = Math.max(1, pageSize.height - 1);
     const pixel = {
       x: Math.max(0, Math.min(maxX, normalizedX * maxX)),
       y: Math.max(
@@ -63,13 +73,11 @@ async function serializeNativeStroke(element, pageSize, pageIndex) {
     pressureCount > 0
       ? await element.stroke.pressures.getRange(0, pressureCount)
       : [];
-  const maxX = Math.max(1, pageSize.width - 1);
-  const maxY = Math.max(1, pageSize.height - 1);
   const samples = emrPoints.map((point, index) => {
-    const pixel = PointUtils.emrPoint2Android(point, pageSize);
+    const normalized = normalizedEmrPoint(point, element);
     return [
-      Math.max(0, Math.min(1, pixel.x / maxX)),
-      Math.max(0, Math.min(1, pixel.y / maxY)),
+      normalized[0],
+      normalized[1],
       Math.max(
         0,
         Math.min(4096, Math.round(nativePressures[index] ?? nativePressures[0] ?? 1024)),
@@ -186,6 +194,7 @@ function findSupersededTarget(described, operation, current, previousTarget) {
 
 async function prepareNativeStroke({
   pageSize,
+  emrRange,
   snapshot,
   yOffset,
   manifestId,
@@ -210,7 +219,12 @@ async function prepareNativeStroke({
     manifestId,
   });
 
-  const points = samplesToEmr(snapshot.samples, pageSize, yOffset);
+  const points = samplesToEmr(
+    snapshot.samples,
+    pageSize,
+    yOffset,
+    emrRange,
+  );
   const pressures = samplePressures(snapshot.samples);
   const pointsOk = await target.stroke.points.setRange(
     0,
@@ -273,6 +287,7 @@ async function applyPage({
   yOffset,
   manifestId,
   counts,
+  requireNativeEmrRangeForInsertions,
 }) {
   const pageSize = await requireResult(
     PluginFileAPI.getPageSize(filePath, pageIndex),
@@ -283,6 +298,7 @@ async function applyPage({
       PluginFileAPI.getElements(pageIndex, filePath),
       `getElements page ${pageIndex + 1}`,
     )) ?? [];
+  const emrRange = commonElementEmrRange(elements);
   const described = await describeElements(elements, pageSize, pageIndex);
   const insertions = [];
   const deletions = [];
@@ -321,9 +337,13 @@ async function applyPage({
       continue;
     }
 
+    const insertionEmrRange = requireNativeEmrRangeForInsertions
+      ? requireEmrRangeForInsertion(emrRange)
+      : emrRange;
     insertions.push(
       await prepareNativeStroke({
         pageSize,
+        emrRange: insertionEmrRange,
         snapshot: operation.after,
         yOffset,
         manifestId,
@@ -379,6 +399,7 @@ export async function applyManifest(
   expectedFilePath = null,
   stableIdentityValidated = false,
   reloadAfterApply = true,
+  requireNativeEmrRangeForInsertions = false,
 ) {
   const manifest = validateManifest(inputManifest);
   const filePath = await requireResult(
@@ -410,6 +431,7 @@ export async function applyManifest(
         yOffset,
         manifestId: manifest.manifestId,
         counts,
+        requireNativeEmrRangeForInsertions,
       });
     }
   }
@@ -477,5 +499,6 @@ export async function applyVirtualSpreadManifest(
     filePath,
     true,
     reloadAfterApply,
+    true,
   );
 }

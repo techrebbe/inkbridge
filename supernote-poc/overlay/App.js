@@ -13,6 +13,7 @@ import {
   buildVirtualSpreadSnapshot,
   nativeViewportForVirtualSpread,
 } from './virtualSpreadAdapterCore';
+import {normalizedEmrPoint} from './emrPointSpaceCore';
 
 const OFFSET_X_PX = 80;
 const OFFSET_Y_PX = 50;
@@ -326,7 +327,6 @@ export async function applyBooxReturnTest() {
 async function serializeSupernoteStroke(
   source,
   elementIndex,
-  pageSize,
   page,
   expectedDocumentId = null,
 ) {
@@ -342,13 +342,11 @@ async function serializeSupernoteStroke(
     ? sourcePressures
     : new Array(pointCount).fill(sourcePressures[0] ?? 1024);
 
-  const maxPixelX = Math.max(1, pageSize.width - 1);
-  const maxPixelY = Math.max(1, pageSize.height - 1);
   const samples = emrPoints.map((point, index) => {
-    const pixel = PointUtils.emrPoint2Android(point, pageSize);
+    const normalized = normalizedEmrPoint(point, source);
     return [
-      Math.max(0, Math.min(1, pixel.x / maxPixelX)),
-      Math.max(0, Math.min(1, pixel.y / maxPixelY)),
+      normalized[0],
+      normalized[1],
       Math.max(0, Math.min(4096, Math.round(pressures[index] ?? 1024))),
     ];
   });
@@ -387,7 +385,6 @@ export async function collectCurrentSupernotePage(expectedDocumentId = null) {
     const serialized = await serializeSupernoteStroke(
       element,
       elementIndex,
-      pageSize,
       page,
       expectedDocumentId,
     );
@@ -477,7 +474,6 @@ export async function collectCurrentVirtualSpread(
     const serialized = await serializeSupernoteStroke(
       element,
       elementIndex,
-      pageSize,
       page,
       representation.documentId,
     );
