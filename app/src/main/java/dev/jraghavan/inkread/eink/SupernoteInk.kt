@@ -6,24 +6,30 @@ import android.os.Parcel
 import android.util.Log
 
 /**
- * Supernote firmware HandWrite-ink client (RR19). Talks to the firmware's pen daemon over the
- * `service_myservice` Binder: the firmware paints stylus ink straight to the EPDC overlay at
- * sub-frame latency, so the app NEVER renders the live stroke — it only claims the pen, sets the
- * nib, and clears the overlay. Proven reachable from a sideloaded app (penspike Route 5, on a
- * Nomad). Reflection/binder throughout; never throws across the boundary (RR21-FR3).
+ * Firmware handwriting entry point used by ReaderActivity.
  *
- * Clean-room (RR18): the contract is reproduced from plateaukao's AGPL-3 sources
+ * The historic class name is retained to keep the reader shell unchanged, but this object now
+ * dispatches to the BOOX [TouchHelper]-backed [BooxInk] implementation when running on a BOOX device.
+ * Everywhere else it preserves the original Supernote HandWriteClient Binder path below.
+ *
+ * Supernote path (RR19): talks to the firmware's pen daemon over `service_myservice`. The firmware
+ * paints stylus ink straight to the EPDC overlay at sub-frame latency, so the app never renders the
+ * live stroke itself — it only claims the pen, sets the nib, and clears the overlay.
+ *
+ * Clean-room (RR18): the Supernote Binder contract is reproduced from plateaukao's AGPL-3 sources
  * (supernote_draw/SupernoteInk.kt and koreader pencil.koplugin/lib/supernote_ink.lua), which
- * reimplement Ratta's HandWriteClient. Both are AGPL-3, so this is license-clean; only the
- * documented binder contract (service name, interface token, tx codes, parcel layout) is
- * reproduced — no decompiled Ratta bytes. IR-7: this vendor code lives in the Kotlin shell.
+ * reimplement Ratta's HandWriteClient. Only the documented binder contract is reproduced — no
+ * decompiled Ratta bytes. Vendor code stays in the Kotlin shell (IR-7).
  */
 class SupernoteInk(private val context: Context) {
+
+    private val useBoox = BooxInk.isBooxDevice()
+    private var boox: BooxInk? = null
 
     private var cached: IBinder? = null
     private var active = false
 
-    /** Resolve (and cache) the firmware binder via the hidden ServiceManager.getService. */
+    /** Resolve (and cache) the Supernote firmware binder via hidden ServiceManager.getService. */
     private fun binder(): IBinder? {
         cached?.let { if (it.isBinderAlive) return it }
         cached = try {
@@ -37,9 +43,40 @@ class SupernoteInk(private val context: Context) {
         return cached
     }
 
-    fun isAvailable(): Boolean = binder() != null
+    private fun booxBackend(): BooxInk? {
+        if (!useBoox) return null
+        boox?.let { return it }
+        val surface = FirmwareInkSurface.current() ?: run {
+            Log.w(TAG, "BOOX detected but reader SurfaceView is not attached yet")
+            return null
+        }
+        return BooxInk(
+            surface,
+            object : BooxInk.Listener {
+                override fun onBooxPenStroke(samples: List<BooxInk.Sample>) {
+                    // PR #2 proves device selection + native wet ink. The next slice routes these
+                    // completed raw samples into the existing Rust-owned portable ink model.
+                    Log.i(TAG, "BOOX raw pen stroke captured: ${samples.size} samples")
+                }
 
-    /** Run a transaction: interface-token + app-name preamble, then [write] the per-call ints. */
+                override fun onBooxEraserGesture(samples: List<BooxInk.Sample>) {
+                    Log.i(TAG, "BOOX raw eraser gesture captured: ${samples.size} samples")
+                }
+
+                override fun onBooxInkStatus(message: String) {
+                    Log.i(TAG, message)
+                }
+            },
+        ).also { boox = it }
+    }
+
+    fun isAvailable(): Boolean = if (useBoox) {
+        FirmwareInkSurface.current() != null
+    } else {
+        binder() != null
+    }
+
+    /** Run a Supernote transaction: interface-token + app-name preamble, then per-call ints. */
     private fun send(code: Int, write: (Parcel) -> Unit) {
         val b = binder() ?: return
         val data = Parcel.obtain()
@@ -57,7 +94,7 @@ class SupernoteInk(private val context: Context) {
         }
     }
 
-    /** Reflection: getSystemService("eink").enableFullUiAuto(boolean) — paint ink for our window. */
+    /** Supernote reflection: getSystemService("eink").enableFullUiAuto(boolean). */
     private fun enableFullUiAuto(enable: Boolean) {
         try {
             val eink = context.getSystemService("eink") ?: return
@@ -68,40 +105,36 @@ class SupernoteInk(private val context: Context) {
         }
     }
 
-    /**
-     * Claim the pen and turn on firmware ink for our window. Idempotent — safe to call on every
-     * focus gain (the firmware resets ownership when another window takes focus). Returns whether
-     * the firmware binder was reachable.
-     */
+    /** Claim the device-native pen path. Idempotent and safe to call on every focus gain. */
     fun setup(): Boolean {
+        if (useBoox) return booxBackend()?.setup() == true
+
         if (binder() == null) return false
         send(TX_WRITE_APP_INFO) { it.writeInt(0); it.writeInt(0) }
         enableFullUiAuto(true)
         send(TX_DISABLE_AREA) { it.writeInt(0) } // no disabled areas
         send(TX_PEN) { it.writeInt(PEN_NEEDLE); it.writeInt(SIZE_EMR); it.writeInt(COLOR_BLACK) }
         active = true
-        Log.i(TAG, "firmware ink claimed (pen=needle)")
+        Log.i(TAG, "Supernote firmware ink claimed (pen=needle)")
         return true
     }
 
-    /** Clear the firmware ink overlay (e.g. on page change so ink doesn't bleed to the next page). */
+    /** Clear transient firmware ink before a page/tool transition. */
     fun clearAll() {
+        if (useBoox) {
+            boox?.clearAll()
+            return
+        }
         if (!active) return
         send(TX_DRAW_BUFFER) { it.writeInt(255); it.writeInt(0) }
     }
 
-    /**
-     * Enable/disable firmware EMR ink painting over the whole window (RR19 / lasso UX). This is the
-     * control Ratta's own lasso uses (`HandWriteClient.sendWritable`) to stop the EMR pen so it can
-     * draw a dashed marquee itself — and it works for a sideloaded app because it rides the
-     * reachable `service_myservice` binder, NOT the SELinux-gated `EinkManager.enableFullUiAuto`
-     * (which is a silent no-op for an untrusted app — the reason toggling it never suppressed ink).
-     *
-     * It sends the "disable-area" transaction (same code as [TX_DISABLE_AREA]) with ONE sentinel
-     * rect: `(0,0,18888,18888)` re-enables ink everywhere, `(0,0,19999,19999)` disables it
-     * everywhere. Each rect is 5 ints `[left, top, width, height, 0]`.
-     */
+    /** Enable/disable firmware pen painting over the reader surface. */
     fun setWritable(enable: Boolean) {
+        if (useBoox) {
+            booxBackend()?.setWritable(enable)
+            return
+        }
         if (!active) return
         val edge = if (enable) WRITABLE_ON_EDGE else WRITABLE_OFF_EDGE
         send(TX_DISABLE_AREA) {
@@ -110,17 +143,22 @@ class SupernoteInk(private val context: Context) {
         }
     }
 
-    /** Release the firmware ink claim and clear the overlay. */
+    /** Release the device-native ink path and clear any transient overlay. */
     fun teardown() {
+        if (useBoox) {
+            boox?.teardown()
+            boox = null
+            return
+        }
         if (!active) return
         clearAll()
         enableFullUiAuto(false)
         active = false
-        Log.i(TAG, "firmware ink released")
+        Log.i(TAG, "Supernote firmware ink released")
     }
 
     private companion object {
-        const val TAG = "SupernoteInk"
+        const val TAG = "FirmwareInk"
         val SERVICE_NAMES = arrayOf("service_myservice", "service.myservice")
         const val IFACE_TOKEN = "android.demo.IMyService"
         const val APP_NAME = "inkread"

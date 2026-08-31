@@ -54,6 +54,10 @@ class SupernoteEinkAdapter : EinkAdapter {
 
     override fun attachView(view: View?) {
         this.view = view
+        // ReaderActivity already calls this seam for the panel-owning SurfaceView. Reuse that hand-off
+        // so a BOOX firmware-ink backend can bind TouchHelper to the exact same surface without putting
+        // vendor-specific setup into the Activity itself.
+        FirmwareInkSurface.attach(view)
         if (view == null) refreshHandler.removeCallbacks(coalescedFrame) // no panel to push to
     }
 

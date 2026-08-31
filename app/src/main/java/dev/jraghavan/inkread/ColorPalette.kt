@@ -9,6 +9,7 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import dev.jraghavan.inkread.eink.FirmwareInkStyle
 
 /**
  * A color-swatch **column** (ADR-INKREAD-0010 — NeoReader's brush "Colors" row): a vertical stack of
@@ -48,6 +49,20 @@ class ColorPalette(
      * chosen index. Never auto-dismisses: the caller hides it only on a tool switch.
      */
     fun show(title: String, colors: IntArray, names: Array<String>, selected: Int, onPick: (Int) -> Unit) {
+        // The original highlighter green (#9CCC65) is a very light yellow-green. On the Note Air 4C
+        // Kaleido panel it collapses visually into the default yellow highlighter even after a full
+        // repaint. Use Onyx's own saturated pen green (#00B036) at the same 50% alpha so the portable
+        // stored colour remains unambiguously green on colour e-ink as well as conventional displays.
+        if (title == "Highlighter") {
+            val greenIndex = names.indexOf("Green")
+            if (greenIndex >= 0 && greenIndex < colors.size) colors[greenIndex] = 0x00B03680
+        }
+
+        // BOOX TouchHelper owns the Pen's low-latency wet-ink layer. Keep its transient colour in sync
+        // with the portable/core colour selected by the user; Highlighter draws its own app overlay.
+        val syncNativePenColor = title == "Pen"
+        if (syncNativePenColor) colors.getOrNull(selected)?.let(FirmwareInkStyle::setPenColorPacked)
+
         // Already mounted for this same palette → restyle in place, no remove/add (no EPD churn).
         if (panel != null && colors.contentEquals(palette)) {
             restyle(selected)
@@ -65,6 +80,7 @@ class ColorPalette(
         col.addView(Ink.eyebrow(activity, title).apply { setPadding(0, 0, 0, Ink.dp(8)) })
         colors.forEachIndexed { i, c ->
             col.addView(swatchCell(c, names.getOrElse(i) { "" }, i == selected) {
+                if (syncNativePenColor) FirmwareInkStyle.setPenColorPacked(c)
                 onPick(i)
                 restyle(i) // update the ring in place — DON'T remove/re-add (that wipes the ink)
             })
