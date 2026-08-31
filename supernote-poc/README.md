@@ -1,6 +1,6 @@
 # InkBridge Supernote native folder plugin
 
-Version 0.2.6 turns the proven native-stroke proof into the Supernote endpoint for the finalized
+Version 0.2.7 turns the proven native-stroke proof into the Supernote endpoint for the finalized
 folder transport. **Export InkBridge** atomically writes the current page snapshot, **Apply
 InkBridge Sync** applies the next incoming manifest and durably acknowledges it, and **InkBridge
 Status** reports synced, pending, conflict, or error. No logcat capture or document-specific plugin
@@ -26,6 +26,8 @@ classify them as crossing a page margin. The plugin-preview firmware does not ex
 Virtual Spread insertion fails closed when a page has no native stroke from which that EMR range
 can be established; a later cache-hydration provider extension must supply equivalent authenticated
 range authority before an entirely empty regenerated page can be populated.
+Ordinary PDFs continue to use the firmware's standard `PointUtils` conversion; the element-carried
+composed-page range is enabled only after an authenticated Virtual Spread representation is active.
 Manifests spanning several physical spreads are applied one currently authorized spread at a
 time, with destination insertions completed before explicit deletions. Durable cache-path-bound
 progress survives reloads and power loss, and the original manifest is not acknowledged until all
@@ -59,7 +61,7 @@ current converter and native manifest application.
 The page payload also includes the source filename, page index and page pixel size.
 
 The legacy `exportCurrentSupernotePage()` helper can still emit numbered `INKBRIDGE_EXPORT` logcat
-chunks for regression diagnosis. The installed 0.2.6 toolbar uses the packaged, fail-closed native
+chunks for regression diagnosis. The installed 0.2.7 toolbar uses the packaged, fail-closed native
 folder module instead.
 
 The exported Supernote UUID is carried into the PDF annotation `/NM` identity. NeoReader preserved those values while editing imported `/Ink`, allowing the returned PDF to be matched back to the original Supernote elements.

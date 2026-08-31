@@ -180,11 +180,19 @@ def main() -> None:
         fail("Virtual Spread export must not rewrite native strokes merely to persist identity metadata")
     if "normalizedEmrPoint(point, source)" not in app:
         fail("Virtual Spread export must use each native stroke's authoritative EMR range")
+    for required in (
+        "if (useElementEmrRange)",
+        "PointUtils.emrPoint2Android(point, pageSize)",
+        "useElementEmrRange: true",
+    ):
+        if required not in app:
+            fail(f"ordinary and Virtual Spread export conversion modes are not separated: {required}")
     if "PluginCommAPI.getPageDisplaySize()" in app:
         fail("plugin-preview firmware does not expose getPageDisplaySize")
     for required in (
         "requireEmrRangeForInsertion(emrRange)",
-        "requireNativeEmrRangeForInsertions",
+        "useElementEmrRange",
+        "PointUtils.emrPoint2Android(point, pageSize)",
     ):
         if required not in manifest_apply:
             fail(f"Virtual Spread insertion EMR guard is missing: {required}")

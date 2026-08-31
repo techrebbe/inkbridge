@@ -326,9 +326,13 @@ export async function applyBooxReturnTest() {
 
 async function serializeSupernoteStroke(
   source,
-  elementIndex,
-  page,
-  expectedDocumentId = null,
+  {
+    elementIndex,
+    pageSize,
+    page,
+    expectedDocumentId = null,
+    useElementEmrRange = false,
+  },
 ) {
   const pointCount = await source.stroke.points.size();
   if (!pointCount) return null;
@@ -341,9 +345,20 @@ async function serializeSupernoteStroke(
   const pressures = sourcePressures.length === pointCount
     ? sourcePressures
     : new Array(pointCount).fill(sourcePressures[0] ?? 1024);
+  const maxPixelX = Math.max(1, pageSize.width - 1);
+  const maxPixelY = Math.max(1, pageSize.height - 1);
 
   const samples = emrPoints.map((point, index) => {
-    const normalized = normalizedEmrPoint(point, source);
+    let normalized;
+    if (useElementEmrRange) {
+      normalized = normalizedEmrPoint(point, source);
+    } else {
+      const pixel = PointUtils.emrPoint2Android(point, pageSize);
+      normalized = [
+        Math.max(0, Math.min(1, pixel.x / maxPixelX)),
+        Math.max(0, Math.min(1, pixel.y / maxPixelY)),
+      ];
+    }
     return [
       normalized[0],
       normalized[1],
@@ -384,9 +399,12 @@ export async function collectCurrentSupernotePage(expectedDocumentId = null) {
   for (const {element, elementIndex} of nativeStrokes) {
     const serialized = await serializeSupernoteStroke(
       element,
-      elementIndex,
-      page,
-      expectedDocumentId,
+      {
+        elementIndex,
+        pageSize,
+        page,
+        expectedDocumentId,
+      },
     );
     if (serialized) {
       totalSamples += serialized.samples.length;
@@ -473,9 +491,13 @@ export async function collectCurrentVirtualSpread(
     }
     const serialized = await serializeSupernoteStroke(
       element,
-      elementIndex,
-      page,
-      representation.documentId,
+      {
+        elementIndex,
+        pageSize,
+        page,
+        expectedDocumentId: representation.documentId,
+        useElementEmrRange: true,
+      },
     );
     if (serialized) {
       totalSamples += serialized.samples.length;
