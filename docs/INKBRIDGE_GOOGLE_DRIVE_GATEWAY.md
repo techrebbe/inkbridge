@@ -170,11 +170,16 @@ rollout remains intentionally split:
 2. add Drive/Cloud Storage/Firestore/Secret Manager adapters and a default-safe
    Cloud Run Job package that scales to zero between polls (implemented, not
    deployed);
-3. add Scheduler with a conservative interval and a lease so only one poller
-   owns a checkpoint;
-4. authorize the owner account once, store the refresh token in Secret Manager,
-   and run a dry synchronization against disposable files;
-5. connect device-native sync flows and perform the full repeated E2E gate.
+3. add guarded Terraform for empty OAuth secret containers, least-privilege
+   IAM, and a private manually invoked job whose default remains dry-run
+   (implemented, not deployed);
+4. after a separate approval, authorize the owner account once, add secret
+   versions outside Terraform, and run a manual dry synchronization against
+   disposable files;
+5. opt into one manual apply-mode execution only after the dry-run evidence is
+   clean;
+6. connect device-native sync flows and perform the full repeated E2E gate;
+7. add Scheduler with a conservative interval and a lease only after that gate.
 
 No Drive change is canonical merely because it is newer. Concurrent BOOX and
 Supernote revisions retain their original `basedOn` frontier and are handed to

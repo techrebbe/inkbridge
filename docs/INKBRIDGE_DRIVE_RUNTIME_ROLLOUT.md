@@ -100,26 +100,35 @@ create. Concurrent workers therefore use the same identity; Drive accepts at
 most one create, and a retry that receives HTTP 409 reads and verifies that
 exact file instead of creating a visible duplicate.
 
-## Proposed deployment (later approval)
+## Default-safe deployment configuration (later approval)
 
 1. Build `Dockerfile.drive-runtime` for Linux `amd64` and pin its Artifact
    Registry digest.
-2. Create a Cloud Run **Job**, not a continuously running service. Configure
-   one task, no parallelism, `--apply`, and the environment above.
+2. The guarded Terraform configuration creates a Cloud Run **Job**, not a
+   continuously running service. It configures one task, no parallelism, zero
+   retries, and the environment above. Its default argument list is empty, so
+   every execution is dry-run.
 3. Grant its service account only:
-   - read/write on the private InkBridge bucket;
-   - read/write on the two InkBridge Firestore collections;
+   - object access on the private InkBridge bucket;
+   - `datastore.user` in the InkBridge project (Firestore IAM cannot be scoped
+     to individual collections; the runtime itself permits only its checkpoint
+     collections and the broker's canonical store);
    - accessor on the two named OAuth secrets;
    - no broad project-owner role.
-4. Run dry-run manually against disposable Drive files.
-5. Run one manual `--apply` execution and verify Drive, GCS, Firestore, and
+4. Run dry-run manually against disposable Drive files. No Scheduler resource
+   exists, so the job cannot poll unless an authenticated operator invokes it.
+5. Enable `--apply` only through a newly reviewed plan carrying the separate
+   exact acknowledgement. Run one manual apply execution and verify Drive, GCS, Firestore, and
    broker state before enabling a schedule.
 6. Add Cloud Scheduler only after the repeated E2E gate. A conservative
    interval is sufficient because native device sync is not real-time.
 
-No Terraform resource for the job or scheduler is active in this PR. That
-keeps deployment, IAM changes, OAuth publication, and recurring cost behind a
-separate explicit approval.
+Terraform now describes the job, empty Secret Manager containers, and
+least-privilege IAM, but remains inert behind the existing deployment guard.
+It never manages secret versions. No resource is applied by this PR or CI, and
+there is still no Scheduler resource. Deployment, OAuth token storage, job
+execution, apply mode, and recurring polling therefore remain separate explicit
+approval gates.
 
 ## Recovery guarantees
 

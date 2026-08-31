@@ -8,6 +8,7 @@ locals {
     "firestore.googleapis.com",
     "iam.googleapis.com",
     "logging.googleapis.com",
+    "secretmanager.googleapis.com",
     "storage.googleapis.com",
   ])
   required_apis = setunion(
@@ -15,6 +16,10 @@ locals {
     local.runtime_enabled ? toset([
       "eventarc.googleapis.com",
       "pubsub.googleapis.com",
+      "run.googleapis.com",
+    ]) : toset([]),
+    local.drive_runtime_enabled ? toset([
+      "drive.googleapis.com",
       "run.googleapis.com",
     ]) : toset([]),
     var.monthly_budget_usd > 0 ? toset(["billingbudgets.googleapis.com"]) : toset([]),
