@@ -130,6 +130,17 @@ export async function publishCurrentPageExport() {
     collected.payload,
     identityState,
   );
+  if (representation) {
+    requireSameNativeViewport(
+      nativeViewport,
+      await currentNativeViewport(
+        native,
+        filePath,
+        representation,
+        nativeDescriptor,
+      ),
+    );
+  }
   const result = parseNativeJson(
     await native.publishPageExport(
       collected.filePath,

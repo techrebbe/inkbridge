@@ -204,6 +204,38 @@ function uniqueMatch(candidates, label) {
   return candidates[0] ?? null;
 }
 
+function assignUniqueHistoryMatches(records, history, used, matcher) {
+  const claims = [];
+  for (const record of records) {
+    if (record.stableUuid) continue;
+    const candidate = uniqueMatch(
+      history.filter(
+        entry => !used.has(entry.stableUuid) && matcher(entry, record.current),
+      ),
+      record.label,
+    );
+    if (candidate) claims.push({record, candidate});
+  }
+
+  const claimantsByStableUuid = new Map();
+  for (const claim of claims) {
+    const claimants = claimantsByStableUuid.get(claim.candidate.stableUuid) ?? [];
+    claimants.push(claim.record.label);
+    claimantsByStableUuid.set(claim.candidate.stableUuid, claimants);
+  }
+  for (const [stableUuid, claimants] of claimantsByStableUuid) {
+    if (claimants.length > 1) {
+      throw new Error(
+        `Stable identity reconciliation is ambiguous for ${stableUuid}: ${claimants.join(', ')}.`,
+      );
+    }
+  }
+  for (const {record, candidate} of claims) {
+    record.stableUuid = candidate.stableUuid;
+    used.add(candidate.stableUuid);
+  }
+}
+
 function retainedIdentity(stroke) {
   const tagged = parseUserData(stroke.userData);
   if (!INKBRIDGE_ORIGINS.has(tagged?.inkBridgeOrigin)) return null;
@@ -225,50 +257,60 @@ export function reconcileStableStrokeIdentities(documentId, payload, state) {
   const history = historyEntries(state, documentId);
   const pages = payloadPages(payload, 'Current export');
   const used = new Set();
-  const nextEntries = [];
   const representedPages = new Set(pages.map(page => page.pageIndex));
-
-  const rewrittenByPage = new Map();
+  const records = [];
   for (const page of pages) {
-    const rewritten = [];
     for (const [strokeIndex, stroke] of page.strokes.entries()) {
       const label = `page ${page.pageIndex + 1} stroke ${strokeIndex + 1}`;
       const current = entryFromStroke(page.pageIndex, stroke);
-      const retained = retainedIdentity(stroke);
-      let stableUuid = retained;
-      if (!stableUuid) {
-        const available = history.filter(entry => !used.has(entry.stableUuid));
-        stableUuid = uniqueMatch(
-          available.filter(entry => entry.nativeUuid === current.nativeUuid),
-          label,
-        )?.stableUuid;
-        if (!stableUuid) {
-          const descriptor = strokeDescriptor(current);
-          stableUuid = uniqueMatch(
-            available.filter(
-              entry =>
-                entry.pageIndex === current.pageIndex &&
-                descriptorMatches(strokeDescriptor(entry), descriptor),
-            ),
-            label,
-          )?.stableUuid;
+      const stableUuid = retainedIdentity(stroke);
+      if (stableUuid) {
+        if (used.has(stableUuid)) {
+          throw new Error(`Stable identity ${stableUuid} appears more than once in this export.`);
         }
-        if (!stableUuid) {
-          stableUuid = uniqueMatch(
-            available.filter(entry => translatedShapeMatches(entry, current)),
-            label,
-          )?.stableUuid;
-        }
-        stableUuid ??= current.nativeUuid;
+        used.add(stableUuid);
       }
-      if (used.has(stableUuid)) {
-        throw new Error(`Stable identity ${stableUuid} appears more than once in this export.`);
-      }
-      used.add(stableUuid);
-      rewritten.push(rewriteIdentity(stroke, stableUuid));
-      nextEntries.push({...current, stableUuid});
+      records.push({pageIndex: page.pageIndex, stroke, current, label, stableUuid});
     }
-    rewrittenByPage.set(page.pageIndex, rewritten);
+  }
+
+  // A retained InkBridge tag or an unchanged native UUID is authoritative.
+  // Resolve those first, then inspect every remaining current stroke together
+  // so two copies cannot greedily claim the same historical identity.
+  assignUniqueHistoryMatches(
+    records,
+    history,
+    used,
+    (entry, current) => entry.nativeUuid === current.nativeUuid,
+  );
+  assignUniqueHistoryMatches(
+    records,
+    history,
+    used,
+    (entry, current) => {
+      const exact =
+        entry.pageIndex === current.pageIndex &&
+        descriptorMatches(strokeDescriptor(entry), strokeDescriptor(current));
+      return exact || translatedShapeMatches(entry, current);
+    },
+  );
+
+  const rewrittenByPage = new Map(pages.map(page => [page.pageIndex, []]));
+  const nextEntries = [];
+  for (const record of records) {
+    if (!record.stableUuid) {
+      record.stableUuid = record.current.nativeUuid;
+      if (used.has(record.stableUuid)) {
+        throw new Error(
+          `Stable identity ${record.stableUuid} appears more than once in this export.`,
+        );
+      }
+      used.add(record.stableUuid);
+    }
+    rewrittenByPage
+      .get(record.pageIndex)
+      .push(rewriteIdentity(record.stroke, record.stableUuid));
+    nextEntries.push({...record.current, stableUuid: record.stableUuid});
   }
 
   const rewrittenPayload = JSON.parse(JSON.stringify(payload));

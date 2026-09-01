@@ -129,6 +129,74 @@ test('ambiguous identical shapes fail closed', () => {
   );
 });
 
+test('a copied current stroke cannot greedily steal a changed native identity', () => {
+  const ledger = {
+    schemaVersion: 1,
+    documentId,
+    entries: [{
+      stableUuid: 'stable-uuid',
+      nativeUuid: 'old-native',
+      pageIndex: 2,
+      nativeStyle: style,
+      samples: original,
+    }],
+  };
+  const translated = original.map(
+    ([x, y, pressure]) => [x + 0.2, y + 0.1, pressure],
+  );
+  const current = payload([{
+    pageIndex: 2,
+    strokes: [
+      stroke('new-copy-native', translated),
+      stroke('changed-original-native', original),
+    ],
+  }]);
+  assert.throws(
+    () => reconcileStableStrokeIdentities(
+      documentId,
+      current,
+      emptyState([], ledger),
+    ),
+    /ambiguous/,
+  );
+});
+
+test('an unchanged native UUID remains authoritative beside a copied shape', () => {
+  const ledger = {
+    schemaVersion: 1,
+    documentId,
+    entries: [{
+      stableUuid: 'stable-uuid',
+      nativeUuid: 'retained-native',
+      pageIndex: 2,
+      nativeStyle: style,
+      samples: original,
+    }],
+  };
+  const translated = original.map(
+    ([x, y, pressure]) => [x + 0.2, y + 0.1, pressure],
+  );
+  const reconciled = reconcileStableStrokeIdentities(
+    documentId,
+    payload([{
+      pageIndex: 2,
+      strokes: [
+        stroke('copied-native', translated),
+        stroke('retained-native', original),
+      ],
+    }]),
+    emptyState([], ledger),
+  );
+  assert.equal(
+    reconciled.payload.pages[0].strokes[1].sourceUuid,
+    'stable-uuid',
+  );
+  assert.equal(
+    reconciled.payload.pages[0].strokes[0].sourceUuid,
+    'copied-native',
+  );
+});
+
 test('represented-page deletion retires the old identity', () => {
   const ledger = {
     schemaVersion: 1,

@@ -239,6 +239,16 @@ def main() -> None:
         "unconditional post-collection viewport revalidation",
     )
     ordered(
+        companion[companion.find("const stabilized = reconcileStableStrokeIdentities(") :],
+        [
+            "const stabilized = reconcileStableStrokeIdentities(",
+            "if (representation)",
+            "requireSameNativeViewport(",
+            "await native.publishPageExport(",
+        ],
+        "post-identity viewport revalidation",
+    )
+    ordered(
         companion[companion.find("const applied = await applyVirtualSpreadManifest(") :],
         [
             "const applied = await applyVirtualSpreadManifest(",
