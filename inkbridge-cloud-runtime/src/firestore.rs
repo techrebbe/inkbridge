@@ -157,9 +157,11 @@ impl FirestoreCanonicalStateStore {
             body: HttpBody::bytes(body),
         })?;
         if response.status != 200 {
+            let detail = String::from_utf8_lossy(&response.body);
             return Err(format!(
-                "Firestore atomic commit returned HTTP {}; retry the event because a concurrent reservation may have won",
-                response.status
+                "Firestore atomic commit returned HTTP {}: {}; retry the event because a concurrent reservation may have won",
+                response.status,
+                detail.trim()
             ));
         }
         Ok(())
