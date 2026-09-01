@@ -1,6 +1,6 @@
 # InkBridge Supernote folder companion
 
-InkBridge 0.2.2 moves the proven native-stroke export and manifest importer onto the finalized
+InkBridge 0.3.0 moves the proven native-stroke export and manifest importer onto the finalized
 folder contract. The `.snplg` contains its own small native Android bridge; it does not require a
 second companion application, logcat capture, a document-specific plugin package, or changes to the
 actively developed RTL Reader project.
@@ -31,7 +31,7 @@ fixture cache basename. It verifies the generated PDF and sidecar bytes, their m
 the hidden versioned cache path, and the immutable original document ID before any folder action.
 The original PDF identity and filename—not the derived spread hash or cache name—select the folder.
 This is deliberately fixture-scoped; generic production cache activation remains disabled.
-For export and import, the plugin calls RTL Reader v0.0.26's live viewport provider with the exact
+For export and import, the plugin calls RTL Reader's live viewport provider with the exact
 document, view, virtual-page, native-canvas, file-path, and representation-hash evidence. The
 native bridge accepts only the expected provider package and release certificate, then validates
 the exact canonical descriptor and activation evidence. It never persists the descriptor or
@@ -68,13 +68,15 @@ another private file transport.
   The transport rejects an older snapshot if a manifest was delivered or applied before upload;
   tapping Export again produces a fresh snapshot at the new frontier.
   Strokes inserted by InkBridge retain the canonical broker UUID stored in their native user data.
-  Otherwise, export uses the Supernote element UUID as the stable native fallback without modifying
-  the stroke. Unknown third-party `userData` fails closed instead of being overwritten. Virtual
+  Otherwise, export resolves the Supernote element UUID through a durable document-local ledger
+  without modifying the stroke. The ledger conservatively reconciles a changed native UUID by exact
+  full-path geometry or by one unique translation-invariant full-path match for a lasso move.
+  Ambiguous matches and unknown third-party `userData` fail closed. Virtual
   Spread export must remain read-only: on the tested landscape page, sending an unchanged element
   back through `modifyElements` solely to attach metadata caused the firmware to reinterpret its EMR
-  coordinates and physically transform the stroke. If future firmware stops retaining native UUIDs,
-  InkBridge must add a separate durable identity ledger with conservative geometry reconciliation;
-  it must not restore the destructive metadata-write path.
+  coordinates and physically transform the stroke. The ledger is stored separately from `.mark`
+  and bootstraps from any still-pending export after an interrupted upgrade; the destructive
+  metadata-write path remains prohibited.
 - **Apply InkBridge Sync** reads the oldest unacknowledged `*.operations.json`, applies its moves,
   insertions, and deletions through the official Supernote element API, reloads the document, and
   only then publishes a durable acknowledgement. The folder transport prefixes delivered files

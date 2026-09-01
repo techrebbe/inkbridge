@@ -5,6 +5,7 @@ import {
   commonElementEmrRange,
   elementEmrRange,
   emrPointFromSample,
+  insertionEmrRange,
   normalizedEmrPoint,
   requireEmrRangeForInsertion,
 } from '../overlay/emrPointSpaceCore.js';
@@ -44,6 +45,25 @@ test('a page must expose one consistent EMR range', () => {
     () => commonElementEmrRange([
       {type: 0, stroke: {}, ...virtualSpreadRange},
       {type: 0, stroke: {}, maxX: 11864, maxY: 15819},
+    ]),
+    /disagree/,
+  );
+});
+
+test('deletion-only work does not require a common insertion range', () => {
+  const mixedRanges = [
+    {type: 0, stroke: {}, ...virtualSpreadRange},
+    {type: 0, stroke: {}, maxX: 11864, maxY: 15819},
+  ];
+  assert.equal(
+    insertionEmrRange(mixedRanges, [
+      {operation: {type: 'delete_stroke'}},
+    ]),
+    null,
+  );
+  assert.throws(
+    () => insertionEmrRange(mixedRanges, [
+      {operation: {type: 'upsert_stroke'}},
     ]),
     /disagree/,
   );

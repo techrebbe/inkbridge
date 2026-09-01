@@ -26,6 +26,7 @@ import {
   fixtureForOpenPath,
   fixtureNativeDescriptor,
 } from './virtualSpreadFixture';
+import {reconcileStableStrokeIdentities} from './identityLedgerCore';
 
 const {InkBridgeFolderModule} = NativeModules;
 
@@ -120,11 +121,21 @@ export async function publishCurrentPageExport() {
   }
   await revalidateCollectedDocument(filePath, async () => collected.filePath);
   await revalidateCollectedDocument(collected.filePath, currentFilePath);
+  const identityState = parseNativeJson(
+    await native.loadIdentityState(collected.filePath, nativeDescriptor),
+    'loadIdentityState',
+  );
+  const stabilized = reconcileStableStrokeIdentities(
+    identity.documentId,
+    collected.payload,
+    identityState,
+  );
   const result = parseNativeJson(
     await native.publishPageExport(
       collected.filePath,
       identity.documentId,
-      JSON.stringify(collected.payload),
+      JSON.stringify(stabilized.payload),
+      JSON.stringify(stabilized.ledger),
       nativeDescriptor,
     ),
     'publishPageExport',

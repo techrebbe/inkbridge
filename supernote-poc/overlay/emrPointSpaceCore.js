@@ -65,6 +65,13 @@ export function commonElementEmrRange(elements) {
   return common;
 }
 
+export function insertionEmrRange(elements, indexedOperations) {
+  const needsInsertionAuthority = (indexedOperations ?? []).some(
+    entry => entry?.operation?.type === 'upsert_stroke',
+  );
+  return needsInsertionAuthority ? commonElementEmrRange(elements) : null;
+}
+
 export function requireEmrRangeForInsertion(range) {
   if (!range) {
     throw new Error(

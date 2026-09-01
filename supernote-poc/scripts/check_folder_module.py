@@ -44,6 +44,9 @@ def main() -> None:
     manifest_apply = (root / "overlay" / "manifestApply.js").read_text(
         encoding="utf-8"
     )
+    identity_ledger = (root / "overlay" / "identityLedgerCore.js").read_text(
+        encoding="utf-8"
+    )
     index = (root / "overlay" / "index.js").read_text(encoding="utf-8")
     build_script = (root / "build.sh").read_text(encoding="utf-8")
 
@@ -72,7 +75,13 @@ def main() -> None:
     )
     ordered(
         module[module.find("fun publishPageExport") : module.find("fun loadNextManifest")],
-        ["context.documentId == expectedDocumentId", "pendingManifests(context)", "atomicWrite(destination"],
+        [
+            "context.documentId == expectedDocumentId",
+            "pendingManifests(context)",
+            "existingHash != sourceViewHash",
+            "atomicWrite(destination",
+            "identityLedgerFile(context)",
+        ],
         "reject-pending-before-export",
     )
     acknowledgement = module[
@@ -133,6 +142,11 @@ def main() -> None:
         "nativeViewportReader.read(",
         "fun recordVirtualSpreadStepApplied(",
         "manifestProgress.record(",
+        "fun loadIdentityState(",
+        "loadIdentityLedger(context)",
+        'File(context.directory, IDENTITY_LEDGER_FILE)',
+        "Pending native export ${file.name} targets another document",
+        "validateIdentityLedger(",
     ):
         if required not in module:
             fail(f"native module is missing required invariant: {required}")
@@ -170,6 +184,7 @@ def main() -> None:
         'cp "$ROOT/overlay/nativeViewportProviderCore.js"',
         'cp "$ROOT/overlay/virtualSpreadFixture.js"',
         'cp "$ROOT/overlay/emrPointSpaceCore.js"',
+        'cp "$ROOT/overlay/identityLedgerCore.js"',
     ):
         if required not in build_script:
             fail(f"Virtual Spread package input is missing: {required}")
@@ -178,6 +193,14 @@ def main() -> None:
     ]
     if "PluginFileAPI.modifyElements(" in virtual_spread_collection:
         fail("Virtual Spread export must not rewrite native strokes merely to persist identity metadata")
+    for required in (
+        "reconcileStableStrokeIdentities(",
+        "translatedShapeMatches(",
+        "Stable identity reconciliation is ambiguous",
+        "delete rewritten.nativeElementUuid",
+    ):
+        if required not in identity_ledger:
+            fail(f"durable non-mutating identity reconciliation is missing: {required}")
     if "normalizedEmrPoint(point, source)" not in app:
         fail("Virtual Spread export must use each native stroke's authoritative EMR range")
     for required in (
@@ -209,6 +232,8 @@ def main() -> None:
             ": await collectCurrentSupernotePage(identity.documentId)",
             "if (representation)",
             "requireSameNativeViewport(",
+            "await native.loadIdentityState(",
+            "reconcileStableStrokeIdentities(",
             "await native.publishPageExport(",
         ],
         "unconditional post-collection viewport revalidation",

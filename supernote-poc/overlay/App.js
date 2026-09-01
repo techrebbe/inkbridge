@@ -374,6 +374,7 @@ async function serializeSupernoteStroke(
   return {
     sourceUuid,
     sourceKey: sourceUuid ?? `supernote-page-${page}-element-${elementIndex}`,
+    nativeElementUuid: source.uuid ?? sourceUuid,
     elementIndex,
     layerNum: source.layerNum ?? 0,
     thickness: source.thickness ?? 2,

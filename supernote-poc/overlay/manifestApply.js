@@ -10,6 +10,7 @@ import {
   liveSnapshotMatches,
   operationSafetyPhases,
   parseUserData,
+  supernoteDeletionApiIndices,
   supernotePenColor,
   strokeDescriptor,
   validateManifest,
@@ -19,8 +20,8 @@ import {
   requireSameDocumentPath,
 } from './folderCompanionCore';
 import {
-  commonElementEmrRange,
   emrPointFromSample,
+  insertionEmrRange,
   normalizedEmrPoint,
   requireEmrRangeForInsertion,
 } from './emrPointSpaceCore';
@@ -277,18 +278,17 @@ async function insertTargets(filePath, pageIndex, targets) {
 
 async function deleteTargets(filePath, pageIndex, targets) {
   if (!targets.length) return;
-  const indices = [];
+  const nativeIndices = [];
   for (const {target, label} of targets) {
-    if (!Number.isInteger(target?.element?.numInPage)) {
+    if (
+      !Number.isInteger(target?.element?.numInPage) ||
+      target.element.numInPage < 0
+    ) {
       throw new Error(`Could not resolve native element index for ${label}.`);
     }
-    if (!indices.includes(target.element.numInPage)) {
-      indices.push(target.element.numInPage);
-    }
+    nativeIndices.push(target.element.numInPage);
   }
-  // Descending order is safe whether the host treats the indices as a set or
-  // removes them one by one while compacting the page element list.
-  indices.sort((left, right) => right - left);
+  const indices = supernoteDeletionApiIndices(nativeIndices);
   await requireResult(
     PluginFileAPI.deleteElements(filePath, pageIndex, indices),
     'deleteElements',
@@ -325,7 +325,7 @@ async function applyPage({
       `getElements page ${pageIndex + 1}`,
     )) ?? [];
   const emrRange = useElementEmrRange
-    ? commonElementEmrRange(elements)
+    ? insertionEmrRange(elements, indexedOperations)
     : null;
   const described = await describeElements(
     elements,

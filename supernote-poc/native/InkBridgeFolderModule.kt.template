@@ -31,10 +31,13 @@ class InkBridgeFolderModule(
         private const val EXPORT_SCHEMA_VERSION = 2
         private const val MANIFEST_SCHEMA_VERSION = 1
         private const val ACK_SCHEMA_VERSION = 1
+        private const val IDENTITY_LEDGER_SCHEMA_VERSION = 1
         private const val MAX_EXPORT_BYTES = 32 * 1024 * 1024
+        private const val MAX_IDENTITY_LEDGER_BYTES = 32 * 1024 * 1024
         private const val MAX_MANIFEST_BYTES = 16 * 1024 * 1024
         private const val MAX_REPRESENTATION_SIDECAR_BYTES = 2 * 1024 * 1024
         private const val ROOT_DIRECTORY = "EXPORT/InkBridge/Supernote_Folder"
+        private const val IDENTITY_LEDGER_FILE = "identity-ledger.json"
         private val DELIVERY_ID = Regex("^[0-9a-f]{64}$")
         private val DOCUMENT_ID = Regex("^inkbridge-doc-v1-[0-9a-f]{64}$")
         private val VIEW_ID = Regex("^inkbridge-view-v1-[0-9a-f]{64}$")
@@ -107,10 +110,37 @@ class InkBridgeFolderModule(
     }
 
     @ReactMethod
+    fun loadIdentityState(
+        filePath: String,
+        representationJson: String,
+        promise: Promise,
+    ) {
+        onWorker(promise, "INKBRIDGE_IDENTITY_STATE_FAILED") {
+            val context = documentContext(filePath, representationJson)
+            val ledger = loadIdentityLedger(context)
+            val bootstrapExports = JSONArray()
+            for (file in outgoingPageFiles(context).sortedBy { it.name }) {
+                val payload = JSONObject(readUtf8(file, MAX_EXPORT_BYTES))
+                require(payload.optString("documentId") == context.documentId) {
+                    "Pending native export ${file.name} targets another document"
+                }
+                bootstrapExports.put(payload)
+            }
+            JSONObject()
+                .put("schemaVersion", IDENTITY_LEDGER_SCHEMA_VERSION)
+                .put("documentId", context.documentId)
+                .put("ledger", ledger ?: JSONObject.NULL)
+                .put("bootstrapExports", bootstrapExports)
+                .toString()
+        }
+    }
+
+    @ReactMethod
     fun publishPageExport(
         filePath: String,
         expectedDocumentId: String,
         payloadJson: String,
+        identityLedgerJson: String,
         representationJson: String,
         promise: Promise,
     ) {
@@ -129,7 +159,17 @@ class InkBridgeFolderModule(
             require(payloadJson.toByteArray(StandardCharsets.UTF_8).size <= MAX_EXPORT_BYTES) {
                 "Native page export exceeds $MAX_EXPORT_BYTES bytes"
             }
+            require(
+                identityLedgerJson.toByteArray(StandardCharsets.UTF_8).size <=
+                    MAX_IDENTITY_LEDGER_BYTES
+            ) {
+                "Native identity ledger exceeds $MAX_IDENTITY_LEDGER_BYTES bytes"
+            }
             val payload = JSONObject(payloadJson)
+            val identityLedger = validateIdentityLedger(
+                context,
+                JSONObject(identityLedgerJson),
+            )
             require(payload.optInt("schemaVersion", -1) in setOf(1, EXPORT_SCHEMA_VERSION)) {
                 "Unsupported Supernote export schema"
             }
@@ -206,6 +246,12 @@ class InkBridgeFolderModule(
                 "A prior export for the same original page(s) is still waiting for sync; allow it to finish before switching document representations"
             }
             atomicWrite(destination, finalBytes)
+            atomicWrite(
+                identityLedgerFile(context),
+                appendNewline(
+                    identityLedger.toString().toByteArray(StandardCharsets.UTF_8),
+                ),
+            )
             val supersededExports = overlappingExports.filter { existing ->
                 existing.absolutePath != destination.absolutePath
             }
@@ -1032,6 +1078,35 @@ class InkBridgeFolderModule(
 
     private fun acknowledgementFile(context: DocumentContext, deliveryId: String): File =
         File(context.acknowledged, "$deliveryId.ack.json")
+
+    private fun identityLedgerFile(context: DocumentContext): File =
+        File(context.directory, IDENTITY_LEDGER_FILE)
+
+    private fun loadIdentityLedger(context: DocumentContext): JSONObject? {
+        val expected = identityLedgerFile(context)
+        if (!expected.exists()) return null
+        require(regularFiles(context.directory).any { it.name == IDENTITY_LEDGER_FILE }) {
+            "InkBridge identity ledger is not a regular document-local file"
+        }
+        return validateIdentityLedger(
+            context,
+            JSONObject(readUtf8(expected, MAX_IDENTITY_LEDGER_BYTES)),
+        )
+    }
+
+    private fun validateIdentityLedger(
+        context: DocumentContext,
+        ledger: JSONObject,
+    ): JSONObject {
+        require(
+            ledger.optInt("schemaVersion", -1) == IDENTITY_LEDGER_SCHEMA_VERSION &&
+                ledger.optString("documentId") == context.documentId &&
+                ledger.optJSONArray("entries") != null
+        ) {
+            "InkBridge identity ledger authority does not match the open document"
+        }
+        return ledger
+    }
 
     private fun isValidAcknowledgement(
         context: DocumentContext,

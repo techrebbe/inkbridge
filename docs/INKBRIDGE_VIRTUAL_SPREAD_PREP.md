@@ -107,10 +107,11 @@ already-generated PDF and sidecar buffers and returns those same private buffers
 activation handoff. This neither rereads mutable shared storage nor creates a second 300–500 MB
 in-memory PDF copy; the published paths remain locators, not activation authority.
 
-The annotation identity helper preserves a retained `sourceUuid`. If Supernote `userData` loses it,
-the adapter derives a document-bound ID from a nonempty native element key. It fails closed rather
-than pretending a geometry fingerprint is stable across lasso movement. The native-key path still
-requires a real-device reopen/move round trip before production use.
+The annotation identity helper preserves a retained `sourceUuid`. If Supernote `userData` does not
+carry it, the adapter resolves the native element key through a document-local ledger. The ledger
+uses exact full-path geometry for reopen recovery and a unique translation-invariant full-path match
+for lasso moves; ambiguity fails closed. It never rewrites an unchanged native stroke just to attach
+metadata, because that firmware path can transform Virtual Spread EMR geometry.
 
 ### Versioned cache-regeneration transaction model
 
@@ -147,6 +148,29 @@ noncanonical authority fails closed rather than falling back to page aspect rati
 
 This adapter is not a general production activation path. Its embedded representation is pinned to
 the normative fixture and production activation remains false.
+
+### Page-143 hardware-gate progress (2026-09-01)
+
+The exact authenticated cache and live viewport provider have now passed the create/export and
+broker portions of the shared hardware gate on a Nomad:
+
+- one native page-143 stroke was exported as one atomic two-source-page snapshot;
+- an unchanged reopen/export produced byte-identical payloads and retained stable annotation ID
+  `ea4f6500-9403-47f4-bc44-125fa5cc4a9c` across a changed native UUID;
+- the folder transport uploaded Supernote revision 1, the broker accepted it without conflict, and
+  the rebuilt BOOX view contained exactly one editable PDF `/Ink` annotation with the same `/NM`;
+- a native lasso commit retained that stable ID and all 306 samples, exported against frontier
+  `boox=0, supernote=1`, and was accepted as Supernote revision 2;
+- the revision-2 BOOX view was rebuilt from the immutable original, passed `qpdf --check`, and
+  contained exactly one `/Ink` annotation at the committed geometry with no duplication.
+
+The lasso interaction exposed a separate RTL Reader portrait/native-view regression: the live drop
+near the lower-left of the golden box jumped about 75 native pixels left and 46 pixels down on pen
+commit, while native thickness changed from 709 to 531. InkBridge correctly preserved the final
+native state rather than applying an additional transform. RTL Reader owns that presentation bug
+and has accepted the before/after evidence for its v0.0.30 hardware gate. The remaining InkBridge
+steps are deletion/tombstone, duplicate-delivery idempotency, and full cache regeneration,
+hydration, activation, and rollback.
 
 ## Remaining shared-gate work
 
