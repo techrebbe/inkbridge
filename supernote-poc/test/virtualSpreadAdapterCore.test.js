@@ -15,6 +15,7 @@ import {
   fixtureNativeDescriptor,
   PAGE_143_VIRTUAL_SPREAD_FIXTURE,
 } from '../overlay/virtualSpreadFixture.js';
+import {normalizedEmrPoint} from '../overlay/emrPointSpaceCore.js';
 
 const fixtureRoot = fileURLToPath(
   new URL('../../inkbridge-convert/tests/fixtures/virtual-spread/page-143-v1/', import.meta.url),
@@ -161,6 +162,41 @@ test('one native spread scan produces two complete original-page snapshots', () 
     close(sample[1], artifacts.strokeRoundTrip.normalizedAfterInverse[index][1]);
     assert.equal(sample[2], 1000 + index);
   });
+});
+
+test('the hardware-captured composed EMR range classifies page-143 ink', () => {
+  const emrRange = {maxX: 15819, maxY: 21098};
+  const samples = [
+    {x: 9197, y: 17991},
+    {x: 8543, y: 17199},
+    {x: 8990, y: 15900},
+  ].map((point, index) => [
+    ...normalizedEmrPoint(point, emrRange),
+    1000 + index,
+  ]);
+  const pages = buildVirtualSpreadSnapshot({
+    representation: PAGE_143_VIRTUAL_SPREAD_FIXTURE,
+    virtualPageIndex: 1,
+    nativeViewport: nativeViewport(1),
+    nativePageSize,
+    strokes: [{
+      sourceUuid: 'hardware-page-143-stroke',
+      sourceKey: 'hardware-page-143-stroke',
+      layerNum: 0,
+      thickness: 533,
+      penColor: 157,
+      penType: 10,
+      samples,
+    }],
+  });
+
+  assert.deepEqual(pages.map(page => page.pageIndex), [1, 2]);
+  assert.deepEqual(pages[0].strokes, []);
+  assert.equal(pages[1].strokes.length, 1);
+  assert.equal(
+    pages[1].strokes[0].sourceUuid,
+    'hardware-page-143-stroke',
+  );
 });
 
 test('canonical upserts and tombstones target the correct native spread page and half', () => {

@@ -94,23 +94,13 @@ impl CloudFolder for GcloudFolder {
                 "folder transport may upload only within BOOX_Folder/ or Supernote_Folder/: {object_path}"
             ));
         }
-        let metadata = metadata
-            .iter()
-            .map(|(key, value)| {
-                if key.contains([',', '=']) || value.contains([',', '=']) {
-                    Err(format!("metadata {key} contains a gcloud-unsafe delimiter"))
-                } else {
-                    Ok(format!("{key}={value}"))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .join(",");
+        let encoded_metadata = encode_custom_metadata(metadata)?;
         let output = self.run(&[
             "storage".to_owned(),
             "cp".to_owned(),
             local_path.to_string_lossy().into_owned(),
             self.gs_url(object_path),
-            format!("--custom-metadata={metadata}"),
+            format!("--custom-metadata={encoded_metadata}"),
             "--if-generation-match=0".to_owned(),
             "--quiet".to_owned(),
         ])?;
@@ -122,7 +112,7 @@ impl CloudFolder for GcloudFolder {
         // response is successful only if the existing immutable object carries
         // exactly the metadata we intended to publish.
         if let Ok(existing) = self.describe(object_path) {
-            if metadata_matches(&existing.metadata, metadata.as_str()) {
+            if metadata_matches(&existing.metadata, metadata) {
                 return Ok(existing);
             }
         }
@@ -154,11 +144,31 @@ fn is_device_upload_path(path: &str) -> bool {
         && !path.chars().any(char::is_control)
 }
 
-fn metadata_matches(existing: &BTreeMap<String, String>, encoded: &str) -> bool {
-    encoded.split(',').all(|pair| {
-        pair.split_once('=')
-            .is_some_and(|(key, value)| existing.get(key).is_some_and(|found| found == value))
-    })
+fn encode_custom_metadata(metadata: &BTreeMap<String, String>) -> Result<String, String> {
+    const DELIMITER: char = ';';
+    let pairs = metadata
+        .iter()
+        .map(|(key, value)| {
+            if key.contains([DELIMITER, '=', '^']) || value.contains(DELIMITER) {
+                Err(format!("metadata {key} contains a gcloud-unsafe delimiter"))
+            } else {
+                Ok(format!("{key}={value}"))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!(
+        "^{DELIMITER}^{}",
+        pairs.join(&DELIMITER.to_string())
+    ))
+}
+
+fn metadata_matches(
+    existing: &BTreeMap<String, String>,
+    intended: &BTreeMap<String, String>,
+) -> bool {
+    intended
+        .iter()
+        .all(|(key, value)| existing.get(key).is_some_and(|found| found == value))
 }
 
 fn command_error(action: &str, output: &Output) -> String {
@@ -302,8 +312,43 @@ mod tests {
             ("a".to_owned(), "1".to_owned()),
             ("b".to_owned(), "2".to_owned()),
         ]);
-        assert!(metadata_matches(&existing, "a=1,b=2"));
-        assert!(!metadata_matches(&existing, "a=1,b=wrong"));
-        assert!(!metadata_matches(&existing, "a=1,c=3"));
+        assert!(metadata_matches(&existing, &existing));
+        assert!(!metadata_matches(
+            &existing,
+            &BTreeMap::from([
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "wrong".to_owned())
+            ])
+        ));
+        assert!(!metadata_matches(
+            &existing,
+            &BTreeMap::from([
+                ("a".to_owned(), "1".to_owned()),
+                ("c".to_owned(), "3".to_owned())
+            ])
+        ));
+    }
+
+    #[test]
+    fn custom_metadata_encoding_preserves_multi_page_scope() {
+        let metadata = BTreeMap::from([
+            (
+                "inkbridge-document-id".to_owned(),
+                "inkbridge-doc-v1-test".to_owned(),
+            ),
+            ("inkbridge-source-page-indices".to_owned(), "2,3".to_owned()),
+        ]);
+        assert_eq!(
+            encode_custom_metadata(&metadata).unwrap(),
+            "^;^inkbridge-document-id=inkbridge-doc-v1-test;inkbridge-source-page-indices=2,3"
+        );
+    }
+
+    #[test]
+    fn custom_metadata_encoding_rejects_the_selected_separator() {
+        let metadata = BTreeMap::from([("key".to_owned(), "value;other".to_owned())]);
+        assert!(encode_custom_metadata(&metadata)
+            .unwrap_err()
+            .contains("gcloud-unsafe delimiter"));
     }
 }

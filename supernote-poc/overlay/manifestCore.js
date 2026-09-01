@@ -122,6 +122,22 @@ export function operationSafetyPhases(operations) {
   ].filter(phase => phase.length > 0);
 }
 
+export function supernoteDeletionApiIndices(nativeIndices) {
+  const apiIndices = [];
+  for (const nativeIndex of nativeIndices ?? []) {
+    if (!Number.isInteger(nativeIndex) || nativeIndex < 0) {
+      throw new Error('Could not resolve a valid native element index for deletion.');
+    }
+    // PluginFileAPI exposes numInPage as a zero-based element position, while
+    // deleteElements expects the corresponding one-based page position.
+    const apiIndex = nativeIndex + 1;
+    if (!apiIndices.includes(apiIndex)) apiIndices.push(apiIndex);
+  }
+  // Descending order is safe whether the host treats the indices as a set or
+  // removes them one by one while compacting the page element list.
+  return apiIndices.sort((left, right) => right - left);
+}
+
 export function validateManifest(manifest) {
   if (!manifest || typeof manifest !== 'object') {
     throw new Error(

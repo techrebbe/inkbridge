@@ -10,6 +10,7 @@ import {
   liveSnapshotMatches,
   operationSafetyPhases,
   parseUserData,
+  supernoteDeletionApiIndices,
   supernotePenColor,
   strokeDescriptor,
   validateManifest,
@@ -18,6 +19,12 @@ import {
   requireCompatibleTargetFileName,
   requireSameDocumentPath,
 } from './folderCompanionCore';
+import {
+  emrPointFromSample,
+  insertionEmrRange,
+  normalizedEmrPoint,
+  requireEmrRangeForInsertion,
+} from './emrPointSpaceCore';
 import {manifestToVirtualSpread} from './virtualSpreadAdapterCore';
 
 async function requireResult(promise, label) {
@@ -33,10 +40,14 @@ function basename(path) {
   return slash >= 0 ? path.slice(slash + 1) : path;
 }
 
-function samplesToEmr(samples, pageSize, normalizedYOffset) {
-  const maxX = Math.max(1, pageSize.width - 1);
-  const maxY = Math.max(1, pageSize.height - 1);
-  return samples.map(([normalizedX, normalizedY]) => {
+function samplesToEmr(samples, pageSize, normalizedYOffset, emrRange = null) {
+  return samples.map(sample => {
+    if (emrRange) {
+      return emrPointFromSample(sample, emrRange, normalizedYOffset);
+    }
+    const [normalizedX, normalizedY] = sample;
+    const maxX = Math.max(1, pageSize.width - 1);
+    const maxY = Math.max(1, pageSize.height - 1);
     const pixel = {
       x: Math.max(0, Math.min(maxX, normalizedX * maxX)),
       y: Math.max(
@@ -54,7 +65,12 @@ function samplePressures(samples) {
   );
 }
 
-async function serializeNativeStroke(element, pageSize, pageIndex) {
+async function serializeNativeStroke(
+  element,
+  pageSize,
+  pageIndex,
+  useElementEmrRange,
+) {
   const pointCount = await element.stroke.points.size();
   if (!pointCount) return null;
   const emrPoints = await element.stroke.points.getRange(0, pointCount);
@@ -66,10 +82,19 @@ async function serializeNativeStroke(element, pageSize, pageIndex) {
   const maxX = Math.max(1, pageSize.width - 1);
   const maxY = Math.max(1, pageSize.height - 1);
   const samples = emrPoints.map((point, index) => {
-    const pixel = PointUtils.emrPoint2Android(point, pageSize);
+    let normalized;
+    if (useElementEmrRange) {
+      normalized = normalizedEmrPoint(point, element);
+    } else {
+      const pixel = PointUtils.emrPoint2Android(point, pageSize);
+      normalized = [
+        Math.max(0, Math.min(1, pixel.x / maxX)),
+        Math.max(0, Math.min(1, pixel.y / maxY)),
+      ];
+    }
     return [
-      Math.max(0, Math.min(1, pixel.x / maxX)),
-      Math.max(0, Math.min(1, pixel.y / maxY)),
+      normalized[0],
+      normalized[1],
       Math.max(
         0,
         Math.min(4096, Math.round(nativePressures[index] ?? nativePressures[0] ?? 1024)),
@@ -92,11 +117,21 @@ async function serializeNativeStroke(element, pageSize, pageIndex) {
   };
 }
 
-async function describeElements(elements, pageSize, pageIndex) {
+async function describeElements(
+  elements,
+  pageSize,
+  pageIndex,
+  useElementEmrRange,
+) {
   const described = [];
   for (const element of elements) {
     if (element?.type !== 0 || !element?.stroke) continue;
-    const snapshot = await serializeNativeStroke(element, pageSize, pageIndex);
+    const snapshot = await serializeNativeStroke(
+      element,
+      pageSize,
+      pageIndex,
+      useElementEmrRange,
+    );
     if (!snapshot) continue;
     described.push({
       element,
@@ -186,6 +221,7 @@ function findSupersededTarget(described, operation, current, previousTarget) {
 
 async function prepareNativeStroke({
   pageSize,
+  emrRange,
   snapshot,
   yOffset,
   manifestId,
@@ -210,7 +246,12 @@ async function prepareNativeStroke({
     manifestId,
   });
 
-  const points = samplesToEmr(snapshot.samples, pageSize, yOffset);
+  const points = samplesToEmr(
+    snapshot.samples,
+    pageSize,
+    yOffset,
+    emrRange,
+  );
   const pressures = samplePressures(snapshot.samples);
   const pointsOk = await target.stroke.points.setRange(
     0,
@@ -237,18 +278,17 @@ async function insertTargets(filePath, pageIndex, targets) {
 
 async function deleteTargets(filePath, pageIndex, targets) {
   if (!targets.length) return;
-  const indices = [];
+  const nativeIndices = [];
   for (const {target, label} of targets) {
-    if (!Number.isInteger(target?.element?.numInPage)) {
+    if (
+      !Number.isInteger(target?.element?.numInPage) ||
+      target.element.numInPage < 0
+    ) {
       throw new Error(`Could not resolve native element index for ${label}.`);
     }
-    if (!indices.includes(target.element.numInPage)) {
-      indices.push(target.element.numInPage);
-    }
+    nativeIndices.push(target.element.numInPage);
   }
-  // Descending order is safe whether the host treats the indices as a set or
-  // removes them one by one while compacting the page element list.
-  indices.sort((left, right) => right - left);
+  const indices = supernoteDeletionApiIndices(nativeIndices);
   await requireResult(
     PluginFileAPI.deleteElements(filePath, pageIndex, indices),
     'deleteElements',
@@ -273,6 +313,7 @@ async function applyPage({
   yOffset,
   manifestId,
   counts,
+  useElementEmrRange,
 }) {
   const pageSize = await requireResult(
     PluginFileAPI.getPageSize(filePath, pageIndex),
@@ -283,7 +324,15 @@ async function applyPage({
       PluginFileAPI.getElements(pageIndex, filePath),
       `getElements page ${pageIndex + 1}`,
     )) ?? [];
-  const described = await describeElements(elements, pageSize, pageIndex);
+  const emrRange = useElementEmrRange
+    ? insertionEmrRange(elements, indexedOperations)
+    : null;
+  const described = await describeElements(
+    elements,
+    pageSize,
+    pageIndex,
+    useElementEmrRange,
+  );
   const insertions = [];
   const deletions = [];
   const outcomes = [];
@@ -321,9 +370,13 @@ async function applyPage({
       continue;
     }
 
+    const insertionEmrRange = useElementEmrRange
+      ? requireEmrRangeForInsertion(emrRange)
+      : null;
     insertions.push(
       await prepareNativeStroke({
         pageSize,
+        emrRange: insertionEmrRange,
         snapshot: operation.after,
         yOffset,
         manifestId,
@@ -378,6 +431,8 @@ export async function applyManifest(
   inputManifest,
   expectedFilePath = null,
   stableIdentityValidated = false,
+  reloadAfterApply = true,
+  useElementEmrRange = false,
 ) {
   const manifest = validateManifest(inputManifest);
   const filePath = await requireResult(
@@ -409,6 +464,7 @@ export async function applyManifest(
         yOffset,
         manifestId: manifest.manifestId,
         counts,
+        useElementEmrRange,
       });
     }
   }
@@ -418,7 +474,9 @@ export async function applyManifest(
     'getCurrentFilePath before reload',
   );
   requireSameDocumentPath(filePath, currentBeforeReload);
-  await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
+  if (reloadAfterApply) {
+    await requireResult(PluginCommAPI.reloadFile(), 'reloadFile');
+  }
   return {
     manifestId: manifest.manifestId,
     operationCount: manifest.operations.length,
@@ -435,6 +493,7 @@ export async function applyVirtualSpreadManifest(
   representation,
   expectedFilePath = null,
   nativeViewports = null,
+  reloadAfterApply = true,
 ) {
   const canonical = validateManifest(inputManifest);
   const filePath = expectedFilePath ?? await requireResult(
@@ -471,6 +530,8 @@ export async function applyVirtualSpreadManifest(
       nativePageSizes,
     ),
     filePath,
+    true,
+    reloadAfterApply,
     true,
   );
 }

@@ -7,6 +7,7 @@ import {
   liveSnapshotMatches,
   operationSafetyPhases,
   strokeDescriptor,
+  supernoteDeletionApiIndices,
   supernotePenColor,
   validateManifest,
 } from '../overlay/manifestCore.js';
@@ -223,5 +224,17 @@ test('cross-page destinations are scheduled before explicit source deletions', (
   assert.deepEqual(
     phases.flat().map(({index}) => index),
     [1, 2, 0],
+  );
+});
+
+test('native deletion positions are converted to one-based PluginFileAPI indices', () => {
+  assert.deepEqual(supernoteDeletionApiIndices([0, 4, 0, 2]), [5, 3, 1]);
+  assert.throws(
+    () => supernoteDeletionApiIndices([-1]),
+    /valid native element index/,
+  );
+  assert.throws(
+    () => supernoteDeletionApiIndices([1.5]),
+    /valid native element index/,
   );
 });

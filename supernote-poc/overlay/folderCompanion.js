@@ -1,5 +1,5 @@
 import {NativeModules} from 'react-native';
-import {NativeUIUtils, PluginCommAPI} from 'sn-plugin-lib';
+import {NativeUIUtils, PluginCommAPI, PluginFileAPI} from 'sn-plugin-lib';
 import {
   collectCurrentSupernotePage,
   collectCurrentVirtualSpread,
@@ -12,11 +12,21 @@ import {
   revalidateCollectedDocument,
   requirePluginResult,
   requireSameDocumentId,
+  requireSameDocumentPath,
 } from './folderCompanionCore';
+import {
+  completedVirtualSpreadDelivery,
+  finishVirtualSpreadStep,
+  nativeViewportMap,
+  planVirtualSpreadDelivery,
+  requireNativeViewportResult,
+  requireSameNativeViewport,
+} from './nativeViewportProviderCore';
 import {
   fixtureForOpenPath,
   fixtureNativeDescriptor,
 } from './virtualSpreadFixture';
+import {reconcileStableStrokeIdentities} from './identityLedgerCore';
 
 const {InkBridgeFolderModule} = NativeModules;
 
@@ -36,6 +46,42 @@ async function currentFilePath() {
   );
 }
 
+async function currentNativeViewport(
+  native,
+  filePath,
+  representation,
+  nativeDescriptor,
+) {
+  const pathBefore = await currentFilePath();
+  requireSameDocumentPath(filePath, pathBefore);
+  const virtualPageIndex = requirePluginResult(
+    await PluginCommAPI.getCurrentPageNum(),
+    'getCurrentPageNum before native viewport request',
+  );
+  const nativePageSize = requirePluginResult(
+    await PluginFileAPI.getPageSize(filePath, virtualPageIndex),
+    'getPageSize before native viewport request',
+  );
+  const result = requireNativeViewportResult(
+    parseNativeJson(
+      await native.getNativeViewport(
+        filePath,
+        nativeDescriptor,
+        virtualPageIndex,
+        nativePageSize.width,
+        nativePageSize.height,
+      ),
+      'getNativeViewport',
+    ),
+    representation,
+    virtualPageIndex,
+    nativePageSize,
+  );
+  const pathAfter = await currentFilePath();
+  requireSameDocumentPath(filePath, pathAfter);
+  return result;
+}
+
 export async function publishCurrentPageExport() {
   const native = requireNativeModule();
   const filePath = await currentFilePath();
@@ -47,30 +93,60 @@ export async function publishCurrentPageExport() {
     await native.getDocumentIdentity(filePath, nativeDescriptor),
     'getDocumentIdentity',
   );
+  const nativeViewport = representation
+    ? await currentNativeViewport(
+        native,
+        filePath,
+        representation,
+        nativeDescriptor,
+      )
+    : null;
   const collected = representation
     ? await collectCurrentVirtualSpread(
         representation,
         filePath,
-        async () => {
-          const revalidated = parseNativeJson(
-            await native.validateDocumentIdentity(
-              filePath,
-              identity.documentId,
-              nativeDescriptor,
-            ),
-            'validateDocumentIdentity before identity persistence',
-          );
-          requireSameDocumentId(identity.documentId, revalidated.documentId);
-        },
+        nativeViewport.descriptor,
       )
     : await collectCurrentSupernotePage(identity.documentId);
+  if (representation) {
+    requireSameNativeViewport(
+      nativeViewport,
+      await currentNativeViewport(
+        native,
+        filePath,
+        representation,
+        nativeDescriptor,
+      ),
+    );
+  }
   await revalidateCollectedDocument(filePath, async () => collected.filePath);
   await revalidateCollectedDocument(collected.filePath, currentFilePath);
+  const identityState = parseNativeJson(
+    await native.loadIdentityState(collected.filePath, nativeDescriptor),
+    'loadIdentityState',
+  );
+  const stabilized = reconcileStableStrokeIdentities(
+    identity.documentId,
+    collected.payload,
+    identityState,
+  );
+  if (representation) {
+    requireSameNativeViewport(
+      nativeViewport,
+      await currentNativeViewport(
+        native,
+        filePath,
+        representation,
+        nativeDescriptor,
+      ),
+    );
+  }
   const result = parseNativeJson(
     await native.publishPageExport(
       collected.filePath,
       identity.documentId,
-      JSON.stringify(collected.payload),
+      JSON.stringify(stabilized.payload),
+      JSON.stringify(stabilized.ledger),
       nativeDescriptor,
     ),
     'publishPageExport',
@@ -107,10 +183,103 @@ export async function applyNextFolderManifest() {
       );
       requireSameDocumentId(currentDelivery.documentId, revalidated.documentId);
     },
-    apply: manifest =>
-      representation
-        ? applyVirtualSpreadManifest(manifest, representation, filePath)
-        : applyManifest(manifest, filePath, true),
+    apply: async manifest => {
+      if (!representation) return applyManifest(manifest, filePath, true);
+      const currentVirtualPageIndex = requirePluginResult(
+        await PluginCommAPI.getCurrentPageNum(),
+        'getCurrentPageNum before Virtual Spread delivery staging',
+      );
+      const plan = planVirtualSpreadDelivery(
+        manifest,
+        representation,
+        currentVirtualPageIndex,
+        delivery.virtualSpreadProgress,
+      );
+      if (plan.complete) {
+        // A previous attempt may have committed its final step but failed to
+        // redraw. Retry the redraw before the whole delivery is acknowledged.
+        requirePluginResult(
+          await PluginCommAPI.reloadFile(),
+          'reloadFile before acknowledging completed Virtual Spread delivery',
+        );
+        return completedVirtualSpreadDelivery(
+          manifest,
+          plan.steps,
+          plan.progress,
+        );
+      }
+      if (!plan.manifest) {
+        return {
+          status: 'pending',
+          acknowledge: false,
+          message:
+            `Open Virtual Spread page ${plan.nextPage + 1}, then tap Apply InkBridge Sync again.`,
+        };
+      }
+      const nativeViewport = await currentNativeViewport(
+        native,
+        filePath,
+        representation,
+        nativeDescriptor,
+      );
+      const applied = await applyVirtualSpreadManifest(
+        plan.manifest,
+        representation,
+        filePath,
+        nativeViewportMap(nativeViewport),
+        false,
+      );
+      // Do not let our own redraw invalidate the generation fence. Native
+      // writes finish first; only a still-matching viewport may commit the
+      // durable step. A failed fence leaves an idempotent retry, not a skip.
+      const progress = await finishVirtualSpreadStep({
+        expectedViewport: nativeViewport,
+        readCurrentViewport: () => currentNativeViewport(
+          native,
+          filePath,
+          representation,
+          nativeDescriptor,
+        ),
+        recordProgress: async () => parseNativeJson(
+          await native.recordVirtualSpreadStepApplied(
+            filePath,
+            delivery.deliveryId,
+            manifest.manifestId,
+            plan.stepId,
+            JSON.stringify({
+              operationCount: plan.manifest.operations.length,
+              added: applied.added,
+              updated: applied.updated,
+              deleted: applied.deleted,
+              skipped: applied.skipped,
+            }),
+            nativeDescriptor,
+          ),
+          'recordVirtualSpreadStepApplied',
+        ),
+        reload: async () => requirePluginResult(
+          await PluginCommAPI.reloadFile(),
+          'reloadFile after Virtual Spread progress commit',
+        ),
+      });
+      const completed = completedVirtualSpreadDelivery(
+        manifest,
+        plan.steps,
+        progress,
+      );
+      if (!completed.complete) {
+        const nextPage = plan.steps.find(
+          step => !progress.completedStepIds.includes(step.id),
+        ).page;
+        return {
+          status: 'pending',
+          acknowledge: false,
+          message:
+            `Applied this spread. Open Virtual Spread page ${nextPage + 1}, then tap Apply InkBridge Sync again.`,
+        };
+      }
+      return completed;
+    },
     acknowledge: async ({deliveryId, manifestId, applied}) =>
       parseNativeJson(
         await native.acknowledgeManifest(

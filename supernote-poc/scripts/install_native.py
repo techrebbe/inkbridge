@@ -35,6 +35,8 @@ def main() -> None:
     for source_name in (
         "InkBridgeFolderModule.kt.template",
         "InkBridgeFolderPackage.kt.template",
+        "InkBridgeManifestProgress.kt.template",
+        "InkBridgeNativeViewport.kt.template",
     ):
         source = repo_root / "native" / source_name
         rendered = source.read_text(encoding="utf-8").replace(
@@ -60,6 +62,25 @@ def main() -> None:
             + text[insert_at + 1 :]
         )
         application.write_text(text, encoding="utf-8", newline="\n")
+
+    manifest = project / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+    manifest_text = manifest.read_text(encoding="utf-8")
+    viewport_authority = "com.techrebbe.supernote.virtualspread.viewport"
+    if viewport_authority not in manifest_text:
+        application_marker = "    <application"
+        marker_index = manifest_text.find(application_marker)
+        if marker_index < 0:
+            fail("could not find Android application manifest entry")
+        query = (
+            "    <queries>\n"
+            "        <provider\n"
+            f'            android:authorities="{viewport_authority}" />\n'
+            "    </queries>\n\n"
+        )
+        manifest_text = (
+            manifest_text[:marker_index] + query + manifest_text[marker_index:]
+        )
+        manifest.write_text(manifest_text, encoding="utf-8", newline="\n")
 
     print(f"Installed InkBridgeFolderModule in Android package {package_name}")
 

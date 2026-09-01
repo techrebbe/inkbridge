@@ -68,6 +68,7 @@ export async function processManifestDelivery({
   try {
     if (validate) await validate(delivery);
     const applied = await apply(delivery.manifest);
+    if (applied?.acknowledge === false) return applied;
     const acknowledged = await acknowledge({
       deliveryId: delivery.deliveryId,
       manifestId: applied.manifestId,

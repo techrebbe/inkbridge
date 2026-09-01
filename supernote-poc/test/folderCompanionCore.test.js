@@ -124,6 +124,26 @@ test('failed application remains unacknowledged and records a retryable error', 
   assert.deepEqual(calls, ['apply', 'error:abc']);
 });
 
+test('partially staged Virtual Spread delivery remains unacknowledged without failure', async () => {
+  const calls = [];
+  const result = await processManifestDelivery({
+    delivery: {deliveryId: 'abc', manifest: {manifestId: 'm1'}},
+    apply: async () => {
+      calls.push('apply');
+      return {
+        status: 'pending',
+        acknowledge: false,
+        message: 'Open the next spread.',
+      };
+    },
+    acknowledge: async () => calls.push('ack'),
+    recordFailure: async () => calls.push('error'),
+  });
+  assert.deepEqual(calls, ['apply']);
+  assert.equal(result.status, 'pending');
+  assert.equal(result.acknowledge, false);
+});
+
 test('duplicate-free no-delivery response performs no write', async () => {
   const result = await processManifestDelivery({
     delivery: {status: 'synced', pendingCount: 0},

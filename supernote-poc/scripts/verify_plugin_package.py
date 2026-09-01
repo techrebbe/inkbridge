@@ -12,7 +12,12 @@ from pathlib import Path
 
 
 EXPECTED_REACT_PACKAGES = ["com.inkbridgepoc.InkBridgeFolderPackage"]
-EXPECTED_NATIVE_CLASSES = (b"InkBridgeFolderModule", b"InkBridgeFolderPackage")
+EXPECTED_NATIVE_CLASSES = (
+    b"InkBridgeFolderModule",
+    b"InkBridgeFolderPackage",
+    b"InkBridgeManifestProgress",
+    b"InkBridgeNativeViewport",
+)
 MINIMUM_NATIVE_APK_SIZE = 1_000_000
 
 
@@ -97,7 +102,13 @@ def verify(package_path: Path, root: Path) -> None:
             if packaged != expected:
                 fail("packaged PluginConfig.json does not publish the reviewed native package")
             bundle = one(package, bundle_name)
-            for marker in (b"INKBRIDGE_FOLDER_DONE", b"publishPageExport"):
+            for marker in (
+                b"INKBRIDGE_FOLDER_DONE",
+                b"publishPageExport",
+                b"getNativeViewport",
+                b"recordVirtualSpreadStepApplied",
+                b"rtl-reader-native-viewport-v1",
+            ):
                 if marker not in bundle:
                     fail(f"JavaScript bundle is missing {marker.decode()}")
             verify_native_apk(one(package, "app.npk"))

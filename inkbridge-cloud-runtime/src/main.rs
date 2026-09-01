@@ -6,15 +6,25 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    if let Err(error) = start() {
         eprintln!("inkbridge-cloud-runtime: {error}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), String> {
+fn start() -> Result<(), String> {
+    // reqwest's blocking client owns an internal runtime. Keep one strong
+    // reference outside Tokio so its final drop never occurs in async context.
+    let transport = Arc::new(ReqwestTransport::new(Duration::from_secs(840))?);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(run(transport.clone()))
+}
+
+async fn run(transport: Arc<ReqwestTransport>) -> Result<(), String> {
     let project_id = required_env("INKBRIDGE_GCP_PROJECT")?;
     let bucket = required_env("INKBRIDGE_GCS_BUCKET")?;
     let database =
@@ -23,7 +33,6 @@ async fn run() -> Result<(), String> {
         .unwrap_or_else(|_| "8080".to_owned())
         .parse::<u16>()
         .map_err(|error| format!("invalid PORT: {error}"))?;
-    let transport = Arc::new(ReqwestTransport::new(Duration::from_secs(840))?);
     let tokens = Arc::new(GoogleTokenProvider::new(transport.clone()));
     let objects = Arc::new(GoogleCloudStorage::new(
         &bucket,

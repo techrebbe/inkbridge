@@ -107,10 +107,11 @@ already-generated PDF and sidecar buffers and returns those same private buffers
 activation handoff. This neither rereads mutable shared storage nor creates a second 300–500 MB
 in-memory PDF copy; the published paths remain locators, not activation authority.
 
-The annotation identity helper preserves a retained `sourceUuid`. If Supernote `userData` loses it,
-the adapter derives a document-bound ID from a nonempty native element key. It fails closed rather
-than pretending a geometry fingerprint is stable across lasso movement. The native-key path still
-requires a real-device reopen/move round trip before production use.
+The annotation identity helper preserves a retained `sourceUuid`. If Supernote `userData` does not
+carry it, the adapter resolves the native element key through a document-local ledger. The ledger
+uses exact full-path geometry for reopen recovery and a unique translation-invariant full-path match
+for lasso moves; ambiguity fails closed. It never rewrites an unchanged native stroke just to attach
+metadata, because that firmware path can transform Virtual Spread EMR geometry.
 
 ### Versioned cache-regeneration transaction model
 
@@ -139,12 +140,37 @@ Supernote page canvas. Aspect ratio also cannot prove that the reader has not ro
 PDF. Export and import therefore require an explicit native viewport descriptor bound to the
 authenticated document ID, view ID, and virtual page. The descriptor supplies the native canvas
 size and spread-to-native affine transform; it must come from the RTL Reader presentation owner.
-The current folder action has no such provider and fails closed rather than guessing. Supporting
-the hardware gate and portrait focus requires connecting that verified signal from the Nomad
-companion.
+RTL Reader v0.0.26 now publishes that authority through its memory-only, page-load-fenced content
+provider. InkBridge verifies the provider package and protected release certificate, supplies the
+independently verified document/view/page/hash evidence, strictly validates the canonical
+seven-field descriptor, and derives the inverse locally. Missing, stale, mismatched, or
+noncanonical authority fails closed rather than falling back to page aspect ratio.
 
 This adapter is not a general production activation path. Its embedded representation is pinned to
 the normative fixture and production activation remains false.
+
+### Page-143 hardware-gate progress (2026-09-01)
+
+The exact authenticated cache and live viewport provider have now passed the create/export and
+broker portions of the shared hardware gate on a Nomad:
+
+- one native page-143 stroke was exported as one atomic two-source-page snapshot;
+- an unchanged reopen/export produced byte-identical payloads and retained stable annotation ID
+  `ea4f6500-9403-47f4-bc44-125fa5cc4a9c` across a changed native UUID;
+- the folder transport uploaded Supernote revision 1, the broker accepted it without conflict, and
+  the rebuilt BOOX view contained exactly one editable PDF `/Ink` annotation with the same `/NM`;
+- a native lasso commit retained that stable ID and all 306 samples, exported against frontier
+  `boox=0, supernote=1`, and was accepted as Supernote revision 2;
+- the revision-2 BOOX view was rebuilt from the immutable original, passed `qpdf --check`, and
+  contained exactly one `/Ink` annotation at the committed geometry with no duplication.
+
+The lasso interaction exposed a separate RTL Reader portrait/native-view regression: the live drop
+near the lower-left of the golden box jumped about 75 native pixels left and 46 pixels down on pen
+commit, while native thickness changed from 709 to 531. InkBridge correctly preserved the final
+native state rather than applying an additional transform. RTL Reader owns that presentation bug
+and has accepted the before/after evidence for its v0.0.30 hardware gate. The remaining InkBridge
+steps are deletion/tombstone, duplicate-delivery idempotency, and full cache regeneration,
+hydration, activation, and rollback.
 
 ## Remaining shared-gate work
 
@@ -158,8 +184,8 @@ proves native hydration, idempotent reimport, versioned cache regeneration, and 
 
 ## First integrated acceptance gate
 
-1. Generate and verify the `page-143` Virtual Spread cache, open it through RTL Reader, and provide
-   InkBridge the verified native viewport descriptor for the active spread.
+1. Generate and verify the `page-143` Virtual Spread cache, open it through RTL Reader, and confirm
+   InkBridge consumes the fresh verified native viewport descriptor for the active spread.
 2. Write a stable-ID stroke on original page 143 through Supernote's native reader.
 3. Export the two represented original-page snapshots atomically.
 4. Confirm the stroke appears editable at the same location on BOOX page 143.
